@@ -134,12 +134,15 @@ class Cluster:
                 return nodo
         raise KeyError(name)
 
-    def cluster_status(self, timeout: float = 5) -> dict:
-        return httpx.get(
-            f"{self.control_url}/internal/v1/cluster/status",
-            headers=self.internal_headers,
+    def cluster_status(self, token: str, timeout: float = 5) -> dict:
+        """Estado del cluster. Va por /api/v1, asi que pide token de usuario."""
+        respuesta = httpx.get(
+            f"{self.control_url}/api/v1/cluster/status",
+            headers={"Authorization": f"Bearer {token}"},
             timeout=timeout,
-        ).json()
+        )
+        respuesta.raise_for_status()
+        return respuesta.json()
 
     def wait_for_nodes(self, expected: int, timeout: float = 20.0) -> None:
         """Espera a que los N nodos esten registrados y hayan latido al menos una vez."""

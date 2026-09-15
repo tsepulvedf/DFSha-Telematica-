@@ -11,6 +11,8 @@ from fastapi import APIRouter, Depends, Response, status
 
 from dfsha.common.dto import (
     BlockReadPlan,
+    ClusterStatusResponse,
+    DataNodeStatus,
     BlockStoredRequest,
     BlockWritePlan,
     CommitResponse,
@@ -34,15 +36,25 @@ from dfsha.control_node.commands import auth as auth_commands
 from dfsha.control_node.commands import files as file_commands
 from dfsha.control_node.commands import internal as internal_commands
 from dfsha.control_node.commands import namespace as namespace_commands
+from dfsha.control_node.queries import cluster as cluster_queries
 from dfsha.control_node.queries import files as file_queries
 from dfsha.control_node.queries import gc as gc_queries
 from dfsha.control_node.queries import namespace as namespace_queries
 
+from dfsha.control_node.domain.membership import MembershipThresholds
+
 from .deps import CurrentUser, Placement, Settings, Uow, require_internal_secret
 
-__all__ = ["auth_router", "fs_router", "files_router", "internal_router"]
+__all__ = [
+    "auth_router",
+    "cluster_router",
+    "fs_router",
+    "files_router",
+    "internal_router",
+]
 
 auth_router = APIRouter(prefix="/auth", tags=["auth"])
+cluster_router = APIRouter(prefix="/cluster", tags=["cluster"])
 fs_router = APIRouter(prefix="/fs", tags=["namespace"])
 files_router = APIRouter(prefix="/files", tags=["transferencia"])
 internal_router = APIRouter(
@@ -71,6 +83,46 @@ def login(body: LoginRequest, uow: Uow, settings: Settings) -> TokenResponse:
         uow, body.username, body.password, settings.jwt_secret, settings.jwt_ttl_seconds
     )
     return TokenResponse(access_token=token, expires_in=expires_in)
+
+
+# --- Cluster ---------------------------------------------------------------
+
+
+@cluster_router.get("/status")
+def cluster_status(uow: Uow, user: CurrentUser, settings: Settings) -> ClusterStatusResponse:
+    """Estado de todos los DataNodes.
+
+    Pide token como el resto de `/api/v1`, pero no filtra por usuario: la topologia del
+    cluster es la misma para todos y no revela nada del arbol de nadie.
+    """
+    nodos = cluster_queries.cluster_status(
+        uow,
+        MembershipThresholds.from_millis(
+            settings.suspect_after_ms, settings.dead_after_ms
+        ),
+    )
+    return ClusterStatusResponse(
+        nodes=[
+            DataNodeStatus(
+                data_node_id=n.data_node_id,
+                advertise_url=n.advertise_url,
+                fault_domain=n.fault_domain,
+                state=n.state,
+                used_bytes=n.used_bytes,
+                capacity_bytes=n.capacity_bytes,
+                disk_free_bytes=n.disk_free_bytes,
+                block_count=n.block_count,
+                replica_count=n.replica_count,
+                seconds_since_heartbeat=n.seconds_since_heartbeat,
+                writes_in_flight=n.writes_in_flight,
+                reads_in_flight=n.reads_in_flight,
+            )
+            for n in nodos
+        ],
+        replication_factor=settings.replication_factor,
+        suspect_after_ms=settings.suspect_after_ms,
+        dead_after_ms=settings.dead_after_ms,
+    )
 
 
 # --- Namespace (RF1) -------------------------------------------------------
@@ -144,6 +196,7 @@ def create_file(
         default_block_size=settings.block_size,
         write_ttl_seconds=settings.write_ttl_seconds,
         block_size=body.block_size,
+        replication_factor=settings.replication_factor,
     )
     return CreateFileResponse(
         file_id=creado.file_id,

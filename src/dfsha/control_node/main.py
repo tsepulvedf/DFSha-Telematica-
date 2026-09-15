@@ -26,7 +26,13 @@ from dfsha.control_node.services.membership_monitor import MembershipMonitor
 
 from .api.errors import install_error_handlers
 from .api.grpc import ControlPlaneServicer, build_grpc_server
-from .api.routers import auth_router, files_router, fs_router, internal_router
+from .api.routers import (
+    auth_router,
+    cluster_router,
+    files_router,
+    fs_router,
+    internal_router,
+)
 
 __all__ = ["create_app"]
 
@@ -111,6 +117,7 @@ def create_app(settings: ControlNodeSettings | None = None) -> FastAPI:
     install_error_handlers(app)
 
     app.include_router(auth_router, prefix=API_PREFIX)
+    app.include_router(cluster_router, prefix=API_PREFIX)
     app.include_router(fs_router, prefix=API_PREFIX)
     app.include_router(files_router, prefix=API_PREFIX)
     app.include_router(internal_router)  # ya trae su propio /internal/v1

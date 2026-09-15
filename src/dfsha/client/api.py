@@ -12,6 +12,7 @@ from pathlib import Path
 import httpx
 
 from dfsha.common.dto import (
+    ClusterStatusResponse,
     CommitResponse,
     CreateFileResponse,
     LsResponse,
@@ -63,6 +64,13 @@ class ControlApi:
             json={"username": username, "password": password},
         )
         return TokenResponse.model_validate(respuesta.json())
+
+    # --- Cluster -----------------------------------------------------------
+
+    def cluster_status(self) -> ClusterStatusResponse:
+        return ClusterStatusResponse.model_validate(
+            self._request("GET", f"{API}/cluster/status").json()
+        )
 
     # --- Namespace ---------------------------------------------------------
 

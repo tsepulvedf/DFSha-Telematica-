@@ -259,6 +259,76 @@ def stat(path: str) -> None:
     console.print(tabla)
 
 
+# --- Cluster ---------------------------------------------------------------
+
+
+@app.command()
+def cluster() -> None:
+    """Muestra el estado de los DataNodes del cluster."""
+    api, _ = _api()
+    try:
+        estado = api.cluster_status()
+    except DFShaError as error:
+        _fallar(error)
+
+    if not estado.nodes:
+        console.print("[dim]no hay ningun DataNode registrado[/dim]")
+        return
+
+    colores = {"ALIVE": "green", "SUSPECT": "yellow", "DEAD": "red"}
+
+    tabla = Table(
+        title=(
+            f"DataNodes · R={estado.replication_factor} · "
+            f"SUSPECT a los {estado.suspect_after_ms / 1000:.0f}s, "
+            f"DEAD a los {estado.dead_after_ms / 1000:.0f}s"
+        ),
+        box=None,
+        pad_edge=False,
+    )
+    tabla.add_column("estado", width=8)
+    tabla.add_column("dominio", style="cyan")
+    tabla.add_column("direccion")
+    tabla.add_column("usado", justify="right", style="magenta")
+    tabla.add_column("libre", justify="right", style="magenta")
+    tabla.add_column("bloques", justify="right")
+    tabla.add_column("replicas", justify="right", style="dim")
+    tabla.add_column("ultimo latido", justify="right")
+
+    for nodo in sorted(estado.nodes, key=lambda n: (n.fault_domain, n.advertise_url)):
+        color = colores.get(nodo.state, "white")
+        latido = (
+            f"{nodo.seconds_since_heartbeat:.0f}s"
+            if nodo.seconds_since_heartbeat is not None
+            else "nunca"
+        )
+        # El bloque de mas o de menos entre lo que dice el disco y lo que cree el
+        # metadato es divergencia, y verlo aqui ahorra ir a los logs.
+        replicas = str(nodo.replica_count)
+        if nodo.replica_count != nodo.block_count:
+            replicas = f"[yellow]{nodo.replica_count}[/yellow]"
+
+        tabla.add_row(
+            f"[{color}]{nodo.state}[/{color}]",
+            nodo.fault_domain or "-",
+            nodo.advertise_url,
+            _humano(nodo.used_bytes),
+            _humano(nodo.disk_free_bytes),
+            str(nodo.block_count),
+            replicas,
+            latido,
+        )
+
+    console.print(tabla)
+
+    vivos = sum(1 for n in estado.nodes if n.state == "ALIVE")
+    dominios = {n.fault_domain for n in estado.nodes if n.state == "ALIVE"}
+    console.print(
+        f"[dim]{vivos}/{len(estado.nodes)} nodos vivos en {len(dominios)} "
+        f"dominios de falla[/dim]"
+    )
+
+
 # --- Transferencia ---------------------------------------------------------
 
 
