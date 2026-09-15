@@ -18,7 +18,7 @@ from dfsha.control_node.config import ControlNodeSettings, load_settings_or_exit
 from dfsha.control_node.repositories.database import (
     build_engine,
     build_session_factory,
-    create_schema,
+    prepare_schema,
 )
 from dfsha.control_node.domain.membership import MembershipThresholds
 from dfsha.control_node.repositories.sql import SqlUnitOfWork
@@ -50,7 +50,7 @@ def create_app(settings: ControlNodeSettings | None = None) -> FastAPI:
     log = get_logger("control_node")
 
     engine = build_engine(settings.db_url)
-    create_schema(engine)
+    prepare_schema(engine)
     session_factory = build_session_factory(engine)
 
     thresholds = MembershipThresholds.from_millis(

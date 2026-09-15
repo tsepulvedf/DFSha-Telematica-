@@ -11,6 +11,12 @@ WORKDIR /app
 COPY "pyproject.toml" "README.md" "./"
 COPY "src" "./src"
 
+# Las migraciones viajan en la imagen por dos motivos: el servicio `migrate` del compose
+# las aplica con esta misma imagen, y el ControlNode necesita los scripts para comprobar
+# al arrancar que la base esta en la ultima revision.
+COPY "alembic.ini" "./"
+COPY "alembic" "./alembic"
+
 RUN pip install --no-cache-dir -e "." "grpcio-tools>=1.60"
 
 # El codigo del .proto no se versiona: se genera aqui, contra el .proto de

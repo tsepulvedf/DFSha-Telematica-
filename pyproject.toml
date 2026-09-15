@@ -21,6 +21,9 @@ dependencies = [
     "pyjwt>=2.8",
     "structlog>=24.1",
     "grpcio>=1.60",
+    # Etapa 3: el metadato pasa a PostgreSQL y el esquema se versiona.
+    "alembic>=1.13",
+    "psycopg[binary]>=3.1",
 ]
 
 [project.optional-dependencies]
