@@ -3,10 +3,22 @@
 #   cp .env.example .env    # y rellena los dos secretos
 #   docker compose up --build
 #
-# El cliente corre en el HOST y habla con los dos puertos publicados. Por eso el
-# DataNode se anuncia como http://localhost:8001: es la URL que el cliente tiene que
-# poder resolver, porque los bytes van directos del cliente al DataNode sin pasar por
-# el ControlNode. Ver DFSHA_DATANODE_BASE_URL en .env.example.
+# ESCENARIO SOPORTADO EN LA ETAPA 1: el cliente corre en el HOST y habla con los dos
+# puertos publicados. Por eso data-node-1 se anuncia como http://localhost:8001.
+#
+# La razon de que haya que elegir: los bytes van directos del cliente al DataNode, y el
+# ControlNode se limita a repetirle al cliente la URL con la que el DataNode se registro.
+# Un unico DataNode solo puede registrar una URL, y "alcanzable" significa cosas
+# distintas desde el host y desde dentro de la red de compose.
+#
+# El interruptor es una sola variable, y va SIEMPRE en data-node-1, nunca en el servicio
+# client: el cliente no lee DFSHA_DATANODE_BASE_URL, recibe la base_url dentro del plan
+# que le da el ControlNode. Ponerla en client no cambiaria nada.
+#
+#   DFSHA_DATANODE_BASE_URL=http://localhost:8001     cliente en el host (por defecto)
+#   DFSHA_DATANODE_BASE_URL=http://data-node-1:8001   cliente en un contenedor
+#
+# Los dos se excluyen. Ver "Dónde corre el cliente" en el README.
 
 # Nombre de proyecto fijo. Sin esto, Compose lo deriva del nombre del directorio, y el
 # del equipo es "DFSha telematica": con un espacio y mayusculas, que no son validos en un
@@ -64,10 +76,18 @@ services:
         condition: "service_healthy"
     restart: "unless-stopped"
 
-  # No arranca con `up`: es para correr la CLI o el GC dentro de la red de compose.
+  # No arranca con `up`: es para correr la CLI dentro de la red de compose.
   #   docker compose run --rm client ls /
-  # Para que el `put` funcione desde aqui, el DataNode debe anunciarse con su nombre
-  # de servicio: DFSHA_DATANODE_BASE_URL=http://data-node-1:8001 docker compose up
+  #
+  # Con la configuracion por defecto, desde aqui SOLO funcionan los comandos de
+  # namespace (ls, mkdir, rmdir, rm, mv, stat, cd, pwd), que son metadato puro contra el
+  # ControlNode. `put`, `get` y scripts/gc.py fallan con un error de conexion, porque el
+  # plan trae http://localhost:8001 y dentro de este contenedor localhost es el propio
+  # contenedor del cliente, no el DataNode.
+  #
+  # Para transferir desde aqui hay que cambiar de escenario, y eso deja de funcionar
+  # para el cliente del host:
+  #   DFSHA_DATANODE_BASE_URL=http://data-node-1:8001 docker compose up -d
   client:
     build:
       context: "."

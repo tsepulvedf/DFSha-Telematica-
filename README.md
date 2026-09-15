@@ -268,17 +268,53 @@ dfsha rmdir [-r] <ruta>
 
 ### Dónde corre el cliente
 
-El ControlNode le entrega al cliente la URL del DataNode tal cual el DataNode se anunció,
-porque los bytes van directos entre los dos. Eso obliga a elegir un escenario:
+**La Etapa 1 soporta el cliente en el host.** Es el escenario del arranque rápido y el
+único verificado de punta a punta.
 
-| Escenario | `DFSHA_DATANODE_BASE_URL` | Estado |
+Hay que elegir porque los bytes viajan directos entre cliente y DataNode: el ControlNode
+se limita a repetirle al cliente la URL con la que el DataNode se registró, y un solo
+DataNode solo puede registrar una. "Alcanzable" significa cosas distintas desde el host y
+desde dentro de la red de compose, y ninguna URL sirve para las dos.
+
+El interruptor es una sola variable, y va **siempre en el servicio `data-node-1`**:
+
+| Escenario | `DFSHA_DATANODE_BASE_URL` en `data-node-1` | Estado |
 |---|---|---|
-| Cliente en el host | `http://localhost:8001` | **Soportado en la Etapa 1** (valor por defecto) |
-| Cliente en un contenedor de compose | `http://data-node-1:8001` | Funciona, pero entonces el cliente del host deja de funcionar |
+| Cliente en el host | `http://localhost:8001` | **Soportado** (por defecto) |
+| Cliente en un contenedor | `http://data-node-1:8001` | Limitación conocida, ver abajo |
 
-Los dos se excluyen porque un único DataNode solo puede anunciar una URL. Con la
-Etapa 2 y N nodos, esto lo resuelve el ControlNode anunciando la dirección visible para
-cada cliente.
+No sirve de nada ponerla en el servicio `client`: el cliente nunca lee esa variable,
+recibe la `base_url` dentro del plan que le devuelve el ControlNode.
+
+#### Limitación conocida: el servicio `client` de compose
+
+Con la configuración por defecto, desde `docker compose run --rm client …` funcionan solo
+los comandos de namespace —`ls`, `mkdir`, `rmdir`, `rm`, `mv`, `stat`, `cd`, `pwd`—, que
+son metadato puro contra el ControlNode.
+
+`put`, `get` y `scripts/gc.py` **fallan ahí** con un error de conexión, porque el plan
+trae `http://localhost:8001` y dentro de ese contenedor `localhost` es el propio
+contenedor del cliente. El síntoma es un fallo en el primer bloque, no un error de
+autenticación ni de ruta.
+
+Para transferir desde un contenedor hay que cambiar de escenario, y entonces deja de
+funcionar el cliente del host:
+
+```bash
+DFSHA_DATANODE_BASE_URL=http://data-node-1:8001 docker compose up -d --build
+```
+
+Corre el GC desde el host, que es donde sí funciona en ambos casos:
+
+```bash
+export DFSHA_CONTROL_URL=http://localhost:8000
+export DFSHA_INTERNAL_SECRET=...   # el mismo valor que en .env
+python scripts/gc.py
+```
+
+Esto no es una carencia que haya que arreglar en la Etapa 1: con N DataNodes, la Etapa 2
+lo resuelve en el sitio correcto, haciendo que el ControlNode anuncie a cada cliente la
+dirección visible desde donde está.
 
 ---
 

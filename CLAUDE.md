@@ -278,10 +278,27 @@ DFSHA_JWT_SECRET=
 DFSHA_JWT_TTL_SECONDS=3600
 DFSHA_INTERNAL_SECRET=
 DFSHA_DATA_DIR=/var/lib/dfsha
+DFSHA_DATANODE_BASE_URL=http://localhost:8001
 DFSHA_DATANODE_CAPACITY_BYTES=
 DFSHA_WRITE_TTL_SECONDS=600      # vencimiento de reservas en WRITING
 DFSHA_LOG_LEVEL=INFO
 ```
+
+`DFSHA_DATANODE_BASE_URL` no estaba en la lista original y la exige el contrato: el
+DataNode tiene que decirle al ControlNode con que URL anunciarse, porque los bytes van
+directos y el ControlNode se limita a repetirsela al cliente.
+
+**Decision de la Etapa 1: el escenario soportado es el cliente en el HOST**, con
+`http://localhost:8001`. Un unico DataNode solo puede registrar una URL, y "alcanzable"
+significa cosas distintas desde el host y desde dentro de la red de compose. La variable
+la lee el DataNode al registrarse, nunca el cliente, asi que ponerla en el servicio
+`client` de compose no tiene ningun efecto.
+
+Limitacion conocida y documentada en el README: desde el contenedor `client` solo
+funcionan los comandos de namespace; `put`, `get` y el GC fallan al conectar, porque el
+plan trae `localhost` y ahi `localhost` es el propio contenedor del cliente. Se resuelve
+en la Etapa 2, en el sitio correcto: el ControlNode anunciando a cada cliente la
+direccion visible desde donde esta.
 
 `DFSHA_JWT_SECRET` y `DFSHA_INTERNAL_SECRET` **no tienen default en el código**. Si faltan,
 el servicio falla al arrancar con un mensaje claro. Un secreto por defecto en un repo
