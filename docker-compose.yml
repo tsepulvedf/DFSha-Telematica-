@@ -1,40 +1,55 @@
-# DFSha - Etapa 1: un ControlNode y un DataNode.
+# DFSha - Etapa 2: un ControlNode y cuatro DataNodes en dominios de falla distintos.
 #
 #   cp .env.example .env    # y rellena los dos secretos
 #   docker compose up --build
 #
-# ESCENARIO SOPORTADO EN LA ETAPA 1: el cliente corre en el HOST y habla con los dos
-# puertos publicados. Por eso data-node-1 se anuncia como http://localhost:8001.
+# ESCENARIO SOPORTADO: el cliente corre en el HOST y habla con los puertos publicados.
+# Por eso cada data-node-N se anuncia como http://localhost:800N.
 #
 # La razon de que haya que elegir: los bytes van directos del cliente al DataNode, y el
 # ControlNode se limita a repetirle al cliente la URL con la que el DataNode se registro.
-# Un unico DataNode solo puede registrar una URL, y "alcanzable" significa cosas
-# distintas desde el host y desde dentro de la red de compose.
+# Un DataNode solo registra una URL, y "alcanzable" significa cosas distintas desde el
+# host y desde dentro de la red de compose. Ver "Donde corre el cliente" en el README.
 #
-# El interruptor es una sola variable, y va SIEMPRE en data-node-1, nunca en el servicio
-# client: el cliente no lee DFSHA_DATANODE_BASE_URL, recibe la base_url dentro del plan
-# que le da el ControlNode. Ponerla en client no cambiaria nada.
-#
-#   DFSHA_DATANODE_BASE_URL=http://localhost:8001     cliente en el host (por defecto)
-#   DFSHA_DATANODE_BASE_URL=http://data-node-1:8001   cliente en un contenedor
-#
-# Los dos se excluyen. Ver "Dónde corre el cliente" en el README.
+# Ojo con la asimetria, que es deliberada:
+#   DFSHA_DATANODE_ADVERTISE_URL -> localhost:800N   (lo consume el CLIENTE, desde fuera)
+#   DFSHA_CONTROL_GRPC_URL       -> control-node:9000 (ControlNode<->DataNode, por dentro)
+#   DFSHA_CONTROL_URL            -> control-node:8000 (idem, confirmacion de bloque)
 
-# Nombre de proyecto fijo. Sin esto, Compose lo deriva del nombre del directorio, y el
-# del equipo es "DFSha telematica": con un espacio y mayusculas, que no son validos en un
-# nombre de proyecto. Las versiones recientes lo sanean solas, las viejas fallan al
-# arrancar. Fijarlo tambien hace que los volumenes se llamen igual en todas las maquinas.
 name: "dfsha"
+
+x-datanode-base: &datanode-base
+  build:
+    context: "."
+    dockerfile: "docker/data_node.Dockerfile"
+  image: "dfsha/data-node:0.2.0"
+  restart: "unless-stopped"
+  depends_on:
+    control-node:
+      condition: "service_healthy"
+
+x-datanode-env: &datanode-env
+  DFSHA_DATA_DIR: "/var/lib/dfsha"
+  DFSHA_CONTROL_URL: "http://control-node:8000"
+  DFSHA_CONTROL_GRPC_URL: "control-node:9000"
+  DFSHA_INTERNAL_SECRET: "${DFSHA_INTERNAL_SECRET:?falta DFSHA_INTERNAL_SECRET; copia .env.example a .env}"
+  DFSHA_DATANODE_CAPACITY_BYTES: "${DFSHA_DATANODE_CAPACITY_BYTES:-10737418240}"
+  DFSHA_LOG_LEVEL: "${DFSHA_LOG_LEVEL:-INFO}"
+  # El depends_on de abajo espera a que el ControlNode este healthy, pero no cubre que
+  # se reinicie despues: el DataNode tiene que poder volver a registrarse por su cuenta.
+  DFSHA_REGISTER_MAX_ATTEMPTS: "30"
+  DFSHA_REGISTER_RETRY_SECONDS: "2"
 
 services:
   control-node:
     build:
       context: "."
       dockerfile: "docker/control_node.Dockerfile"
-    image: "dfsha/control-node:0.1.0"
+    image: "dfsha/control-node:0.2.0"
     container_name: "dfsha-control-node"
     ports:
-      - "8000:8000"
+      - "8000:8000"   # REST, lo consume el cliente
+      - "9000:9000"   # gRPC, plano de control
     environment:
       DFSHA_DB_URL: "sqlite:////var/lib/dfsha-meta/dfsha.db"
       DFSHA_JWT_SECRET: "${DFSHA_JWT_SECRET:?falta DFSHA_JWT_SECRET; copia .env.example a .env}"
@@ -43,56 +58,87 @@ services:
       DFSHA_JWT_TTL_SECONDS: "${DFSHA_JWT_TTL_SECONDS:-3600}"
       DFSHA_WRITE_TTL_SECONDS: "${DFSHA_WRITE_TTL_SECONDS:-600}"
       DFSHA_LOG_LEVEL: "${DFSHA_LOG_LEVEL:-INFO}"
+      DFSHA_GRPC_PORT: "9000"
+      DFSHA_HEARTBEAT_INTERVAL_MS: "${DFSHA_HEARTBEAT_INTERVAL_MS:-3000}"
+      DFSHA_FULL_REPORT_EVERY_N: "${DFSHA_FULL_REPORT_EVERY_N:-20}"
+      DFSHA_SUSPECT_AFTER_MS: "${DFSHA_SUSPECT_AFTER_MS:-10000}"
+      DFSHA_DEAD_AFTER_MS: "${DFSHA_DEAD_AFTER_MS:-30000}"
+      DFSHA_MEMBERSHIP_INTERVAL_MS: "${DFSHA_MEMBERSHIP_INTERVAL_MS:-1000}"
+      DFSHA_REPLICATION_FACTOR: "${DFSHA_REPLICATION_FACTOR:-1}"
+      DFSHA_PLACEMENT_D: "${DFSHA_PLACEMENT_D:-3}"
+      DFSHA_MIN_FREE_BYTES: "${DFSHA_MIN_FREE_BYTES:-134217728}"
     volumes:
       - "dfsha-meta:/var/lib/dfsha-meta"
     restart: "unless-stopped"
 
+  # Cuatro DataNodes, cada uno en su dominio de falla. En local la separacion es logica
+  # (son contenedores del mismo host), pero el ControlNode trata el dominio como una
+  # cadena opaca, asi que el mismo codigo funciona sin cambios cuando en AWS pasan a ser
+  # zonas de disponibilidad de verdad.
+  #
+  # Para ver la RELAJACION de la restriccion de dominios, agrupa los cuatro en dos:
+  #   DFSHA_FD_1=zona-a DFSHA_FD_2=zona-a DFSHA_FD_3=zona-b DFSHA_FD_4=zona-b \
+  #     DFSHA_REPLICATION_FACTOR=3 docker compose up -d
   data-node-1:
-    build:
-      context: "."
-      dockerfile: "docker/data_node.Dockerfile"
-    image: "dfsha/data-node:0.1.0"
+    <<: *datanode-base
     container_name: "dfsha-data-node-1"
     ports:
       - "8001:8001"
     environment:
-      DFSHA_DATA_DIR: "/var/lib/dfsha"
-      DFSHA_CONTROL_URL: "http://control-node:8000"
-      # URL alcanzable por el CLIENTE, no por el ControlNode.
-      DFSHA_DATANODE_BASE_URL: "${DFSHA_DATANODE_BASE_URL:-http://localhost:8001}"
-      DFSHA_DATANODE_CAPACITY_BYTES: "${DFSHA_DATANODE_CAPACITY_BYTES:-10737418240}"
-      DFSHA_INTERNAL_SECRET: "${DFSHA_INTERNAL_SECRET:?falta DFSHA_INTERNAL_SECRET; copia .env.example a .env}"
-      DFSHA_LOG_LEVEL: "${DFSHA_LOG_LEVEL:-INFO}"
-      # Reintentos del registro, explicitos para que se vean. El depends_on de abajo
-      # espera a que el ControlNode este healthy, pero no basta por si solo: si el
-      # ControlNode se reinicia despues, el DataNode tiene que poder volver a
-      # registrarse por su cuenta. 30 intentos cada 2 s = un minuto de margen.
-      DFSHA_REGISTER_MAX_ATTEMPTS: "30"
-      DFSHA_REGISTER_RETRY_SECONDS: "2"
+      <<: *datanode-env
+      DFSHA_DATANODE_ADVERTISE_URL: "${DFSHA_ADVERTISE_1:-http://localhost:8001}"
+      DFSHA_DATANODE_FAULT_DOMAIN: "${DFSHA_FD_1:-local-1}"
     volumes:
-      - "dfsha-blocks:/var/lib/dfsha"
-    depends_on:
-      control-node:
-        condition: "service_healthy"
-    restart: "unless-stopped"
+      - "dfsha-blocks-1:/var/lib/dfsha"
+
+  data-node-2:
+    <<: *datanode-base
+    container_name: "dfsha-data-node-2"
+    ports:
+      - "8002:8001"
+    environment:
+      <<: *datanode-env
+      DFSHA_DATANODE_ADVERTISE_URL: "${DFSHA_ADVERTISE_2:-http://localhost:8002}"
+      DFSHA_DATANODE_FAULT_DOMAIN: "${DFSHA_FD_2:-local-2}"
+    volumes:
+      - "dfsha-blocks-2:/var/lib/dfsha"
+
+  data-node-3:
+    <<: *datanode-base
+    container_name: "dfsha-data-node-3"
+    ports:
+      - "8003:8001"
+    environment:
+      <<: *datanode-env
+      DFSHA_DATANODE_ADVERTISE_URL: "${DFSHA_ADVERTISE_3:-http://localhost:8003}"
+      DFSHA_DATANODE_FAULT_DOMAIN: "${DFSHA_FD_3:-local-3}"
+    volumes:
+      - "dfsha-blocks-3:/var/lib/dfsha"
+
+  data-node-4:
+    <<: *datanode-base
+    container_name: "dfsha-data-node-4"
+    ports:
+      - "8004:8001"
+    environment:
+      <<: *datanode-env
+      DFSHA_DATANODE_ADVERTISE_URL: "${DFSHA_ADVERTISE_4:-http://localhost:8004}"
+      DFSHA_DATANODE_FAULT_DOMAIN: "${DFSHA_FD_4:-local-4}"
+    volumes:
+      - "dfsha-blocks-4:/var/lib/dfsha"
 
   # No arranca con `up`: es para correr la CLI dentro de la red de compose.
   #   docker compose run --rm client ls /
   #
-  # Con la configuracion por defecto, desde aqui SOLO funcionan los comandos de
-  # namespace (ls, mkdir, rmdir, rm, mv, stat, cd, pwd), que son metadato puro contra el
-  # ControlNode. `put`, `get` y scripts/gc.py fallan con un error de conexion, porque el
-  # plan trae http://localhost:8001 y dentro de este contenedor localhost es el propio
-  # contenedor del cliente, no el DataNode.
-  #
-  # Para transferir desde aqui hay que cambiar de escenario, y eso deja de funcionar
-  # para el cliente del host:
-  #   DFSHA_DATANODE_BASE_URL=http://data-node-1:8001 docker compose up -d
+  # Dos limitaciones conocidas, documentadas en el README y comprobadas en ejecucion:
+  # desde aqui solo funcionan los comandos de namespace (put, get y el GC fallan con
+  # "Connection refused", porque el plan trae localhost y ahi localhost es este mismo
+  # contenedor), y la sesion no sobrevive entre invocaciones.
   client:
     build:
       context: "."
       dockerfile: "docker/client.Dockerfile"
-    image: "dfsha/client:0.1.0"
+    image: "dfsha/client:0.2.0"
     environment:
       DFSHA_CONTROL_URL: "http://control-node:8000"
       DFSHA_INTERNAL_SECRET: "${DFSHA_INTERNAL_SECRET:-}"
@@ -106,5 +152,8 @@ services:
 
 volumes:
   dfsha-meta:
-  dfsha-blocks:
+  dfsha-blocks-1:
+  dfsha-blocks-2:
+  dfsha-blocks-3:
+  dfsha-blocks-4:
   dfsha-client-home:

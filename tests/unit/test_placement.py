@@ -149,6 +149,33 @@ class TestPowerOfDChoices:
         for nodo_id, veces in conteo.items():
             assert 250 < veces < 420, f"{nodo_id} se lleva {veces}/1000, reparto sesgado"
 
+    def test_un_archivo_entero_alcanza_a_todos_los_nodos(self) -> None:
+        """Los bloques de un `put` se colocan TODOS en la misma llamada a
+        `/files/create`, con una unica foto de carga: la del ultimo heartbeat.
+
+        Sin contar lo ya asignado dentro de la propia llamada, cuatro nodos igual de
+        vacios y d=3 significan que el cuarto no entra en la ventana ni una sola vez en
+        todo el archivo, por muy aleatoria que sea la eleccion. Es el mismo efecto manada
+        que el power of d evita entre peticiones, reaparecido dentro de una.
+        """
+        nodos = [nodo(f"n{i}", usado=0, capacidad=10 * GB, libre=10 * GB) for i in range(1, 5)]
+        p = politica(nodos, d=3, semilla=3)
+
+        # 50 bloques de 1 MB: el archivo de la prueba de aceptacion.
+        reparto = Counter(p.select(MB, 1)[0].id for _ in range(50))
+
+        assert len(reparto) == 4, f"algun nodo se quedo sin bloques: {dict(reparto)}"
+        assert max(reparto.values()) <= 30, f"reparto concentrado: {dict(reparto)}"
+
+    def test_sin_contar_lo_asignado_el_cuarto_nodo_nunca_entraria(self) -> None:
+        # Documenta el sesgo que la prueba de arriba evita: una politica nueva por
+        # bloque (sin memoria) deja fuera al cuarto nodo de forma sistematica.
+        nodos = [nodo(f"n{i}", usado=0, capacidad=10 * GB, libre=10 * GB) for i in range(1, 5)]
+        reparto = Counter(
+            politica(nodos, d=3, semilla=s).select(MB, 1)[0].id for s in range(50)
+        )
+        assert "n4" not in reparto
+
     def test_con_d_igual_a_1_siempre_gana_el_menos_cargado(self) -> None:
         nodos = [nodo("lleno", usado=90 * GB), nodo("vacio", usado=1 * GB)]
         assert {politica(nodos, d=1, semilla=s).select(MB, 1)[0].id for s in range(20)} == {

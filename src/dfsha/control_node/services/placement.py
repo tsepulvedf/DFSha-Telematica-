@@ -92,6 +92,9 @@ class LeastLoadedPlacement:
         self._rng = rng or random.Random()
         self._clock = clock
         self._log = get_logger("control_node")
+        #: Bytes que esta politica ya ha colocado en cada nodo y que el heartbeat
+        #: todavia no refleja. Ver `_carga`.
+        self._asignado: dict[str, int] = {}
 
     # --- Evaluacion --------------------------------------------------------
 
@@ -174,6 +177,11 @@ class LeastLoadedPlacement:
             elegido = self._power_of_d(candidatos)
             elegidos.append(elegido)
             dominios_usados.add(elegido.node.fault_domain)
+            # Se contabiliza al momento: el proximo bloque de este mismo archivo ya ve
+            # a este nodo un poco mas cargado.
+            self._asignado[elegido.node.id] = (
+                self._asignado.get(elegido.node.id, 0) + block_size
+            )
 
         self._log.info(
             "placement.selected",
@@ -193,16 +201,29 @@ class LeastLoadedPlacement:
         ventana = candidatos[: self._d]
         return self._rng.choice(ventana)
 
-    @staticmethod
-    def _carga(candidato: Candidate) -> tuple[float, int, str]:
+    def _carga(self, candidato: Candidate) -> tuple[float, int, str]:
+        """Ocupacion del nodo contando lo que esta politica ya le ha asignado.
+
+        Sin esto hay un sesgo importante y facil de pasar por alto: los bloques de un
+        `put` se colocan TODOS en la misma llamada a `/files/create`, con una unica foto
+        de carga, la del ultimo heartbeat. Cuatro nodos igual de vacios y d=3 significan
+        que el cuarto no entra en la ventana ni una sola vez en todo el archivo, por muy
+        aleatoria que sea la eleccion dentro de la ventana. Es el mismo efecto manada que
+        el power of d evita entre peticiones, reaparecido dentro de una.
+
+        Contar lo ya asignado hace que el orden se reordene bloque a bloque, y entonces
+        el reparto alcanza a todos los nodos validos.
+        """
+        stats = candidato.node.stats
+        pendiente = self._asignado.get(candidato.node.id, 0)
+        capacidad = stats.capacity_bytes or candidato.node.capacity_bytes
+        ocupacion = (
+            min(1.0, (stats.used_bytes + pendiente) / capacidad) if capacidad > 0 else 1.0
+        )
         # El id entra en la clave solo para que el orden sea estable entre ejecuciones
         # cuando dos nodos empatan en todo: sin el, `sorted` es estable respecto a la
         # consulta, que no tiene por que serlo.
-        return (
-            candidato.node.stats.load_ratio,
-            candidato.node.stats.writes_in_flight,
-            candidato.node.id,
-        )
+        return (ocupacion, stats.writes_in_flight, candidato.node.id)
 
     def _fallar(
         self, block_size: int, replication_factor: int, evaluados: list[Candidate]
