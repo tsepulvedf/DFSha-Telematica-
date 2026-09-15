@@ -113,8 +113,15 @@ def login(
     sesion.token = token.access_token
     sesion.username = username
     sesion.cwd = "/"
-    store.save(sesion)
+    try:
+        store.save(sesion)
+    except DFShaError as error:
+        _fallar(error)
     console.print(f"[green]sesion iniciada como[/green] {username}")
+    # Decir donde quedo guardada: si el siguiente comando se queja de que no hay sesion,
+    # esta linea es la mitad del diagnostico. Pasa dentro de contenedores, cuando el
+    # directorio no es el que persiste.
+    console.print(f"[dim]sesion guardada en {store.path}[/dim]")
 
 
 @app.command()

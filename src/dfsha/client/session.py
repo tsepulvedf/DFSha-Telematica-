@@ -28,6 +28,10 @@ class Session:
     token: str | None = None
     username: str | None = None
     cwd: str = "/"
+    #: De donde salio (o saldria) esta sesion. Solo sirve para poder decirlo en los
+    #: mensajes de error: saber que fichero se miro ahorra la mitad del diagnostico
+    #: cuando la sesion no persiste, por ejemplo dentro de un contenedor.
+    session_path: str | None = None
 
     @property
     def is_authenticated(self) -> bool:
@@ -36,7 +40,10 @@ class Session:
     @property
     def headers(self) -> dict[str, str]:
         if not self.token:
-            raise AuthenticationError("no has iniciado sesion; usa 'dfsha login'")
+            donde = f" (sesion buscada en {self.session_path})" if self.session_path else ""
+            raise AuthenticationError(
+                f"no has iniciado sesion; usa 'dfsha login'{donde}"
+            )
         return {"Authorization": f"Bearer {self.token}"}
 
 
@@ -47,34 +54,50 @@ class SessionStore:
 
     def load(self, control_url: str) -> Session:
         if not self.path.exists():
-            return Session(control_url=control_url)
+            return Session(control_url=control_url, session_path=str(self.path))
         try:
             datos = json.loads(self.path.read_text(encoding="utf-8"))
-        except (json.JSONDecodeError, OSError):
+        except json.JSONDecodeError:
             # Una sesion corrupta no debe dejar la CLI inutilizable: se empieza de cero.
-            return Session(control_url=control_url)
+            return Session(control_url=control_url, session_path=str(self.path))
+        except OSError as exc:
+            # Hay sesion guardada pero no se puede leer, casi siempre por permisos. Antes
+            # esto se trataba como "no hay sesion", y el sintoma era un desconcertante
+            # "no has iniciado sesion" justo despues de un login que dijo que fue bien.
+            raise AuthenticationError(
+                f"hay una sesion en {self.path} pero no se puede leer: {exc.strerror or exc}"
+            ) from exc
 
         return Session(
             control_url=datos.get("control_url", control_url),
             token=datos.get("token"),
             username=datos.get("username"),
             cwd=datos.get("cwd", "/"),
+            session_path=str(self.path),
         )
 
     def save(self, session: Session) -> None:
-        self.directory.mkdir(parents=True, exist_ok=True)
-        self.path.write_text(
-            json.dumps(
-                {
-                    "control_url": session.control_url,
-                    "token": session.token,
-                    "username": session.username,
-                    "cwd": session.cwd,
-                },
-                indent=2,
-            ),
-            encoding="utf-8",
-        )
+        try:
+            self.directory.mkdir(parents=True, exist_ok=True)
+            self.path.write_text(
+                json.dumps(
+                    {
+                        "control_url": session.control_url,
+                        "token": session.token,
+                        "username": session.username,
+                        "cwd": session.cwd,
+                    },
+                    indent=2,
+                ),
+                encoding="utf-8",
+            )
+        except OSError as exc:
+            # Falla ruidosamente y diciendo donde. Un login que no consigue guardar el
+            # token y aun asi dice "sesion iniciada" deja al siguiente comando quejandose
+            # de que no hay sesion, sin ninguna pista de por que.
+            raise AuthenticationError(
+                f"no se pudo guardar la sesion en {self.path}: {exc.strerror or exc}"
+            ) from exc
         # El archivo lleva un token de acceso: solo su dueno debe poder leerlo. En
         # Windows chmod no hace gran cosa, pero en Linux y macOS, que es donde se
         # evaluara, evita dejar credenciales legibles por todo el sistema.

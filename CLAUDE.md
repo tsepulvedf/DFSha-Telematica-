@@ -294,11 +294,18 @@ significa cosas distintas desde el host y desde dentro de la red de compose. La 
 la lee el DataNode al registrarse, nunca el cliente, asi que ponerla en el servicio
 `client` de compose no tiene ningun efecto.
 
-Limitacion conocida y documentada en el README: desde el contenedor `client` solo
-funcionan los comandos de namespace; `put`, `get` y el GC fallan al conectar, porque el
-plan trae `localhost` y ahi `localhost` es el propio contenedor del cliente. Se resuelve
-en la Etapa 2, en el sitio correcto: el ControlNode anunciando a cada cliente la
-direccion visible desde donde esta.
+El contenedor `client` de compose tiene dos limitaciones conocidas, ambas comprobadas
+en ejecucion y documentadas en el README. No se arreglan en la Etapa 1 porque el
+escenario soportado es el cliente del host, y el contenedor es solo una comodidad:
+
+1. `put`, `get` y el GC fallan con "Connection refused", porque el plan trae `localhost`
+   y ahi `localhost` es el propio contenedor del cliente. Los comandos de namespace si
+   funcionan. Se resuelve en la Etapa 2, en el sitio correcto: el ControlNode anunciando
+   a cada cliente la direccion visible desde donde esta.
+2. La sesion no sobrevive entre invocaciones de `docker compose run --rm client`, pese
+   al volumen montado en `/home/dfsha/.dfsha`, que es donde `DFSHA_HOME` apunta. Si
+   alguien lo retoma: el cliente ya dice por pantalla donde guardo la sesion y que
+   fichero busco al no encontrarla, que es la mitad del diagnostico.
 
 `DFSHA_JWT_SECRET` y `DFSHA_INTERNAL_SECRET` **no tienen default en el código**. Si faltan,
 el servicio falla al arrancar con un mensaje claro. Un secreto por defecto en un repo

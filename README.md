@@ -13,42 +13,53 @@ manual de bloques huérfanos.
 
 ---
 
-## ⚠️ Validación pendiente
-
-**Los contenedores todavía no se han ejecutado.** Los tres `Dockerfile` y el
-`docker-compose.yml` están escritos y revisados, y el YAML parsea, pero nadie ha corrido
-aún `docker compose up --build` de principio a fin.
-
-Lo que **sí** está verificado de punta a punta es todo lo demás: las 196 pruebas
-automatizadas, y el recorrido completo del arranque rápido (registro, login, `mkdir -p`,
-`put` de 50 MB en 50 bloques, `get` con SHA-256 idéntico, `rm` y el ciclo del GC) contra
-un ControlNode y un DataNode reales lanzados con `uvicorn` directamente, sin Docker.
-
-Si vas a evaluar la reproducibilidad, empieza por ahí y avísanos del resultado. Esta
-sección se borra en cuanto alguien confirme el arranque con Docker.
-
----
-
 ## Arranque rápido
 
 Necesitas Docker y Python 3.11+. Debería llevarte menos de cinco minutos.
 
-### 1. Levantar el clúster
+### 1. Crear el `.env` — obligatorio antes de nada
+
+`docker compose up` **aborta** si no existe `.env` con los dos secretos rellenos:
+
+```
+falta DFSHA_JWT_SECRET; copia .env.example a .env
+```
+
+Es a propósito: los secretos no tienen valor por defecto en el código, porque uno por
+defecto en un repositorio público es un hallazgo de seguridad.
 
 ```bash
 git clone https://github.com/tsepulvedf/DFSha-Telematica-.git
 cd DFSha-Telematica-
-
-cp .env.example .env
 ```
 
-Abre `.env` y rellena los dos secretos. No tienen valor por defecto: si faltan, los
-servicios se niegan a arrancar.
+**bash / zsh / WSL:**
 
 ```bash
-python -c "import secrets; print('DFSHA_JWT_SECRET=' + secrets.token_urlsafe(48))"
-python -c "import secrets; print('DFSHA_INTERNAL_SECRET=' + secrets.token_urlsafe(48))"
+cp .env.example .env
+sed -i "s|^DFSHA_JWT_SECRET=$|DFSHA_JWT_SECRET=$(python -c 'import secrets;print(secrets.token_urlsafe(48))')|" .env
+sed -i "s|^DFSHA_INTERNAL_SECRET=$|DFSHA_INTERNAL_SECRET=$(python -c 'import secrets;print(secrets.token_urlsafe(48))')|" .env
+
+grep -E '^DFSHA_(JWT|INTERNAL)_SECRET=.+' .env    # deben salir dos líneas con valor
 ```
+
+**PowerShell:**
+
+```powershell
+Copy-Item .env.example .env
+$jwt = python -c "import secrets;print(secrets.token_urlsafe(48))"
+$int = python -c "import secrets;print(secrets.token_urlsafe(48))"
+(Get-Content .env) -replace '^DFSHA_JWT_SECRET=$', "DFSHA_JWT_SECRET=$jwt" -replace '^DFSHA_INTERNAL_SECRET=$', "DFSHA_INTERNAL_SECRET=$int" | Set-Content .env
+
+Select-String -Path .env -Pattern '^DFSHA_(JWT|INTERNAL)_SECRET=.+'   # deben salir dos
+```
+
+Rellenan las dos líneas vacías en su sitio, sin duplicar claves. En macOS el `sed -i`
+del sistema pide un argumento: usa `sed -i ''` en lugar de `sed -i`.
+
+`.env` está en `.gitignore`. No lo subas nunca.
+
+### 2. Levantar el clúster
 
 ```bash
 docker compose up --build -d
@@ -59,7 +70,7 @@ curl http://localhost:8001/health
 El DataNode se registra solo contra el ControlNode al arrancar, reintentando hasta que
 este responde.
 
-### 2. Instalar el cliente
+### 3. Instalar el cliente
 
 El cliente corre en tu máquina, no en un contenedor. Es el escenario que soporta la
 Etapa 1 (ver [Dónde corre el cliente](#dónde-corre-el-cliente)).
@@ -70,7 +81,7 @@ source .venv/bin/activate        # Windows: .venv\Scripts\activate
 pip install -e ".[dev]"
 ```
 
-### 3. Reproducir el round-trip
+### 4. Reproducir el round-trip
 
 ```bash
 export DFSHA_CONTROL_URL=http://localhost:8000
@@ -93,24 +104,38 @@ sha256sum /tmp/original.bin /tmp/bajado.bin     # deben coincidir
 ```
 
 Con el tamaño de bloque por defecto (64 MB) ese archivo cabe en un bloque. Para verlo
-partido en 50 bloques, levanta el clúster con bloques de 1 MB:
+partido en 50 bloques, pásalo en la subida:
 
 ```bash
-DFSHA_BLOCK_SIZE=1048576 docker compose up --build -d
+dfsha put --block-size 1048576 /tmp/original.bin /datos/pruebas/original.bin
+dfsha stat /datos/pruebas/original.bin     # bloques: 50
 ```
 
-o pásalo solo para esa subida: `dfsha put --block-size 1048576 ...`.
+O levanta el clúster entero con bloques de 1 MB: `DFSHA_BLOCK_SIZE=1048576 docker compose
+up --build -d`.
 
-### 4. Ver el ciclo de borrado y el GC
+### 5. Ver el ciclo de borrado y el GC
+
+Corre el GC **desde la raíz del repositorio**: lee `DFSHA_INTERNAL_SECRET` del entorno y,
+si no está, del `.env` que creaste en el paso 1. No hace falta exportar nada.
 
 ```bash
 dfsha rm /datos/pruebas/original.bin     # borrado lógico: los bloques siguen en disco
-curl http://localhost:8001/health        # used_bytes todavía alto
+curl http://localhost:8001/health        # used_bytes todavía alto, block_count intacto
 
-python scripts/gc.py --dry-run           # qué se borraría
-python scripts/gc.py                     # borrarlo de verdad
+python scripts/gc.py --dry-run           # lista los huérfanos sin borrar nada
+python scripts/gc.py                     # borrarlos de verdad
 
-curl http://localhost:8001/health        # used_bytes de vuelta a su valor previo
+curl http://localhost:8001/health        # used_bytes y block_count de vuelta a cero
+```
+
+Si lo ejecutas desde otro directorio no encontrará el `.env`, y entonces sí hay que
+pasarle el secreto:
+
+```bash
+export DFSHA_INTERNAL_SECRET=...              # bash: el mismo valor que en .env
+$env:DFSHA_INTERNAL_SECRET = "..."            # PowerShell
+python scripts/gc.py --internal-secret ...    # o directamente por argumento
 ```
 
 ---
@@ -286,16 +311,43 @@ El interruptor es una sola variable, y va **siempre en el servicio `data-node-1`
 No sirve de nada ponerla en el servicio `client`: el cliente nunca lee esa variable,
 recibe la `base_url` dentro del plan que le devuelve el ControlNode.
 
-#### Limitación conocida: el servicio `client` de compose
+#### Limitaciones conocidas del servicio `client` de compose
 
-Con la configuración por defecto, desde `docker compose run --rm client …` funcionan solo
-los comandos de namespace —`ls`, `mkdir`, `rmdir`, `rm`, `mv`, `stat`, `cd`, `pwd`—, que
-son metadato puro contra el ControlNode.
+El contenedor `client` existe para poder usar la CLI sin instalar Python, y trae el
+`ENTRYPOINT` ya puesto, así que los comandos se invocan **sin repetir `dfsha`**:
 
-`put`, `get` y `scripts/gc.py` **fallan ahí** con un error de conexión, porque el plan
-trae `http://localhost:8001` y dentro de ese contenedor `localhost` es el propio
-contenedor del cliente. El síntoma es un fallo en el primer bloque, no un error de
-autenticación ni de ruta.
+```bash
+docker compose run --rm client ls /        # correcto
+docker compose run --rm client dfsha ls /  # NO: 'dfsha' sería el nombre de la ruta
+```
+
+Tiene dos limitaciones, ambas comprobadas en ejecución. Las dos desaparecen usando el
+cliente del host, que es el escenario soportado.
+
+**1. `put`, `get` y el GC no funcionan desde ahí.** Fallan con
+`[Errno 111] Connection refused` en el primer bloque, porque el plan trae
+`http://localhost:8001` y dentro de ese contenedor `localhost` es el propio contenedor
+del cliente. Los comandos de namespace —`ls`, `mkdir`, `rmdir`, `rm`, `mv`, `stat`— sí
+funcionan: son metadato puro contra el ControlNode. El síntoma es un error de conexión,
+no de autenticación ni de ruta.
+
+**2. La sesión no sobrevive entre invocaciones.** Tras un `login` correcto, el siguiente
+`docker compose run` responde `no has iniciado sesion`. Cada `run` es un contenedor
+nuevo, y aunque hay un volumen `dfsha-client-home` montado en `/home/dfsha/.dfsha`
+—donde el cliente escribe, según `DFSHA_HOME`—, el `session.json` no reaparece.
+
+No se ha arreglado en la Etapa 1: el escenario soportado es el cliente del host, donde la
+sesión persiste en `~/.dfsha/session.json` sin nada de por medio, y el contenedor solo
+es una comodidad. Lo que sí se hizo fue dejar de esconder el fallo: `login` imprime ahora
+dónde guardó la sesión y el error de "no has iniciado sesión" dice qué fichero miró, así
+que un vistazo a esas dos líneas basta para localizar el problema.
+
+Si necesitas la CLI en contenedor con sesión persistente, encadena los comandos en una
+sola invocación, que sí comparte el sistema de ficheros:
+
+```bash
+docker compose run --rm --entrypoint sh client -c "dfsha login ana --password X && dfsha ls /"
+```
 
 Para transferir desde un contenedor hay que cambiar de escenario, y entonces deja de
 funcionar el cliente del host:

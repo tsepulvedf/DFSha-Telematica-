@@ -24,10 +24,43 @@ import argparse
 import os
 import sys
 from dataclasses import dataclass, field
+from pathlib import Path
 
 import httpx
 
 INTERNAL_SECRET_HEADER = "X-DFSha-Internal-Secret"
+
+
+def leer_env(nombre: str) -> str | None:
+    """Busca una variable en el entorno y, si no esta, en el .env de la raiz.
+
+    El .env ya existe porque docker compose lo necesita, y sin esto el GC pedia que el
+    secreto se exportara ademas a mano en la shell. Es el mismo fichero y el mismo valor:
+    hacer que el script lo lea evita un paso que es facil de olvidar y cuyo unico sintoma
+    es un "falta el secreto interno" que no dice de donde sacarlo.
+
+    Parseo deliberadamente simple: KEY=VALOR, sin sustituciones ni comillas multilinea.
+    Es lo que .env.example contiene.
+    """
+    valor = os.environ.get(nombre)
+    if valor:
+        return valor
+
+    env = Path(__file__).resolve().parent.parent / ".env"
+    if not env.exists():
+        return None
+
+    try:
+        for linea in env.read_text(encoding="utf-8").splitlines():
+            linea = linea.strip()
+            if not linea or linea.startswith("#") or "=" not in linea:
+                continue
+            clave, _, bruto = linea.partition("=")
+            if clave.strip() == nombre:
+                return bruto.strip().strip("\"'") or None
+    except OSError:
+        return None
+    return None
 
 
 @dataclass
@@ -129,13 +162,16 @@ def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     parser.add_argument(
         "--control-url",
-        default=os.environ.get("DFSHA_CONTROL_URL", "http://localhost:8000"),
-        help="URL del ControlNode.",
+        default=leer_env("DFSHA_CONTROL_URL") or "http://localhost:8000",
+        help="URL del ControlNode (por defecto DFSHA_CONTROL_URL, o el .env de la raiz).",
     )
     parser.add_argument(
         "--internal-secret",
-        default=os.environ.get("DFSHA_INTERNAL_SECRET"),
-        help="Secreto del plano interno (por defecto, DFSHA_INTERNAL_SECRET).",
+        default=leer_env("DFSHA_INTERNAL_SECRET"),
+        help=(
+            "Secreto del plano interno. Por defecto DFSHA_INTERNAL_SECRET del entorno "
+            "y, si no esta, del .env de la raiz del repositorio."
+        ),
     )
     parser.add_argument(
         "--dry-run",
@@ -145,9 +181,13 @@ def main(argv: list[str] | None = None) -> int:
     args = parser.parse_args(argv)
 
     if not args.internal_secret:
+        raiz = Path(__file__).resolve().parent.parent
         print(
-            "falta el secreto interno: exporta DFSHA_INTERNAL_SECRET o usa "
-            "--internal-secret",
+            "falta el secreto interno. El GC lo busca, en este orden:\n"
+            "  1. la variable de entorno DFSHA_INTERNAL_SECRET\n"
+            f"  2. DFSHA_INTERNAL_SECRET en {raiz / '.env'}\n"
+            "  3. la opcion --internal-secret\n"
+            "Tiene que ser el MISMO valor con el que arrancaron los servicios.",
             file=sys.stderr,
         )
         return 2
