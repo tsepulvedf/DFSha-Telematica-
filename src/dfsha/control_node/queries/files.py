@@ -58,17 +58,33 @@ def open_file(uow: SqlUnitOfWork, owner_id: str, raw_path: str) -> ReadPlan:
                 r for r in replicas.get(bloque.block_id, []) if r.state is ReplicaState.STORED
             ]
             if not almacenadas or bloque.checksum_sha256 is None:
-                # Un archivo COMMITTED no deberia llegar aqui: el commit exige que todos
-                # sus bloques esten STORED. Si pasa, el metadato esta corrupto y es mejor
-                # decirlo que entregar un archivo incompleto.
+                # Con R=1, un nodo caido deja su archivo ilegible. El cliente tiene que
+                # saber QUE bloque falta y EN QUE NODO estaba: un timeout generico le
+                # haria buscar el problema en su red. Se dice donde estaba la replica
+                # aunque ahora este MISSING, porque es justo el dato que permite decidir
+                # si hay que levantar ese nodo o darlo por perdido.
+                ubicaciones = [
+                    f"{r.data_node_id}"
+                    + (f" ({nodo.advertise_url}, {r.state.value})" if nodo else "")
+                    for r in replicas.get(bloque.block_id, [])
+                    if (nodo := uow.data_nodes.get(r.data_node_id)) or True
+                ]
                 raise NotFoundError(
-                    "el archivo tiene bloques sin replica disponible",
+                    "el archivo no se puede leer: le falta un bloque. "
+                    f"Bloque {bloque.index} ({bloque.block_id}) de {len(bloques)}, "
+                    + (
+                        f"que estaba en: {'; '.join(ubicaciones)}"
+                        if ubicaciones
+                        else "sin ninguna replica registrada"
+                    ),
                     path=str(path),
                     block_id=bloque.block_id,
+                    block_index=bloque.index,
+                    replicas=ubicaciones,
                 )
 
             nodos = [
-                (r.data_node_id, nodo.base_url)
+                (r.data_node_id, nodo.advertise_url)
                 for r in almacenadas
                 if (nodo := uow.data_nodes.get(r.data_node_id)) is not None
             ]

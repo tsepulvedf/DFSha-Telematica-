@@ -10,7 +10,7 @@ from __future__ import annotations
 import sys
 from functools import lru_cache
 
-from pydantic import Field, ValidationError, field_validator
+from pydantic import Field, ValidationError, field_validator, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 __all__ = ["ControlNodeSettings", "get_settings", "load_settings_or_exit"]
@@ -38,6 +38,38 @@ class ControlNodeSettings(BaseSettings):
     jwt_ttl_seconds: int = Field(default=3600, gt=0)
     write_ttl_seconds: int = Field(default=600, gt=0)
     log_level: str = "INFO"
+
+    # --- Plano de control (Etapa 2) ---------------------------------------
+    grpc_port: int = Field(default=9000, gt=0, lt=65536)
+    heartbeat_interval_ms: int = Field(default=3000, gt=0)
+    full_report_every_n: int = Field(default=20, gt=0)
+    #: Umbrales agresivos a proposito: con un latido cada 3 s, 10 s son tres perdidos y
+    #: 30 s son diez. Se eligieron para que la transicion quepa en la demostracion del
+    #: hito; en produccion serian mucho mas largos.
+    suspect_after_ms: int = Field(default=10_000, gt=0)
+    dead_after_ms: int = Field(default=30_000, gt=0)
+    #: Cada cuanto corre el evaluador de pertenencia. Configurable a proposito: es lo que
+    #: marca cuanto tarda en registrarse una transicion cuando nadie esta consultando.
+    membership_interval_ms: int = Field(default=1000, gt=0)
+    #: Hilos del servidor gRPC. Cada stream de heartbeat ocupa uno mientras esta abierto,
+    #: asi que tiene que sobrar sitio respecto al numero de DataNodes.
+    grpc_max_workers: int = Field(default=16, gt=0)
+
+    # --- Colocacion --------------------------------------------------------
+    replication_factor: int = Field(default=1, gt=0)
+    placement_d: int = Field(default=3, gt=0)
+    #: Margen de seguridad: un nodo necesita block_size + esto para ser candidato.
+    min_free_bytes: int = Field(default=128 * 1024 * 1024, ge=0)
+
+    @model_validator(mode="after")
+    def _umbrales_coherentes(self) -> "ControlNodeSettings":
+        if self.suspect_after_ms >= self.dead_after_ms:
+            raise ValueError(
+                "DFSHA_SUSPECT_AFTER_MS debe ser menor que DFSHA_DEAD_AFTER_MS; si no, "
+                "el estado SUSPECT no existiria y un hipo de red costaria dar por "
+                "perdidas las replicas de un nodo que sigue vivo"
+            )
+        return self
 
     @field_validator("jwt_secret", "internal_secret")
     @classmethod

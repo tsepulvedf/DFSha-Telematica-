@@ -11,7 +11,12 @@ WORKDIR /app
 COPY "pyproject.toml" "README.md" "./"
 COPY "src" "./src"
 
-RUN pip install --no-cache-dir -e "."
+RUN pip install --no-cache-dir -e "." "grpcio-tools>=1.60"
+
+# El codigo del .proto no se versiona: se genera aqui, contra el .proto de
+# esta imagen, de modo que no puede quedar desincronizado.
+COPY "scripts/gen_proto.py" "./scripts/gen_proto.py"
+RUN python scripts/gen_proto.py
 
 # La base de datos vive en un volumen, no en la capa de imagen.
 RUN mkdir -p "/var/lib/dfsha-meta"

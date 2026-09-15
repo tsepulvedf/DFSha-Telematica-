@@ -32,5 +32,10 @@ jobs:
           python -m pip install --upgrade pip
           pip install -e ".[dev]"
 
+      - name: Generate gRPC code
+        # El .proto se versiona y lo generado no, asi que el CI lo regenera en cada
+        # ejecucion: eso garantiza que los stubs corresponden al .proto del commit.
+        run: python scripts/gen_proto.py
+
       - name: Run tests
         run: pytest -q

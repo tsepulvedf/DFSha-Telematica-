@@ -7,6 +7,7 @@ acepta, que es como se comprueba que las costuras existen de verdad.
 
 from __future__ import annotations
 
+import socket
 from pathlib import Path as FsPath
 
 import pytest
@@ -21,6 +22,18 @@ SECRETO_JWT = "pruebas-jwt-no-es-un-secreto-real"
 SECRETO_INTERNO = "pruebas-interno-no-es-un-secreto-real"
 
 
+def puerto_libre() -> int:
+    """Un puerto que nadie esta usando.
+
+    Cada app levanta su servidor gRPC del plano de control, asi que dos pruebas con el
+    puerto por defecto chocarian. Se pide uno al sistema en vez de repartir numeros fijos
+    entre ficheros de prueba.
+    """
+    with socket.socket() as s:
+        s.bind(("127.0.0.1", 0))
+        return s.getsockname()[1]
+
+
 def build_settings(tmp_path: FsPath, **overrides) -> ControlNodeSettings:
     valores = dict(
         db_url=f"sqlite:///{(tmp_path / 'dfsha.db').as_posix()}",
@@ -29,6 +42,7 @@ def build_settings(tmp_path: FsPath, **overrides) -> ControlNodeSettings:
         block_size=MB,
         write_ttl_seconds=600,
         log_level="WARNING",
+        grpc_port=puerto_libre(),
     )
     valores.update(overrides)
     return ControlNodeSettings(**valores)

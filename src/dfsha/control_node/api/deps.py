@@ -16,7 +16,11 @@ from dfsha.common.errors import AuthenticationError
 from dfsha.control_node.config import ControlNodeSettings
 from dfsha.control_node.repositories.sql import SqlUnitOfWork
 from dfsha.control_node.services.auth import TokenClaims, decode_access_token
-from dfsha.control_node.services.placement import BlockPlacementPolicy, SingleNodePlacement
+from dfsha.control_node.domain.membership import MembershipThresholds
+from dfsha.control_node.services.placement import (
+    BlockPlacementPolicy,
+    LeastLoadedPlacement,
+)
 
 __all__ = [
     "INTERNAL_SECRET_HEADER",
@@ -57,10 +61,18 @@ def get_uow(
 
 def get_placement(
     uow: Annotated[SqlUnitOfWork, Depends(get_uow)],
+    settings: Annotated[ControlNodeSettings, Depends(get_settings_dep)],
 ) -> BlockPlacementPolicy:
     """La politica lee los DataNodes por la misma unidad de trabajo que el caso de uso,
     para que la eleccion vea el mismo estado que el resto de la operacion."""
-    return SingleNodePlacement(uow.data_nodes)
+    return LeastLoadedPlacement(
+        uow.data_nodes,
+        thresholds=MembershipThresholds.from_millis(
+            settings.suspect_after_ms, settings.dead_after_ms
+        ),
+        d=settings.placement_d,
+        min_free_bytes=settings.min_free_bytes,
+    )
 
 
 def current_user(

@@ -16,7 +16,12 @@ COPY "pyproject.toml" "README.md" "./"
 COPY "src" "./src"
 COPY "scripts" "./scripts"
 
-RUN pip install --no-cache-dir -e "."
+RUN pip install --no-cache-dir -e "." "grpcio-tools>=1.60"
+
+# El codigo del .proto no se versiona: se genera aqui, contra el .proto de
+# esta imagen, de modo que no puede quedar desincronizado.
+COPY "scripts/gen_proto.py" "./scripts/gen_proto.py"
+RUN python scripts/gen_proto.py
 
 # ~/.dfsha guarda token y cwd. Montarlo como volumen conserva la sesion entre
 # invocaciones de `docker compose run`.

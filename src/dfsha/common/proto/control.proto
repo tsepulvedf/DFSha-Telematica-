@@ -1,0 +1,90 @@
+// Plano de control ControlNode <-> DataNode.
+//
+// gRPC SOLO aqui. El trafico de cliente (cliente<->ControlNode y cliente<->DataNode)
+// sigue en REST y no cambia. El criterio esta en CLAUDE.md: el trafico de control son
+// mensajes frecuentes, pequenos y de esquema fijo, donde Protobuf y una conexion
+// persistente pagan; el de cliente mueve bytes crudos, se depura con curl y se beneficia
+// de una API legible.
+//
+// Este fichero se versiona; el codigo generado NO (esta en .gitignore). Se regenera con
+// `python scripts/gen_proto.py`, que corre en el CI y en los Dockerfiles.
+
+syntax = "proto3";
+
+package dfsha.control.v1;
+
+service ControlPlane {
+  // Alta del nodo. Idempotente: un reinicio reenvia su data_node_id y conserva su
+  // identidad, porque las replicas ya registradas apuntan a ese id.
+  rpc Register    (RegisterRequest)          returns (RegisterResponse);
+
+  // Stream bidireccional. Hoy el ControlNode solo responde Ack y, cuando le falta
+  // informacion, FullReportReq. El canal es bidireccional desde ya porque es por donde
+  // la Etapa 3 empujara las ordenes de re-replicacion.
+  rpc Heartbeat   (stream HeartbeatRequest)  returns (stream ControlMessage);
+
+  // Report completo, fuera de banda respecto al heartbeat: puede ser grande.
+  rpc BlockReport (BlockReportRequest)       returns (BlockReportResponse);
+}
+
+message RegisterRequest {
+  string advertise_url    = 1;  // alcanzable por el CLIENTE, no por el ControlNode
+  string fault_domain     = 2;  // cadena opaca; el ControlNode solo compara igualdad
+  string boot_id          = 3;  // UUID nuevo en cada arranque con disco vacio
+  uint64 capacity_bytes   = 4;
+  string data_node_id     = 5;  // vacio en el primer registro
+}
+
+message RegisterResponse {
+  string data_node_id           = 1;
+  uint32 heartbeat_interval_ms  = 2;
+  uint32 full_report_every_n    = 3;
+}
+
+message NodeStats {
+  uint64 used_bytes        = 1;
+  uint64 capacity_bytes    = 2;
+  uint64 disk_free_bytes   = 3;   // de shutil.disk_usage, NO capacity - used
+  uint32 block_count       = 4;
+  uint32 writes_in_flight  = 5;
+  uint32 reads_in_flight   = 6;
+  uint64 bytes_written_60s = 7;
+}
+
+message HeartbeatRequest {
+  string   data_node_id     = 1;
+  string   boot_id          = 2;
+  uint64   sequence         = 3;   // monotona por arranque
+  NodeStats stats           = 4;
+  repeated string added_block_ids   = 5;  // desde el heartbeat anterior
+  repeated string removed_block_ids = 6;
+}
+
+message ControlMessage {
+  oneof payload {
+    Ack           ack            = 1;
+    FullReportReq full_report    = 2;
+    // Etapa 3: ReplicateBlock, DeleteBlock
+  }
+}
+
+message Ack           { uint64 acked_sequence = 1; }
+message FullReportReq { string reason = 1; }
+
+message BlockReportRequest {
+  string   data_node_id = 1;
+  string   boot_id      = 2;
+  bool     is_full      = 3;
+  repeated BlockInfo blocks = 4;
+}
+
+message BlockInfo {
+  string block_id       = 1;
+  uint64 size           = 2;
+  string checksum_sha256 = 3;
+}
+
+message BlockReportResponse {
+  uint32 unknown_blocks  = 1;  // reportados que el metadato no conoce
+  uint32 missing_blocks  = 2;  // esperados que el nodo no reporto
+}

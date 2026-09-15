@@ -28,6 +28,7 @@ from dfsha.control_node.domain.entities import (
     Directory,
     File,
     FileState,
+    NodeStats,
     ReplicaState,
     User,
 )
@@ -110,11 +111,24 @@ def _to_replica(row: BlockReplicaRow) -> BlockReplica:
 def _to_data_node(row: DataNodeRow) -> DataNode:
     return DataNode(
         id=row.id,
-        base_url=row.base_url,
+        advertise_url=row.advertise_url,
         capacity_bytes=row.capacity_bytes,
         used_bytes=row.used_bytes,
         state=DataNodeState(row.state),
         registered_at=row.registered_at,
+        fault_domain=row.fault_domain,
+        boot_id=row.boot_id,
+        last_heartbeat_at=row.last_heartbeat_at,
+        last_sequence=row.last_sequence,
+        stats=NodeStats(
+            used_bytes=row.stat_used_bytes,
+            capacity_bytes=row.stat_capacity_bytes,
+            disk_free_bytes=row.stat_disk_free_bytes,
+            block_count=row.stat_block_count,
+            writes_in_flight=row.stat_writes_in_flight,
+            reads_in_flight=row.stat_reads_in_flight,
+            bytes_written_60s=row.stat_bytes_written_60s,
+        ),
     )
 
 
@@ -506,6 +520,67 @@ class SqlBlockRepository:
         ).rowcount
         return int(borrados or 0)
 
+    def list_block_ids_on_node(
+        self, data_node_id: str, states: Sequence[ReplicaState] = (ReplicaState.STORED,)
+    ) -> list[str]:
+        """Bloques que el metadato cree que ese nodo tiene.
+
+        Es el lado "esperado" de la comparacion con lo que el nodo reporta. Por defecto
+        solo STORED: un PENDING todavia se esta subiendo y su ausencia no es divergencia.
+        """
+        rows = self._session.scalars(
+            select(BlockReplicaRow.block_id).where(
+                BlockReplicaRow.data_node_id == data_node_id,
+                BlockReplicaRow.state.in_([e.value for e in states]),
+            )
+        )
+        return list(rows)
+
+    def set_replicas_state(
+        self, block_ids: Sequence[str], data_node_id: str, state: ReplicaState
+    ) -> int:
+        if not block_ids:
+            return 0
+        resultado = self._session.execute(
+            update(BlockReplicaRow)
+            .where(
+                BlockReplicaRow.block_id.in_(list(block_ids)),
+                BlockReplicaRow.data_node_id == data_node_id,
+            )
+            .values(state=state.value)
+        )
+        return int(resultado.rowcount or 0)
+
+    def mark_node_replicas(
+        self,
+        data_node_id: str,
+        state: ReplicaState,
+        only_from: Sequence[ReplicaState] | None = None,
+    ) -> int:
+        """Cambia de estado TODAS las replicas de un nodo.
+
+        Lo usan dos casos: un nodo que pasa a DEAD (sus replicas dejan de ser legibles) y
+        uno que vuelve con el disco vacio (sus replicas se dan por perdidas). Nunca borra
+        filas: MISSING es informacion que la Etapa 3 necesita para re-replicar.
+        """
+        condiciones = [BlockReplicaRow.data_node_id == data_node_id]
+        if only_from is not None:
+            condiciones.append(BlockReplicaRow.state.in_([e.value for e in only_from]))
+
+        resultado = self._session.execute(
+            update(BlockReplicaRow).where(*condiciones).values(state=state.value)
+        )
+        return int(resultado.rowcount or 0)
+
+    def count_replicas_by_node(self) -> dict[str, int]:
+        """Cuantas replicas STORED tiene cada nodo. Para `/cluster/status`."""
+        filas = self._session.execute(
+            select(BlockReplicaRow.data_node_id, func.count())
+            .where(BlockReplicaRow.state == ReplicaState.STORED.value)
+            .group_by(BlockReplicaRow.data_node_id)
+        )
+        return {nodo: int(total) for nodo, total in filas}
+
     def total_size(self, block_ids: Sequence[str]) -> int:
         if not block_ids:
             return 0
@@ -521,39 +596,126 @@ class SqlDataNodeRepository:
     def __init__(self, session: Session) -> None:
         self._session = session
 
-    def register(self, base_url: str, capacity_bytes: int, now: datetime) -> DataNode:
-        row = self._session.scalar(
-            select(DataNodeRow).where(DataNodeRow.base_url == base_url)
-        )
+    def register(
+        self,
+        advertise_url: str,
+        capacity_bytes: int,
+        now: datetime,
+        fault_domain: str = "",
+        boot_id: str = "",
+        data_node_id: str | None = None,
+    ) -> DataNode:
+        """Alta o re-alta de un nodo.
+
+        La identidad la manda el `data_node_id` que el nodo envia: lo persiste en su
+        disco y lo reenvia en cada arranque, asi que reiniciarlo no puede producir un
+        nodo nuevo al que ninguna replica apunte. Solo si no lo manda (primer arranque)
+        se busca por `advertise_url`, que es el siguiente identificador mas estable.
+
+        Este metodo no decide que significa el re-alta: eso es del dominio
+        (`classify_rejoin`), que compara el `boot_id` guardado con el que llega. Aqui
+        solo se escribe.
+        """
+        row = None
+        if data_node_id:
+            row = self._session.get(DataNodeRow, data_node_id)
+        if row is None:
+            row = self._session.scalar(
+                select(DataNodeRow).where(DataNodeRow.advertise_url == advertise_url)
+            )
+
         if row is None:
             row = DataNodeRow(
-                id=new_id(),
-                base_url=base_url,
+                id=data_node_id or new_id(),
+                advertise_url=advertise_url,
+                fault_domain=fault_domain,
+                boot_id=boot_id,
                 capacity_bytes=capacity_bytes,
                 used_bytes=0,
                 state=DataNodeState.ALIVE.value,
                 registered_at=now,
+                last_heartbeat_at=None,
+                last_sequence=0,
+                stat_capacity_bytes=capacity_bytes,
             )
             self._session.add(row)
-            self._session.flush()
         else:
-            # Reinicio de un nodo ya conocido: conserva su id, porque las replicas
-            # existentes apuntan a el.
+            # Un nodo conocido conserva su id. Lo demas puede haber cambiado: se
+            # redespliega con otra URL anunciada, se le cambia el dominio de falla, o
+            # arranca con el disco vacio y otro boot_id.
+            row.advertise_url = advertise_url
+            row.fault_domain = fault_domain
+            row.boot_id = boot_id
             row.capacity_bytes = capacity_bytes
             row.state = DataNodeState.ALIVE.value
+        self._session.flush()
         return _to_data_node(row)
 
     def get(self, data_node_id: str) -> DataNode | None:
         row = self._session.get(DataNodeRow, data_node_id)
         return _to_data_node(row) if row else None
 
+    def get_by_advertise_url(self, advertise_url: str) -> DataNode | None:
+        row = self._session.scalar(
+            select(DataNodeRow).where(DataNodeRow.advertise_url == advertise_url)
+        )
+        return _to_data_node(row) if row else None
+
+    def list_all(self) -> list[DataNode]:
+        """Todos los nodos, en cualquier estado.
+
+        Es lo que usan la colocacion y `/cluster/status`, porque el estado real se deriva
+        del ultimo heartbeat, no de la columna. Filtrar aqui por la columna dejaria fuera
+        a un nodo que acaba de volver y cuya fila todavia dice SUSPECT.
+        """
+        rows = self._session.scalars(
+            select(DataNodeRow).order_by(DataNodeRow.registered_at)
+        )
+        return [_to_data_node(row) for row in rows]
+
     def list_alive(self) -> list[DataNode]:
+        """Nodos cuya columna `state` dice ALIVE.
+
+        Se conserva para las rutas que no tienen reloj ni umbrales a mano. Para decidir
+        colocacion, usa `list_all()` y deriva el estado con `membership.state_for`.
+        """
         rows = self._session.scalars(
             select(DataNodeRow)
             .where(DataNodeRow.state == DataNodeState.ALIVE.value)
             .order_by(DataNodeRow.registered_at)
         )
         return [_to_data_node(row) for row in rows]
+
+    def record_heartbeat(
+        self,
+        data_node_id: str,
+        sequence: int,
+        stats: NodeStats,
+        now: datetime,
+    ) -> None:
+        """Guarda el ultimo latido. Esto es la fuente de verdad de la colocacion."""
+        self._session.execute(
+            update(DataNodeRow)
+            .where(DataNodeRow.id == data_node_id)
+            .values(
+                last_heartbeat_at=now,
+                last_sequence=sequence,
+                stat_used_bytes=stats.used_bytes,
+                stat_capacity_bytes=stats.capacity_bytes,
+                stat_disk_free_bytes=stats.disk_free_bytes,
+                stat_block_count=stats.block_count,
+                stat_writes_in_flight=stats.writes_in_flight,
+                stat_reads_in_flight=stats.reads_in_flight,
+                stat_bytes_written_60s=stats.bytes_written_60s,
+            )
+        )
+
+    def set_state(self, data_node_id: str, state: DataNodeState) -> None:
+        self._session.execute(
+            update(DataNodeRow)
+            .where(DataNodeRow.id == data_node_id)
+            .values(state=state.value)
+        )
 
     def add_used_bytes(self, data_node_id: str, delta: int) -> None:
         """Ajusta el ocupado que el ControlNode tiene registrado de ese nodo.

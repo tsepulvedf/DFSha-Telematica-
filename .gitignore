@@ -20,6 +20,10 @@ dfsha.db
 testfiles/
 *.bin
 
+# Codigo generado desde el .proto: se regenera en el build y en el CI.
+# Versionarlo ata el repositorio a la version exacta de protobuf con la que se genero.
+src/dfsha/common/proto/gen/
+
 # Python
 __pycache__/
 *.py[cod]

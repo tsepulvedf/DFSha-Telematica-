@@ -20,12 +20,15 @@ dependencies = [
     "bcrypt>=4.0.1,<4.1",
     "pyjwt>=2.8",
     "structlog>=24.1",
+    "grpcio>=1.60",
 ]
 
 [project.optional-dependencies]
 dev = [
     "pytest>=8.2",
     "pytest-asyncio>=0.23",
+    # Solo para generar el codigo del .proto; no hace falta en produccion.
+    "grpcio-tools>=1.60",
 ]
 
 [project.scripts]

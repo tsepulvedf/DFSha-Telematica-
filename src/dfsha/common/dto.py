@@ -39,6 +39,8 @@ __all__ = [
     "OrphanBlocksResponse",
     "GcConfirmRequest",
     "HealthResponse",
+    "DataNodeStatus",
+    "ClusterStatusResponse",
     "ErrorResponse",
 ]
 
@@ -222,6 +224,40 @@ class HealthResponse(_Dto):
     block_count: int
     disk_free_bytes: int
     data_node_id: str | None = None
+    #: Etapa 2: para poder comprobar desde fuera en que dominio esta y con que disco
+    #: arranco, sin tener que mirar los logs del ControlNode.
+    fault_domain: str | None = None
+    boot_id: str | None = None
+
+
+class DataNodeStatus(_Dto):
+    """Un DataNode visto desde el ControlNode.
+
+    `state` se deriva del ultimo heartbeat en el momento de la consulta, no de una
+    columna que alguien tenga que acordarse de actualizar.
+    """
+
+    data_node_id: str
+    advertise_url: str
+    fault_domain: str
+    state: Literal["ALIVE", "SUSPECT", "DEAD"]
+    used_bytes: int
+    capacity_bytes: int
+    disk_free_bytes: int
+    block_count: int
+    #: Replicas que el METADATO cree que tiene. Comparada con `block_count`, que sale del
+    #: disco del nodo, la diferencia entre las dos es divergencia.
+    replica_count: int
+    seconds_since_heartbeat: float | None
+    writes_in_flight: int
+    reads_in_flight: int
+
+
+class ClusterStatusResponse(_Dto):
+    nodes: list[DataNodeStatus]
+    replication_factor: int
+    suspect_after_ms: int
+    dead_after_ms: int
 
 
 class ErrorResponse(_Dto):
