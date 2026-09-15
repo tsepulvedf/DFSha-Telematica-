@@ -29,6 +29,7 @@ __all__ = [
     "MoveDecision",
     "ensure_directory_is_empty",
     "ensure_name_is_free",
+    "ensure_no_live_reservation",
     "ensure_visible",
     "ensure_can_commit",
     "ensure_can_abort",
@@ -55,6 +56,30 @@ def ensure_name_is_free(path: Path, existing: File | None, now: datetime | None 
     """
     if existing is not None and existing.holds_name(now or utcnow()):
         raise AlreadyExistsError("ya existe un archivo en esa ruta", path=str(path))
+
+
+def ensure_no_live_reservation(
+    path: Path, existing: File | None, now: datetime | None = None
+) -> None:
+    """Lo que puede impedir un `create`, que no es lo mismo que un nombre ocupado.
+
+    Un archivo COMMITTED no estorba: escribir sobre una ruta existente es copy-on-write,
+    se suben bloques nuevos y el viejo pasa a DELETED en el commit. Lo que si se rechaza
+    es una reserva WRITING todavia viva, porque hay otro cliente subiendo a ese nombre
+    ahora mismo y el segundo commit dejaria sus bloques huerfanos sin que nadie se entere.
+
+    Una reserva vencida no estorba: quien la pidio ya no esta.
+    """
+    if existing is None:
+        return
+    if existing.state is not FileState.WRITING:
+        return
+    if not existing.is_expired(now or utcnow()):
+        raise AlreadyExistsError(
+            "hay una escritura en curso sobre esa ruta",
+            path=str(path),
+            file_id=existing.id,
+        )
 
 
 def ensure_visible(path: Path, file: File | None, now: datetime | None = None) -> File:

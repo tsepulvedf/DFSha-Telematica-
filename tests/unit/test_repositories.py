@@ -168,6 +168,32 @@ class TestUsuariosYDirectorios:
 
         assert uow.directories.count_children(raiz.id) == 2
 
+    def test_un_directorio_borrado_es_invisible_y_libera_el_nombre(
+        self, uow: SqlUnitOfWork
+    ) -> None:
+        usuario, raiz = sembrar_usuario(uow)
+        viejo = Directory(
+            id=new_id(), parent_id=raiz.id, name="a", owner_id=usuario.id, created_at=AHORA
+        )
+        uow.directories.add(viejo)
+        uow.directories.mark_deleted(viejo.id, AHORA)
+
+        assert uow.directories.get_child(raiz.id, "a") is None
+        assert uow.directories.list_children(raiz.id) == []
+        assert uow.directories.count_children(raiz.id) == 0
+
+        # El nombre vuelve a estar libre aunque la fila vieja siga ahi esperando al GC.
+        uow.directories.add(
+            Directory(
+                id=new_id(),
+                parent_id=raiz.id,
+                name="a",
+                owner_id=usuario.id,
+                created_at=AHORA,
+            )
+        )
+        assert uow.directories.get_child(raiz.id, "a") is not None
+
     def test_list_descendants_recorre_el_subarbol(self, uow: SqlUnitOfWork) -> None:
         usuario, raiz = sembrar_usuario(uow)
         padre_id = raiz.id

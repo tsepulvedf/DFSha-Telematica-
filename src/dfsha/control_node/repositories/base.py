@@ -64,9 +64,17 @@ class DirectoryRepository(Protocol):
 
     def move(self, directory_id: str, new_parent_id: str, new_name: str) -> None: ...
 
-    def delete(self, directory_id: str) -> None:
-        """Borrado fisico de la fila. Los directorios no tienen bloques, asi que no hay
-        nada que el GC tenga que recoger despues."""
+    def mark_deleted(self, directory_id: str, deleted_at: datetime) -> None:
+        """Borrado logico.
+
+        No es fisico porque `files.directory_id` apunta aqui y las filas de archivos
+        borrados tienen que sobrevivir hasta que el GC recoja sus bloques. Ver la nota de
+        `DirectoryRow`.
+        """
+        ...
+
+    def mark_many_deleted(self, directory_ids: Sequence[str], deleted_at: datetime) -> None:
+        """Borrado logico en lote para `rmdir -r`, en una sola sentencia."""
         ...
 
     def list_descendants(self, directory_id: str) -> list[Directory]:

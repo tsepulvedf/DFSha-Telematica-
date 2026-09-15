@@ -65,10 +65,17 @@ class Directory:
     name: str
     owner_id: str
     created_at: datetime
+    deleted_at: datetime | None = None
 
     @property
     def is_root(self) -> bool:
         return self.parent_id is None
+
+    @property
+    def is_live(self) -> bool:
+        """Un directorio borrado es invisible y su nombre queda libre, pero su fila
+        sigue ahi mientras los archivos que contenia esperen al GC."""
+        return self.deleted_at is None
 
 
 @dataclass(frozen=True, slots=True)

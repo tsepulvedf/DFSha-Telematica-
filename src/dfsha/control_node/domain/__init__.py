@@ -26,6 +26,7 @@ from .rules import (
     ensure_directory_is_empty,
     ensure_move_is_legal,
     ensure_name_is_free,
+    ensure_no_live_reservation,
     ensure_visible,
 )
 
@@ -50,6 +51,7 @@ __all__ = [
     "ensure_directory_is_empty",
     "ensure_move_is_legal",
     "ensure_name_is_free",
+    "ensure_no_live_reservation",
     "ensure_visible",
     "plan_blocks",
     "utcnow",

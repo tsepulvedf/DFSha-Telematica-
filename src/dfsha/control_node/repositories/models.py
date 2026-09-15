@@ -78,8 +78,13 @@ class UserRow(Base):
 class DirectoryRow(Base):
     """El root de cada usuario es la fila con `parent_id IS NULL`.
 
-    El UNIQUE(parent_id, name) no cubre los roots, porque en SQL dos NULL no colisionan.
-    Eso es justo lo que hace falta: un root por usuario, todos con parent_id NULL.
+    Los directorios se borran de forma logica (`deleted_at`), no fisica, aunque el
+    esquema de la especificacion no lo previera. La razon es una dependencia que solo
+    aparece al implementar `rmdir -r`: los archivos que cuelgan de un directorio se
+    marcan DELETED y sus filas tienen que sobrevivir hasta que el GC recoja sus bloques,
+    pero `files.directory_id` apunta a esta tabla. Borrar la fila del directorio
+    violaria esa clave foranea, y quitar la clave foranea dejaria el metadato sin quien
+    lo sostenga. Un directorio con `deleted_at` es invisible y su nombre queda libre.
     """
 
     __tablename__ = "directories"
@@ -93,10 +98,24 @@ class DirectoryRow(Base):
         String(ID_LEN), ForeignKey("users.id"), nullable=False, index=True
     )
     created_at: Mapped[datetime] = mapped_column(UtcDateTime, nullable=False)
+    # Borrado logico, igual que en files. Un directorio borrado no puede desaparecer de
+    # la tabla mientras queden filas de `files` apuntando a el: esas filas son lo que le
+    # dice al GC que bloques recoger, y borrarlas antes dejaria los .blk en disco sin
+    # nadie que supiera de ellos. Ver la nota de la clase.
+    deleted_at: Mapped[datetime | None] = mapped_column(UtcDateTime, nullable=True)
 
     __table_args__ = (
-        UniqueConstraint("parent_id", "name", name="uq_directories_parent_name"),
-        # El UNIQUE de arriba no protege las raices: en SQL dos NULL nunca colisionan, asi
+        # Unicidad solo entre directorios vivos, para que `rmdir /a` seguido de
+        # `mkdir /a` funcione mientras el /a viejo espera al GC.
+        Index(
+            "uq_directories_parent_name",
+            "parent_id",
+            "name",
+            unique=True,
+            sqlite_where=text("deleted_at IS NULL"),
+            postgresql_where=text("deleted_at IS NULL"),
+        ),
+        # El indice de arriba no protege las raices: en SQL dos NULL nunca colisionan, asi
         # que nada impediria dos filas con parent_id NULL para el mismo usuario, es decir
         # dos arboles para una sola cuenta. Este indice parcial es el que garantiza
         # una raiz por usuario.
@@ -104,8 +123,8 @@ class DirectoryRow(Base):
             "uq_directories_root_per_owner",
             "owner_id",
             unique=True,
-            sqlite_where=text("parent_id IS NULL"),
-            postgresql_where=text("parent_id IS NULL"),
+            sqlite_where=text("parent_id IS NULL AND deleted_at IS NULL"),
+            postgresql_where=text("parent_id IS NULL AND deleted_at IS NULL"),
         ),
         Index("ix_directories_parent", "parent_id"),
     )

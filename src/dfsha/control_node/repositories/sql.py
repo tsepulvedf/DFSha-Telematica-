@@ -68,6 +68,7 @@ def _to_directory(row: DirectoryRow) -> Directory:
         name=row.name,
         owner_id=row.owner_id,
         created_at=row.created_at,
+        deleted_at=row.deleted_at,
     )
 
 
@@ -167,7 +168,9 @@ class SqlDirectoryRepository:
     def get_root(self, owner_id: str) -> Directory | None:
         row = self._session.scalar(
             select(DirectoryRow).where(
-                DirectoryRow.owner_id == owner_id, DirectoryRow.parent_id.is_(None)
+                DirectoryRow.owner_id == owner_id,
+                DirectoryRow.parent_id.is_(None),
+                DirectoryRow.deleted_at.is_(None),
             )
         )
         return _to_directory(row) if row else None
@@ -175,7 +178,9 @@ class SqlDirectoryRepository:
     def get_child(self, parent_id: str, name: str) -> Directory | None:
         row = self._session.scalar(
             select(DirectoryRow).where(
-                DirectoryRow.parent_id == parent_id, DirectoryRow.name == name
+                DirectoryRow.parent_id == parent_id,
+                DirectoryRow.name == name,
+                DirectoryRow.deleted_at.is_(None),
             )
         )
         return _to_directory(row) if row else None
@@ -183,7 +188,10 @@ class SqlDirectoryRepository:
     def list_children(self, directory_id: str) -> list[Directory]:
         rows = self._session.scalars(
             select(DirectoryRow)
-            .where(DirectoryRow.parent_id == directory_id)
+            .where(
+                DirectoryRow.parent_id == directory_id,
+                DirectoryRow.deleted_at.is_(None),
+            )
             .order_by(DirectoryRow.name)
         )
         return [_to_directory(row) for row in rows]
@@ -192,7 +200,10 @@ class SqlDirectoryRepository:
         subdirs = self._session.scalar(
             select(func.count())
             .select_from(DirectoryRow)
-            .where(DirectoryRow.parent_id == directory_id)
+            .where(
+                DirectoryRow.parent_id == directory_id,
+                DirectoryRow.deleted_at.is_(None),
+            )
         )
         files = self._session.scalar(
             select(func.count())
@@ -211,8 +222,21 @@ class SqlDirectoryRepository:
             .values(parent_id=new_parent_id, name=new_name)
         )
 
-    def delete(self, directory_id: str) -> None:
-        self._session.execute(delete(DirectoryRow).where(DirectoryRow.id == directory_id))
+    def mark_deleted(self, directory_id: str, deleted_at: datetime) -> None:
+        self._session.execute(
+            update(DirectoryRow)
+            .where(DirectoryRow.id == directory_id)
+            .values(deleted_at=deleted_at)
+        )
+
+    def mark_many_deleted(self, directory_ids: Sequence[str], deleted_at: datetime) -> None:
+        if not directory_ids:
+            return
+        self._session.execute(
+            update(DirectoryRow)
+            .where(DirectoryRow.id.in_(list(directory_ids)))
+            .values(deleted_at=deleted_at)
+        )
 
     def list_descendants(self, directory_id: str) -> list[Directory]:
         """Recorrido por niveles: una consulta por nivel de profundidad.
@@ -225,7 +249,10 @@ class SqlDirectoryRepository:
         nivel = [directory_id]
         while nivel:
             rows = self._session.scalars(
-                select(DirectoryRow).where(DirectoryRow.parent_id.in_(nivel))
+                select(DirectoryRow).where(
+                    DirectoryRow.parent_id.in_(nivel),
+                    DirectoryRow.deleted_at.is_(None),
+                )
             ).all()
             if not rows:
                 break
