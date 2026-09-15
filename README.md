@@ -401,6 +401,21 @@ dfsha rmdir [-r] <ruta>
 - `put` y `get` aceptan `--parallel N` (por defecto 4) para transferir bloques a la vez.
 - `-v` emite los logs JSON de tiempos por stdout.
 
+### `dfsha cluster`: por qué `bloq.` y `repl.` son dos columnas
+
+Parecen redundantes y no lo son: **`bloq.` es lo que el nodo dice tener en su disco, y
+`repl.` lo que el ControlNode cree que ese nodo le sirve.** Salen de sitios distintos, y
+su diferencia es precisamente la señal.
+
+Se ve al matar un nodo. En `SUSPECT` mantiene sus réplicas —sale de la colocación pero
+sigue sirviendo lo que tiene—, así que las dos columnas siguen cuadrando. Al pasar a
+`DEAD`, **`repl.` cae a 0 mientras `bloq.` se queda en 14**: los bytes siguen ahí, pero
+el ControlNode ya no cuenta con ellos. Esa asimetría es la transición, visible sin abrir
+un solo log.
+
+La misma diferencia aparece por divergencia —un `.blk` borrado a mano baja `bloq.` y deja
+`repl.` alto— y por eso la columna se pinta en amarillo cuando las dos no coinciden.
+
 > **Git Bash en Windows**: MSYS reescribe los argumentos que empiezan por `/` y convierte
 > `/datos/pruebas` en `C:/Program Files/Git/datos/pruebas` antes de que la CLI los vea.
 > Usa PowerShell, CMD o WSL, o antepón una barra más: `dfsha cd //datos/pruebas`.
