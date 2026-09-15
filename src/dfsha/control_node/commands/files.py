@@ -68,6 +68,7 @@ def create_file(
     default_block_size: int,
     write_ttl_seconds: int,
     block_size: int | None = None,
+    replication_factor: int = 1,
 ) -> CreatedFile:
     path = Path.parse(raw_path)
     if path.is_root:
@@ -109,7 +110,7 @@ def create_file(
         for spec in plan_blocks(size, efectivo):
             block_id = new_id()
             # La colocacion se decide aqui y se registra: no se recalcula nunca por hash.
-            destinos = placement.select(spec.size, replication_factor=1)
+            destinos = placement.select(spec.size, replication_factor)
             bloques.append(
                 Block(block_id=block_id, file_id=archivo.id, index=spec.index, size=spec.size)
             )
