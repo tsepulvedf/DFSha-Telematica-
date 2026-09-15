@@ -183,7 +183,16 @@ class BlockStoredRequest(_Dto):
 
 
 class OrphanBlock(_Dto):
+    """Un bloque a recoger.
+
+    `size` no estaba en el contrato original, y se anadio al implementar el GC: el
+    ControlNode ya conoce el tamano de cada bloque, y sin el, el script tendria que
+    preguntarselo al DataNode con una peticion extra por bloque solo para poder informar
+    cuantos bytes libero.
+    """
+
     block_id: str
+    size: int
     replicas: list[ReplicaRef]
 
 

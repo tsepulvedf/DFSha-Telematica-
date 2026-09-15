@@ -220,7 +220,9 @@ def block_stored(block_id: str, body: BlockStoredRequest, uow: Uow) -> Response:
 def orphan_blocks(uow: Uow) -> OrphanBlocksResponse:
     return OrphanBlocksResponse(
         blocks=[
-            OrphanBlock(block_id=b.block_id, replicas=_replicas(b.replicas))
+            OrphanBlock(
+                block_id=b.block_id, size=b.size, replicas=_replicas(b.replicas)
+            )
             for b in gc_queries.orphan_blocks(uow)
         ]
     )
