@@ -141,6 +141,16 @@ Reglas de dominio, a hacer cumplir en `domain/`:
   bloquea el nombre: si otro `create` pide la misma ruta, la reserva vencida se marca
   `DELETED` y se procede. Comprobación perezosa, nunca un barrido en background.
 - Borrar es marcar `DELETED` y fijar `deleted_at`. Los bloques siguen en disco hasta el GC.
+- **Copy-on-write sobre una ruta ocupada**: `create` sobre un nombre ya `COMMITTED` se
+  permite. En el **commit**, el archivo viejo pasa a `DELETED` y el nuevo a `COMMITTED`
+  **en una sola transacción**. Si se hiciera en dos pasos, una caída en el medio dejaría la
+  ruta sin archivo visible. Los bloques del viejo quedan para el GC.
+- `mv`: si `dst` es un directorio existente, mueve dentro conservando el nombre; si `dst`
+  no existe y su padre sí, renombra; si `dst` es un archivo existente, 409 (nada de
+  sobrescritura silenciosa). El padre nunca se crea implícitamente.
+- El `UNIQUE(directory_id, name)` parcial sobre `COMMITTED` se declara con `sqlite_where` y
+  `postgresql_where` **juntos en el mismo objeto `Index`**, para no amarrarnos a SQLite
+  antes de la migración a PostgreSQL de la Etapa 3.
 - Las rutas se normalizan y validan en un value object `Path`: rechaza `..`, rutas
   relativas sin cwd, nombres vacíos y caracteres de control.
 
@@ -215,14 +225,20 @@ PUT    /blocks/{block_id}    body: bytes crudos
        el DataNode notifica al ControlNode antes de responder 201
 GET    /blocks/{block_id}    -> bytes crudos, header X-DFSha-Checksum
 DELETE /blocks/{block_id}    -> 204
-GET    /health               -> {status, used_bytes, capacity_bytes, block_count}
+GET    /health               -> {status, used_bytes, capacity_bytes, block_count,
+                                disk_free_bytes}
 ```
 
 Los bloques son inmutables: reescribir un `block_id` existente es 409.
 
 `used_bytes` y `block_count` se calculan del estado real en disco, no de un contador en
-memoria. En la Etapa 2 `/health` se convierte en el heartbeat y la política de colocación
-depende de esos números, así que tienen que ser fiables desde ya.
+memoria; `used_bytes` suma solo los bytes de los `.blk`, ignorando los `.meta`. En la
+Etapa 2 `/health` se convierte en el heartbeat y la política de colocación depende de esos
+números, así que tienen que ser fiables desde ya.
+
+`disk_free_bytes` sale de `shutil.disk_usage`, **nunca** de `capacity_bytes - used_bytes`.
+Si el disco se llena por logs, la base de datos u otro contenedor, la resta miente y la
+política de colocación de la Etapa 2 mandaría bloques a un nodo que no puede recibirlos.
 
 ### Layout del DataNode
 
@@ -318,6 +334,10 @@ El repositorio es **público**. No negociable:
   **nunca secretos reales**.
 - Nada de archivos de prueba binarios versionados. Para eso está `scripts/gen_testfile.py`.
 - `.github/workflows/tests.yml` corre `pytest` en cada push y pull request.
+- `.gitattributes` fuerza LF en `*.py`, `*.sh` y Dockerfiles: sin eso, un checkout desde
+  Windows rompe los builds de Docker.
+- La ruta de trabajo de un integrante contiene un espacio (`F:\DFSha telematica`). Todas
+  las rutas en Dockerfiles, `docker-compose.yml` y scripts van **entrecomilladas**.
 
 ### Ramas
 
