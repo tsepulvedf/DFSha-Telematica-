@@ -13,6 +13,22 @@ manual de bloques huérfanos.
 
 ---
 
+## ⚠️ Validación pendiente
+
+**Los contenedores todavía no se han ejecutado.** Los tres `Dockerfile` y el
+`docker-compose.yml` están escritos y revisados, y el YAML parsea, pero nadie ha corrido
+aún `docker compose up --build` de principio a fin.
+
+Lo que **sí** está verificado de punta a punta es todo lo demás: las 196 pruebas
+automatizadas, y el recorrido completo del arranque rápido (registro, login, `mkdir -p`,
+`put` de 50 MB en 50 bloques, `get` con SHA-256 idéntico, `rm` y el ciclo del GC) contra
+un ControlNode y un DataNode reales lanzados con `uvicorn` directamente, sin Docker.
+
+Si vas a evaluar la reproducibilidad, empieza por ahí y avísanos del resultado. Esta
+sección se borra en cuanto alguien confirme el arranque con Docker.
+
+---
+
 ## Arranque rápido
 
 Necesitas Docker y Python 3.11+. Debería llevarte menos de cinco minutos.

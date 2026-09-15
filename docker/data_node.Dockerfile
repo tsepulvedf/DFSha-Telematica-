@@ -21,7 +21,9 @@ USER dfsha
 
 EXPOSE 8001
 
-HEALTHCHECK --interval=5s --timeout=3s --start-period=5s --retries=10 \
+# Intervalo mas largo que el del ControlNode a proposito: /health recorre el disco
+# para contar bloques y bytes, en vez de fiarse de un contador en memoria.
+HEALTHCHECK --interval=15s --timeout=5s --start-period=10s --retries=5 \
     CMD python -c "import httpx,sys; sys.exit(0 if httpx.get('http://127.0.0.1:8001/health', timeout=3).status_code==200 else 1)"
 
 CMD ["uvicorn", "dfsha.data_node.main:create_app", "--factory", \

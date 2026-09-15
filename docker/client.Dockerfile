@@ -18,12 +18,19 @@ COPY "scripts" "./scripts"
 
 RUN pip install --no-cache-dir -e "."
 
-RUN useradd --create-home --uid 1000 dfsha && chown -R dfsha:dfsha "/app"
-USER dfsha
-
 # ~/.dfsha guarda token y cwd. Montarlo como volumen conserva la sesion entre
 # invocaciones de `docker compose run`.
+#
+# El directorio TIENE que existir en la imagen antes del montaje: Docker crea los
+# puntos de montaje que faltan como root, y entonces el cliente no podria escribir
+# session.json y `dfsha login` fallaria con un error de permisos. Cuando el
+# directorio ya existe, el volumen nombrado hereda su dueno y sus permisos.
 ENV DFSHA_HOME="/home/dfsha/.dfsha"
+
+RUN useradd --create-home --uid 1000 dfsha \
+    && mkdir -p "/home/dfsha/.dfsha" \
+    && chown -R dfsha:dfsha "/home/dfsha" "/app"
+USER dfsha
 
 ENTRYPOINT ["dfsha"]
 CMD ["--help"]

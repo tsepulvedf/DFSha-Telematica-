@@ -8,6 +8,12 @@
 # poder resolver, porque los bytes van directos del cliente al DataNode sin pasar por
 # el ControlNode. Ver DFSHA_DATANODE_BASE_URL en .env.example.
 
+# Nombre de proyecto fijo. Sin esto, Compose lo deriva del nombre del directorio, y el
+# del equipo es "DFSha telematica": con un espacio y mayusculas, que no son validos en un
+# nombre de proyecto. Las versiones recientes lo sanean solas, las viejas fallan al
+# arrancar. Fijarlo tambien hace que los volumenes se llamen igual en todas las maquinas.
+name: "dfsha"
+
 services:
   control-node:
     build:
@@ -45,6 +51,12 @@ services:
       DFSHA_DATANODE_CAPACITY_BYTES: "${DFSHA_DATANODE_CAPACITY_BYTES:-10737418240}"
       DFSHA_INTERNAL_SECRET: "${DFSHA_INTERNAL_SECRET:?falta DFSHA_INTERNAL_SECRET; copia .env.example a .env}"
       DFSHA_LOG_LEVEL: "${DFSHA_LOG_LEVEL:-INFO}"
+      # Reintentos del registro, explicitos para que se vean. El depends_on de abajo
+      # espera a que el ControlNode este healthy, pero no basta por si solo: si el
+      # ControlNode se reinicia despues, el DataNode tiene que poder volver a
+      # registrarse por su cuenta. 30 intentos cada 2 s = un minuto de margen.
+      DFSHA_REGISTER_MAX_ATTEMPTS: "30"
+      DFSHA_REGISTER_RETRY_SECONDS: "2"
     volumes:
       - "dfsha-blocks:/var/lib/dfsha"
     depends_on:
