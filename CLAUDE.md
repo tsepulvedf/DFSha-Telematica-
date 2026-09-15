@@ -112,8 +112,9 @@ OpenTelemetry ni exportadores de métricas. Logs JSON y nada más.
 ```
 users(id, username UNIQUE, password_hash, created_at)
 
-directories(id, parent_id NULL, name, owner_id, created_at)
-    UNIQUE(parent_id, name)
+directories(id, parent_id NULL, name, owner_id, created_at, deleted_at NULL)
+    UNIQUE(parent_id, name) solo sobre filas con deleted_at NULL
+    UNIQUE(owner_id) solo sobre filas con parent_id NULL: una raiz por usuario
     el root de cada usuario es una fila con parent_id NULL
 
 files(id, directory_id, name, owner_id, size, block_size,
@@ -133,6 +134,19 @@ data_nodes(id, base_url, capacity_bytes, used_bytes, state, registered_at)
     state in {ALIVE, DEAD}
 ```
 
+Dos desviaciones respecto al esquema y los contratos originales, ambas descubiertas al
+implementar y ambas deliberadas:
+
+1. **`directories.deleted_at`**: los directorios se borran de forma lógica. `rmdir -r`
+   marca `DELETED` los archivos que contiene, y esas filas tienen que sobrevivir hasta
+   que el GC recoja sus bloques; pero `files.directory_id` apunta a `directories`, así
+   que borrar físicamente la fila del directorio violaría la clave foránea, y quitar la
+   clave foránea dejaría el metadato sin quien lo sostenga. Un directorio con
+   `deleted_at` es invisible y su nombre queda libre.
+2. **`GET /gc/orphan-blocks` devuelve también `size`**: el ControlNode ya conoce el
+   tamaño de cada bloque. Sin ese campo, el GC tendría que hacer una petición extra por
+   bloque al DataNode solo para poder informar cuántos bytes liberó.
+
 Reglas de dominio, a hacer cumplir en `domain/`:
 
 - `rmdir` falla si el directorio no está vacío, salvo `--recursive`.
@@ -141,6 +155,16 @@ Reglas de dominio, a hacer cumplir en `domain/`:
   bloquea el nombre: si otro `create` pide la misma ruta, la reserva vencida se marca
   `DELETED` y se procede. Comprobación perezosa, nunca un barrido en background.
 - Borrar es marcar `DELETED` y fijar `deleted_at`. Los bloques siguen en disco hasta el GC.
+- **Copy-on-write sobre una ruta ocupada**: `create` sobre un nombre ya `COMMITTED` se
+  permite. En el **commit**, el archivo viejo pasa a `DELETED` y el nuevo a `COMMITTED`
+  **en una sola transacción**. Si se hiciera en dos pasos, una caída en el medio dejaría la
+  ruta sin archivo visible. Los bloques del viejo quedan para el GC.
+- `mv`: si `dst` es un directorio existente, mueve dentro conservando el nombre; si `dst`
+  no existe y su padre sí, renombra; si `dst` es un archivo existente, 409 (nada de
+  sobrescritura silenciosa). El padre nunca se crea implícitamente.
+- El `UNIQUE(directory_id, name)` parcial sobre `COMMITTED` se declara con `sqlite_where` y
+  `postgresql_where` **juntos en el mismo objeto `Index`**, para no amarrarnos a SQLite
+  antes de la migración a PostgreSQL de la Etapa 3.
 - Las rutas se normalizan y validan en un value object `Path`: rechaza `..`, rutas
   relativas sin cwd, nombres vacíos y caracteres de control.
 
@@ -195,7 +219,7 @@ GET  /files/open?path=/a/b/c
 ```
 POST /datanodes/register        {base_url, capacity_bytes} -> {data_node_id}
 POST /blocks/{block_id}/stored  {data_node_id, size, checksum_sha256} -> 204
-GET  /gc/orphan-blocks          -> {blocks:[{block_id, replicas:[{data_node_id, base_url}]}]}
+GET  /gc/orphan-blocks          -> {blocks:[{block_id, size, replicas:[{data_node_id, base_url}]}]}
 POST /gc/confirm                {block_ids:[...]} -> 204
 ```
 
@@ -203,8 +227,8 @@ POST /gc/confirm                {block_ids:[...]} -> 204
 `POST /gc/confirm` borra esas filas del metadato una vez el script confirmó que los bloques
 ya no están en disco.
 
-Autenticación interna: secreto compartido por header `X-DFSha-Internal-Secret`. En la
-Etapa 3 esto pasa a gRPC con mTLS.
+Autenticación interna: secreto compartido por header `X-DFSha-Internal-Secret`,
+comparado en tiempo constante. En la Etapa 3 esto pasa a gRPC con mTLS.
 
 ### DataNode `/api/v1` — lo consume el cliente
 
@@ -215,14 +239,20 @@ PUT    /blocks/{block_id}    body: bytes crudos
        el DataNode notifica al ControlNode antes de responder 201
 GET    /blocks/{block_id}    -> bytes crudos, header X-DFSha-Checksum
 DELETE /blocks/{block_id}    -> 204
-GET    /health               -> {status, used_bytes, capacity_bytes, block_count}
+GET    /health               -> {status, used_bytes, capacity_bytes, block_count,
+                                disk_free_bytes}
 ```
 
 Los bloques son inmutables: reescribir un `block_id` existente es 409.
 
 `used_bytes` y `block_count` se calculan del estado real en disco, no de un contador en
-memoria. En la Etapa 2 `/health` se convierte en el heartbeat y la política de colocación
-depende de esos números, así que tienen que ser fiables desde ya.
+memoria; `used_bytes` suma solo los bytes de los `.blk`, ignorando los `.meta`. En la
+Etapa 2 `/health` se convierte en el heartbeat y la política de colocación depende de esos
+números, así que tienen que ser fiables desde ya.
+
+`disk_free_bytes` sale de `shutil.disk_usage`, **nunca** de `capacity_bytes - used_bytes`.
+Si el disco se llena por logs, la base de datos u otro contenedor, la resta miente y la
+política de colocación de la Etapa 2 mandaría bloques a un nodo que no puede recibirlos.
 
 ### Layout del DataNode
 
@@ -248,10 +278,34 @@ DFSHA_JWT_SECRET=
 DFSHA_JWT_TTL_SECONDS=3600
 DFSHA_INTERNAL_SECRET=
 DFSHA_DATA_DIR=/var/lib/dfsha
+DFSHA_DATANODE_BASE_URL=http://localhost:8001
 DFSHA_DATANODE_CAPACITY_BYTES=
 DFSHA_WRITE_TTL_SECONDS=600      # vencimiento de reservas en WRITING
 DFSHA_LOG_LEVEL=INFO
 ```
+
+`DFSHA_DATANODE_BASE_URL` no estaba en la lista original y la exige el contrato: el
+DataNode tiene que decirle al ControlNode con que URL anunciarse, porque los bytes van
+directos y el ControlNode se limita a repetirsela al cliente.
+
+**Decision de la Etapa 1: el escenario soportado es el cliente en el HOST**, con
+`http://localhost:8001`. Un unico DataNode solo puede registrar una URL, y "alcanzable"
+significa cosas distintas desde el host y desde dentro de la red de compose. La variable
+la lee el DataNode al registrarse, nunca el cliente, asi que ponerla en el servicio
+`client` de compose no tiene ningun efecto.
+
+El contenedor `client` de compose tiene dos limitaciones conocidas, ambas comprobadas
+en ejecucion y documentadas en el README. No se arreglan en la Etapa 1 porque el
+escenario soportado es el cliente del host, y el contenedor es solo una comodidad:
+
+1. `put`, `get` y el GC fallan con "Connection refused", porque el plan trae `localhost`
+   y ahi `localhost` es el propio contenedor del cliente. Los comandos de namespace si
+   funcionan. Se resuelve en la Etapa 2, en el sitio correcto: el ControlNode anunciando
+   a cada cliente la direccion visible desde donde esta.
+2. La sesion no sobrevive entre invocaciones de `docker compose run --rm client`, pese
+   al volumen montado en `/home/dfsha/.dfsha`, que es donde `DFSHA_HOME` apunta. Si
+   alguien lo retoma: el cliente ya dice por pantalla donde guardo la sesion y que
+   fichero busco al no encontrarla, que es la mitad del diagnostico.
 
 `DFSHA_JWT_SECRET` y `DFSHA_INTERNAL_SECRET` **no tienen default en el código**. Si faltan,
 el servicio falla al arrancar con un mensaje claro. Un secreto por defecto en un repo
@@ -318,6 +372,10 @@ El repositorio es **público**. No negociable:
   **nunca secretos reales**.
 - Nada de archivos de prueba binarios versionados. Para eso está `scripts/gen_testfile.py`.
 - `.github/workflows/tests.yml` corre `pytest` en cada push y pull request.
+- `.gitattributes` fuerza LF en `*.py`, `*.sh` y Dockerfiles: sin eso, un checkout desde
+  Windows rompe los builds de Docker.
+- La ruta de trabajo de un integrante contiene un espacio (`F:\DFSha telematica`). Todas
+  las rutas en Dockerfiles, `docker-compose.yml` y scripts van **entrecomilladas**.
 
 ### Ramas
 

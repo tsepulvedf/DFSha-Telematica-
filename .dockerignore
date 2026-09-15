@@ -1,0 +1,35 @@
+# El contexto de build se sube entero al daemon. Sin esto viajan 82 MB de .venv
+# en cada `docker compose build`.
+.venv/
+venv/
+.git/
+.github/
+
+__pycache__/
+*.py[cod]
+*.egg-info/
+build/
+dist/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+
+# Secretos y datos locales: no pueden acabar ni en el contexto ni en la imagen.
+.env
+*.db
+*.db-journal
+*.db-wal
+*.db-shm
+*.blk
+*.meta
+data/
+var/
+.dfsha/
+
+# No hacen falta dentro de la imagen.
+tests/
+docs/
+*.md
+!README.md

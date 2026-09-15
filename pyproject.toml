@@ -29,7 +29,7 @@ dev = [
 ]
 
 [project.scripts]
-dfsha = "dfsha.client.cli:app"
+dfsha = "dfsha.client.cli:main"
 
 [build-system]
 requires = ["setuptools>=68"]
