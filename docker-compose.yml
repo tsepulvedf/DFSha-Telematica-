@@ -1,0 +1,78 @@
+# DFSha - Etapa 1: un ControlNode y un DataNode.
+#
+#   cp .env.example .env    # y rellena los dos secretos
+#   docker compose up --build
+#
+# El cliente corre en el HOST y habla con los dos puertos publicados. Por eso el
+# DataNode se anuncia como http://localhost:8001: es la URL que el cliente tiene que
+# poder resolver, porque los bytes van directos del cliente al DataNode sin pasar por
+# el ControlNode. Ver DFSHA_DATANODE_BASE_URL en .env.example.
+
+services:
+  control-node:
+    build:
+      context: "."
+      dockerfile: "docker/control_node.Dockerfile"
+    image: "dfsha/control-node:0.1.0"
+    container_name: "dfsha-control-node"
+    ports:
+      - "8000:8000"
+    environment:
+      DFSHA_DB_URL: "sqlite:////var/lib/dfsha-meta/dfsha.db"
+      DFSHA_JWT_SECRET: "${DFSHA_JWT_SECRET:?falta DFSHA_JWT_SECRET; copia .env.example a .env}"
+      DFSHA_INTERNAL_SECRET: "${DFSHA_INTERNAL_SECRET:?falta DFSHA_INTERNAL_SECRET; copia .env.example a .env}"
+      DFSHA_BLOCK_SIZE: "${DFSHA_BLOCK_SIZE:-67108864}"
+      DFSHA_JWT_TTL_SECONDS: "${DFSHA_JWT_TTL_SECONDS:-3600}"
+      DFSHA_WRITE_TTL_SECONDS: "${DFSHA_WRITE_TTL_SECONDS:-600}"
+      DFSHA_LOG_LEVEL: "${DFSHA_LOG_LEVEL:-INFO}"
+    volumes:
+      - "dfsha-meta:/var/lib/dfsha-meta"
+    restart: "unless-stopped"
+
+  data-node-1:
+    build:
+      context: "."
+      dockerfile: "docker/data_node.Dockerfile"
+    image: "dfsha/data-node:0.1.0"
+    container_name: "dfsha-data-node-1"
+    ports:
+      - "8001:8001"
+    environment:
+      DFSHA_DATA_DIR: "/var/lib/dfsha"
+      DFSHA_CONTROL_URL: "http://control-node:8000"
+      # URL alcanzable por el CLIENTE, no por el ControlNode.
+      DFSHA_DATANODE_BASE_URL: "${DFSHA_DATANODE_BASE_URL:-http://localhost:8001}"
+      DFSHA_DATANODE_CAPACITY_BYTES: "${DFSHA_DATANODE_CAPACITY_BYTES:-10737418240}"
+      DFSHA_INTERNAL_SECRET: "${DFSHA_INTERNAL_SECRET:?falta DFSHA_INTERNAL_SECRET; copia .env.example a .env}"
+      DFSHA_LOG_LEVEL: "${DFSHA_LOG_LEVEL:-INFO}"
+    volumes:
+      - "dfsha-blocks:/var/lib/dfsha"
+    depends_on:
+      control-node:
+        condition: "service_healthy"
+    restart: "unless-stopped"
+
+  # No arranca con `up`: es para correr la CLI o el GC dentro de la red de compose.
+  #   docker compose run --rm client ls /
+  # Para que el `put` funcione desde aqui, el DataNode debe anunciarse con su nombre
+  # de servicio: DFSHA_DATANODE_BASE_URL=http://data-node-1:8001 docker compose up
+  client:
+    build:
+      context: "."
+      dockerfile: "docker/client.Dockerfile"
+    image: "dfsha/client:0.1.0"
+    environment:
+      DFSHA_CONTROL_URL: "http://control-node:8000"
+      DFSHA_INTERNAL_SECRET: "${DFSHA_INTERNAL_SECRET:-}"
+    volumes:
+      - "dfsha-client-home:/home/dfsha/.dfsha"
+    profiles:
+      - "tools"
+    depends_on:
+      control-node:
+        condition: "service_healthy"
+
+volumes:
+  dfsha-meta:
+  dfsha-blocks:
+  dfsha-client-home:
