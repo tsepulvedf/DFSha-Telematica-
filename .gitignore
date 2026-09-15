@@ -1,0 +1,44 @@
+# Entorno y secretos
+.env
+.env.local
+*.pem
+*.key
+
+# Metadato y datos de bloques (nunca versionar)
+*.db
+*.db-journal
+*.db-wal
+*.db-shm
+*.blk
+*.meta
+data/
+var/
+dfsha.db
+.dfsha/
+
+# Archivos de prueba generados (usa scripts/gen_testfile.py)
+testfiles/
+*.bin
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+build/
+dist/
+.venv/
+venv/
+.python-version
+
+# Test / tooling
+.pytest_cache/
+.coverage
+htmlcov/
+.mypy_cache/
+.ruff_cache/
+
+# Editores y SO
+.idea/
+.vscode/
+.DS_Store
+Thumbs.db

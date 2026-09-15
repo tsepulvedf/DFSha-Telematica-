@@ -1,0 +1,44 @@
+[project]
+name = "dfsha"
+version = "0.1.0"
+description = "DFSha - Sistema de archivos distribuido por bloques (SI3007 / ST0263)"
+readme = "README.md"
+requires-python = ">=3.11"
+license = { text = "MIT" }
+
+dependencies = [
+    "fastapi>=0.115",
+    "uvicorn[standard]>=0.30",
+    "pydantic>=2.7",
+    "pydantic-settings>=2.3",
+    "sqlalchemy>=2.0",
+    "typer>=0.12",
+    "rich>=13.7",
+    "httpx>=0.27",
+    "passlib[bcrypt]>=1.7.4",
+    # passlib 1.7.4 inspecciona bcrypt.__about__, eliminado en bcrypt >= 4.1
+    "bcrypt>=4.0.1,<4.1",
+    "pyjwt>=2.8",
+    "structlog>=24.1",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.2",
+    "pytest-asyncio>=0.23",
+]
+
+[project.scripts]
+dfsha = "dfsha.client.cli:app"
+
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+asyncio_mode = "auto"
+filterwarnings = ["ignore::DeprecationWarning"]
