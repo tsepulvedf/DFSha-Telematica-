@@ -127,7 +127,7 @@ def create_file(
                     block_id=block_id,
                     index=spec.index,
                     size=spec.size,
-                    replicas=[(nodo.id, nodo.base_url) for nodo in destinos],
+                    replicas=[(nodo.id, nodo.advertise_url) for nodo in destinos],
                 )
             )
 

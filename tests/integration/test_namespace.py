@@ -190,16 +190,16 @@ class TestPlanoInterno:
             headers={"X-DFSha-Internal-Secret": "equivocado"},
         ).status_code == 401
 
-    def test_registro_de_datanode_es_idempotente(self, control, internal_headers) -> None:
-        cuerpo = {"base_url": "http://data-node-1:8001", "capacity_bytes": 10 * MB}
-        primero = control.post(
-            "/internal/v1/datanodes/register", json=cuerpo, headers=internal_headers
+    def test_el_registro_ya_no_esta_en_rest(self, control, internal_headers) -> None:
+        # Se fue a gRPC (ControlPlane.Register) con el resto del plano de control. La
+        # idempotencia del registro se comprueba ahora en test_control_plane.py, contra
+        # el servidor gRPC de verdad.
+        respuesta = control.post(
+            "/internal/v1/datanodes/register",
+            json={"base_url": "http://data-node-1:8001", "capacity_bytes": 10 * MB},
+            headers=internal_headers,
         )
-        segundo = control.post(
-            "/internal/v1/datanodes/register", json=cuerpo, headers=internal_headers
-        )
-        assert primero.status_code == segundo.status_code == 200
-        assert primero.json()["data_node_id"] == segundo.json()["data_node_id"]
+        assert respuesta.status_code == 404
 
     def test_un_token_de_usuario_no_abre_el_plano_interno(self, ana: Sesion) -> None:
         assert ana.get("/internal/v1/gc/orphan-blocks").status_code == 401

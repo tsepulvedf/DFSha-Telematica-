@@ -6,12 +6,17 @@ cambiar una URL y borrar los `PRAGMA` de aqui.
 
 from __future__ import annotations
 
-from sqlalchemy import Engine, create_engine, event
+from sqlalchemy import Engine, create_engine, event, inspect
 from sqlalchemy.orm import Session, sessionmaker
 
 from .models import Base
 
-__all__ = ["build_engine", "build_session_factory", "create_schema"]
+__all__ = [
+    "build_engine",
+    "build_session_factory",
+    "create_schema",
+    "SchemaTooOldError",
+]
 
 
 def build_engine(db_url: str, echo: bool = False) -> Engine:
@@ -50,10 +55,61 @@ def build_session_factory(engine: Engine) -> sessionmaker[Session]:
     return sessionmaker(bind=engine, expire_on_commit=False, future=True)
 
 
-def create_schema(engine: Engine) -> None:
-    """Crea las tablas si faltan.
+class SchemaTooOldError(RuntimeError):
+    """El metadato existe pero es de una etapa anterior."""
 
-    Basta para la Etapa 1. Cuando la Etapa 3 traiga PostgreSQL y un esquema que
-    evoluciona, esto se sustituye por migraciones de verdad.
+
+def create_schema(engine: Engine) -> None:
+    """Crea las tablas que falten y rechaza un metadato de una etapa anterior.
+
+    `create_all` crea tablas nuevas, pero **no anade columnas a una tabla que ya existe**.
+    Un volumen de metadato de la Etapa 1 tiene `data_nodes` sin `fault_domain`, `boot_id`
+    ni las columnas del heartbeat, y el arranque parece ir bien hasta que la primera
+    consulta falla con un "no such column" que no explica nada.
+
+    No se hace migracion: no hay herramienta de migraciones en el proyecto, y la Etapa 3
+    va a rehacer esto al pasar a PostgreSQL. Se falla pronto y con instrucciones.
     """
+    _rechazar_esquema_viejo(engine)
     Base.metadata.create_all(engine)
+
+
+#: Columnas que la Etapa 2 anadio a tablas ya existentes en la Etapa 1.
+_COLUMNAS_REQUERIDAS: dict[str, tuple[str, ...]] = {
+    "data_nodes": (
+        "advertise_url",
+        "fault_domain",
+        "boot_id",
+        "last_heartbeat_at",
+        "stat_disk_free_bytes",
+    ),
+}
+
+
+def _rechazar_esquema_viejo(engine: Engine) -> None:
+    inspector = inspect(engine)
+    tablas = set(inspector.get_table_names())
+
+    for tabla, requeridas in _COLUMNAS_REQUERIDAS.items():
+        if tabla not in tablas:
+            continue  # base de datos nueva: create_all la creara bien
+        presentes = {c["name"] for c in inspector.get_columns(tabla)}
+        faltan = [c for c in requeridas if c not in presentes]
+        if not faltan:
+            continue
+
+        raise SchemaTooOldError(
+            f"el metadato es de la Etapa 1: a la tabla '{tabla}' le faltan las columnas "
+            f"{', '.join(faltan)}.\n"
+            "\n"
+            "La Etapa 2 anade el plano de control (dominios de falla, boot_id, "
+            "estadisticas de heartbeat) y no hay migracion automatica.\n"
+            "\n"
+            "Para recrearlo desde cero:\n"
+            "\n"
+            "    docker compose down -v && docker compose up --build -d\n"
+            "\n"
+            "AVISO: '-v' BORRA los volumenes, y con ellos TODO el metadato y TODOS los\n"
+            "bloques ya subidos. Los archivos que hubiera en DFSha se pierden. Si son\n"
+            "datos que te importan, bajalos con 'dfsha get' antes de hacerlo."
+        )

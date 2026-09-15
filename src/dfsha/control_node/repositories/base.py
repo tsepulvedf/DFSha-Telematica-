@@ -18,8 +18,11 @@ from dfsha.control_node.domain.entities import (
     Block,
     BlockReplica,
     DataNode,
+    DataNodeState,
     Directory,
     File,
+    NodeStats,
+    ReplicaState,
     User,
 )
 
@@ -164,21 +167,72 @@ class BlockRepository(Protocol):
 
     def total_size(self, block_ids: Sequence[str]) -> int: ...
 
+    def list_block_ids_on_node(
+        self, data_node_id: str, states: Sequence[ReplicaState] = ...
+    ) -> list[str]:
+        """Lo que el metadato cree que ese nodo tiene: el lado 'esperado' del report."""
+        ...
+
+    def set_replicas_state(
+        self, block_ids: Sequence[str], data_node_id: str, state: ReplicaState
+    ) -> int: ...
+
+    def mark_node_replicas(
+        self,
+        data_node_id: str,
+        state: ReplicaState,
+        only_from: Sequence[ReplicaState] | None = None,
+    ) -> int:
+        """Cambia de estado todas las replicas de un nodo. Nunca borra filas: MISSING es
+        informacion que la Etapa 3 necesita para re-replicar."""
+        ...
+
+    def count_replicas_by_node(self) -> dict[str, int]: ...
+
 
 @runtime_checkable
 class DataNodeRepository(Protocol):
-    def register(self, base_url: str, capacity_bytes: int, now: datetime) -> DataNode:
-        """Alta idempotente por `base_url`.
+    def register(
+        self,
+        advertise_url: str,
+        capacity_bytes: int,
+        now: datetime,
+        fault_domain: str = "",
+        boot_id: str = "",
+        data_node_id: str | None = None,
+    ) -> DataNode:
+        """Alta idempotente, identificada por `data_node_id` y, si falta, por la URL.
 
         Reiniciar un DataNode no puede crear un nodo nuevo: sus bloques seguirian
-        apuntando al id viejo. Si ya existe, se actualiza capacidad y estado y se
-        devuelve el mismo id.
+        apuntando al id viejo. Que significa el re-alta (mismo disco o disco perdido) lo
+        decide el dominio con `classify_rejoin`, no este metodo.
         """
         ...
 
     def get(self, data_node_id: str) -> DataNode | None: ...
 
-    def list_alive(self) -> list[DataNode]: ...
+    def get_by_advertise_url(self, advertise_url: str) -> DataNode | None: ...
+
+    def list_all(self) -> list[DataNode]:
+        """Todos los nodos, en cualquier estado.
+
+        Es lo que debe usar la colocacion: el estado real se deriva del ultimo heartbeat
+        con `membership.state_for`, no de la columna `state`, que solo se persiste para
+        poder detectar la transicion y emitir el evento.
+        """
+        ...
+
+    def list_alive(self) -> list[DataNode]:
+        """Nodos cuya columna `state` dice ALIVE. Para rutas sin reloj a mano."""
+        ...
+
+    def record_heartbeat(
+        self, data_node_id: str, sequence: int, stats: NodeStats, now: datetime
+    ) -> None:
+        """Guarda el ultimo latido: la fuente de verdad de carga y espacio libre."""
+        ...
+
+    def set_state(self, data_node_id: str, state: DataNodeState) -> None: ...
 
     def add_used_bytes(self, data_node_id: str, delta: int) -> None:
         """Ajusta el ocupado registrado. Positivo al confirmar un bloque, negativo cuando

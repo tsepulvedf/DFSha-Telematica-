@@ -16,8 +16,6 @@ from dfsha.common.dto import (
     CommitResponse,
     CreateFileRequest,
     CreateFileResponse,
-    DataNodeRegisterRequest,
-    DataNodeRegisterResponse,
     GcConfirmRequest,
     LoginRequest,
     LsEntry,
@@ -198,14 +196,11 @@ def open_file(path: str, uow: Uow, user: CurrentUser) -> OpenFileResponse:
 
 
 # --- Plano interno: DataNode y GC -----------------------------------------
-
-
-@internal_router.post("/datanodes/register")
-def register_data_node(body: DataNodeRegisterRequest, uow: Uow) -> DataNodeRegisterResponse:
-    data_node_id = internal_commands.register_data_node(
-        uow, body.base_url, body.capacity_bytes
-    )
-    return DataNodeRegisterResponse(data_node_id=data_node_id)
+#
+# El registro del DataNode ya no esta aqui: se fue a gRPC (ControlPlane.Register) con el
+# resto del plano de control. Lo que queda en REST es la confirmacion de bloque
+# almacenado, que el DataNode llama de forma sincrona antes de responder 201 al cliente,
+# y los dos endpoints del GC, que usa el script.
 
 
 @internal_router.post("/blocks/{block_id}/stored", status_code=status.HTTP_204_NO_CONTENT)

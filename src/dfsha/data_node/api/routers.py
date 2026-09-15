@@ -47,7 +47,11 @@ async def put_block(
             trozos.append(chunk)
 
     with timed("block.write", logger=log, block_id=block_id, data_node_id=data_node_id) as t:
-        meta = storage.write(block_id, iter(trozos), x_dfsha_checksum)
+        # El contador de escrituras en vuelo alimenta el heartbeat, y con el la politica
+        # de colocacion: es lo que desempata entre dos nodos igual de llenos.
+        with request.app.state.load.write() as escritura:
+            meta = storage.write(block_id, iter(trozos), x_dfsha_checksum)
+            escritura.size = meta.size
         t.bind(size_bytes=meta.size)
 
     # Antes del 201: cuando el cliente vea su bloque subido, el ControlNode ya lo sabra.
@@ -64,6 +68,11 @@ async def put_block(
             block_id=block_id,
         ) from exc
 
+    # El bloque ya esta confirmado: entra en el proximo report incremental. Anotarlo
+    # antes del notify_stored haria que un fallo en la notificacion, que deshace la
+    # escritura, dejara anunciado un bloque que ya no existe.
+    request.app.state.changes.block_added(block_id)
+
     return Response(
         status_code=status.HTTP_201_CREATED,
         headers={CHECKSUM_HEADER: meta.checksum_sha256},
@@ -73,10 +82,17 @@ async def put_block(
 @blocks_router.get("/blocks/{block_id}")
 def get_block(block_id: str, request: Request) -> StreamingResponse:
     storage = request.app.state.storage
+    load = request.app.state.load
     meta = storage.read_meta(block_id)
 
+    def cuerpo():
+        # El contador se mantiene durante todo el envio, no solo mientras se abre el
+        # fichero: una descarga lenta ocupa el nodo hasta que termina.
+        with load.read():
+            yield from storage.read(block_id)
+
     return StreamingResponse(
-        storage.read(block_id),
+        cuerpo(),
         media_type="application/octet-stream",
         headers={
             CHECKSUM_HEADER: meta.checksum_sha256,
@@ -89,7 +105,10 @@ def get_block(block_id: str, request: Request) -> StreamingResponse:
 def delete_block(block_id: str, request: Request) -> Response:
     """Borra un bloque. Idempotente: borrar lo que ya no esta tambien es 204, para que el
     GC pueda reintentar una pasada a medias sin que falle entera."""
-    request.app.state.storage.delete(block_id)
+    if request.app.state.storage.delete(block_id):
+        # Solo se anuncia como quitado lo que estaba: si no, un reintento del GC haria
+        # que el ControlNode marcase MISSING una replica que ya habia olvidado.
+        request.app.state.changes.block_removed(block_id)
     return Response(status_code=status.HTTP_204_NO_CONTENT)
 
 
@@ -109,4 +128,6 @@ def health(request: Request) -> HealthResponse:
         block_count=stats.block_count,
         disk_free_bytes=stats.disk_free_bytes,
         data_node_id=request.app.state.data_node_id,
+        fault_domain=request.app.state.fault_domain,
+        boot_id=request.app.state.boot_id,
     )

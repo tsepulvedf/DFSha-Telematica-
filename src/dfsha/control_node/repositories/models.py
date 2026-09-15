@@ -198,11 +198,43 @@ class BlockReplicaRow(Base):
 
 
 class DataNodeRow(Base):
+    """Un DataNode registrado.
+
+    Las columnas de estadisticas son el ultimo heartbeat recibido, no un acumulado del
+    ControlNode. Es la fuente de verdad para la politica de colocacion: `used_bytes` del
+    ControlNode (mas abajo) es solo una cache que se desvia en cuanto se pierde una
+    notificacion. Ver la nota de `add_used_bytes`.
+    """
+
     __tablename__ = "data_nodes"
 
     id: Mapped[str] = mapped_column(String(ID_LEN), primary_key=True)
-    base_url: Mapped[str] = mapped_column(String(512), unique=True, nullable=False)
+    #: Direccion alcanzable por el CLIENTE, no por el ControlNode. El ControlNode se
+    #: limita a repetirsela al cliente en el plan, porque los bytes van directos.
+    advertise_url: Mapped[str] = mapped_column(String(512), unique=True, nullable=False)
+    #: Cadena opaca: solo se compara igualdad. En local son etiquetas logicas
+    #: (local-1..local-4); en AWS, zonas de disponibilidad reales.
+    fault_domain: Mapped[str] = mapped_column(String(128), nullable=False, default="")
+    #: UUID nuevo en cada arranque con disco vacio. Distingue "volvio el mismo nodo" de
+    #: "volvio con el disco perdido", que decide si sus replicas se recuperan.
+    boot_id: Mapped[str] = mapped_column(String(ID_LEN), nullable=False, default="")
+
     capacity_bytes: Mapped[int] = mapped_column(BigInteger, nullable=False)
+    #: Cache del ControlNode, NO la fuente de verdad. Ver stat_used_bytes.
     used_bytes: Mapped[int] = mapped_column(BigInteger, nullable=False, default=0)
     state: Mapped[str] = mapped_column(String(16), nullable=False)
     registered_at: Mapped[datetime] = mapped_column(UtcDateTime, nullable=False)
+
+    # --- Ultimo heartbeat: lo que la colocacion debe mirar ---------------------
+    last_heartbeat_at: Mapped[datetime | None] = mapped_column(UtcDateTime, nullable=True)
+    last_sequence: Mapped[int] = mapped_column(BigInteger, nullable=False, default=0)
+    stat_used_bytes: Mapped[int] = mapped_column(BigInteger, nullable=False, default=0)
+    stat_capacity_bytes: Mapped[int] = mapped_column(BigInteger, nullable=False, default=0)
+    #: De shutil.disk_usage en el nodo, nunca de capacity - used.
+    stat_disk_free_bytes: Mapped[int] = mapped_column(BigInteger, nullable=False, default=0)
+    stat_block_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    stat_writes_in_flight: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    stat_reads_in_flight: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    stat_bytes_written_60s: Mapped[int] = mapped_column(BigInteger, nullable=False, default=0)
+
+    __table_args__ = (Index("ix_data_nodes_state", "state"),)

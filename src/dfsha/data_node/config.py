@@ -26,8 +26,15 @@ class DataNodeSettings(BaseSettings):
     control_url: str = "http://localhost:8000"
 
     #: Con que URL se anuncia el DataNode. Tiene que ser la alcanzable POR EL CLIENTE:
-    #: el ControlNode se limita a repetirsela, porque los bytes van directos.
-    datanode_base_url: str = "http://localhost:8001"
+    #: el ControlNode se limita a repetirsela, porque los bytes van directos. Una sola
+    #: direccion por nodo, fijada por el despliegue; ver la decision en CLAUDE.md.
+    datanode_advertise_url: str = "http://localhost:8001"
+    #: Cadena opaca que agrupa nodos que pueden caerse juntos. En local son etiquetas
+    #: (local-1..local-4); en AWS, zonas de disponibilidad. El ControlNode solo compara
+    #: igualdad, asi que el mismo codigo sirve para simular y para ser real.
+    datanode_fault_domain: str = "local-1"
+    #: Donde escucha el plano de control. gRPC, no REST.
+    control_grpc_url: str = "localhost:9000"
 
     #: Vacio = se deduce del espacio libre del disco al arrancar.
     datanode_capacity_bytes: int | None = None

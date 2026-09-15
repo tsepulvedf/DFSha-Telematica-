@@ -222,6 +222,10 @@ class HealthResponse(_Dto):
     block_count: int
     disk_free_bytes: int
     data_node_id: str | None = None
+    #: Etapa 2: para poder comprobar desde fuera en que dominio esta y con que disco
+    #: arranco, sin tener que mirar los logs del ControlNode.
+    fault_domain: str | None = None
+    boot_id: str | None = None
 
 
 class ErrorResponse(_Dto):

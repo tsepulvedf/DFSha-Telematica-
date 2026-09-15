@@ -10,9 +10,12 @@ from contextlib import asynccontextmanager
 from fastapi import FastAPI
 
 from dfsha.common.logging import configure_logging, get_logger
+from dfsha.common.proto.gen import control_pb2
 from dfsha.control_node.api.errors import install_error_handlers
 from dfsha.data_node.config import DataNodeSettings, load_settings_or_exit
-from dfsha.data_node.control_client import ControlClient, NodeIdentity
+from dfsha.data_node.control_client import ControlClient, Identity, NodeIdentity
+from dfsha.data_node.heartbeat import BlockChangeLog, HeartbeatClient
+from dfsha.data_node.runtime import LoadTracker
 from dfsha.data_node.storage import BlockStorage
 
 from .api.routers import blocks_router, health_router
@@ -35,42 +38,84 @@ def create_app(
     log = get_logger("data_node")
 
     storage = BlockStorage(settings.data_dir)
-    identity = NodeIdentity(settings.data_dir)
+    identity_store = NodeIdentity(settings.data_dir)
+    identity = identity_store.load_or_create()
     capacity = settings.resolved_capacity_bytes()
     control = control or ControlClient(settings.control_url, settings.internal_secret)
+    load = LoadTracker()
+    changes = BlockChangeLog()
+
+    def stats_proto() -> control_pb2.NodeStats:
+        estado = storage.stats()
+        return control_pb2.NodeStats(
+            used_bytes=estado.used_bytes,
+            capacity_bytes=capacity,
+            disk_free_bytes=estado.disk_free_bytes,
+            block_count=estado.block_count,
+            writes_in_flight=load.writes_in_flight,
+            reads_in_flight=load.reads_in_flight,
+            bytes_written_60s=load.bytes_written_60s(),
+        )
+
+    heartbeat = HeartbeatClient(
+        grpc_url=settings.control_grpc_url,
+        advertise_url=settings.datanode_advertise_url,
+        fault_domain=settings.datanode_fault_domain,
+        boot_id=identity.boot_id,
+        capacity_bytes=capacity,
+        stats_provider=stats_proto,
+        block_ids_provider=storage.list_block_ids,
+        changes=changes,
+        data_node_id=identity.data_node_id,
+        retry_seconds=settings.register_retry_seconds,
+    )
 
     @asynccontextmanager
     async def lifespan(app: FastAPI):
         if register:
+            info = heartbeat.register(max_attempts=settings.register_max_attempts)
             # El id que devuelve el ControlNode manda sobre el guardado en disco: si el
-            # metadato se recreo, seguir usando el id viejo dejaria replicas apuntando a
-            # un nodo que ya no existe.
-            data_node_id = control.register(
-                base_url=settings.datanode_base_url,
-                capacity_bytes=capacity,
-                max_attempts=settings.register_max_attempts,
-                retry_seconds=settings.register_retry_seconds,
-            )
-            if data_node_id != identity.read():
-                identity.write(data_node_id)
-            app.state.data_node_id = data_node_id
+            # metadato se recreo, seguir con el id viejo dejaria replicas apuntando a un
+            # nodo que ya no existe.
+            if info.data_node_id != identity.data_node_id:
+                identity_store.write(
+                    Identity(data_node_id=info.data_node_id, boot_id=identity.boot_id)
+                )
+            elif identity_store.read() is None:
+                identity_store.write(identity)
+            app.state.data_node_id = info.data_node_id
 
-        stats = storage.stats()
+            # Un report completo nada mas registrarse: es lo que pone al ControlNode al
+            # dia sobre lo que este nodo tiene de verdad, incluido lo que cambio
+            # mientras estuvo desconectado.
+            try:
+                heartbeat.send_full_report(reason="arranque")
+            except Exception as exc:  # el bucle lo reintentara
+                log.warning("block_report.startup_failed", error=type(exc).__name__)
+
+            heartbeat.start()
+
+        estado = storage.stats()
         log.info(
             "data_node.start",
             data_node_id=app.state.data_node_id,
             data_dir=str(storage.root),
+            advertise_url=settings.datanode_advertise_url,
+            fault_domain=settings.datanode_fault_domain,
+            boot_id=identity.boot_id,
             capacity_bytes=capacity,
-            used_bytes=stats.used_bytes,
-            block_count=stats.block_count,
-            disk_free_bytes=stats.disk_free_bytes,
+            used_bytes=estado.used_bytes,
+            block_count=estado.block_count,
+            disk_free_bytes=estado.disk_free_bytes,
         )
         yield
+
+        heartbeat.stop()
         log.info("data_node.stop", data_node_id=app.state.data_node_id)
 
     app = FastAPI(
         title="DFSha DataNode",
-        version="0.1.0",
+        version="0.2.0",
         summary="Almacena bloques opacos por block_id. No conoce rutas ni usuarios.",
         lifespan=lifespan,
     )
@@ -79,7 +124,13 @@ def create_app(
     app.state.storage = storage
     app.state.control = control
     app.state.capacity_bytes = capacity
-    app.state.data_node_id = identity.read() or "sin-registrar"
+    app.state.data_node_id = identity.data_node_id or "sin-registrar"
+    app.state.boot_id = identity.boot_id
+    app.state.fault_domain = settings.datanode_fault_domain
+    app.state.advertise_url = settings.datanode_advertise_url
+    app.state.load = load
+    app.state.changes = changes
+    app.state.heartbeat = heartbeat
 
     # Misma tabla de traduccion que el ControlNode: los codigos de error de DFSha
     # significan lo mismo en los dos servicios.

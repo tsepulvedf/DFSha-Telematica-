@@ -32,7 +32,7 @@ def orphan_blocks(uow: SqlUnitOfWork) -> list[OrphanBlockView]:
 
         for bloque, replicas in uow.blocks.list_orphans(ahora):
             nodos = [
-                (r.data_node_id, nodo.base_url)
+                (r.data_node_id, nodo.advertise_url)
                 for r in replicas
                 if (nodo := uow.data_nodes.get(r.data_node_id)) is not None
             ]

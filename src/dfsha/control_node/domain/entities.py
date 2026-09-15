@@ -8,12 +8,13 @@ tocar una linea de logica.
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from enum import StrEnum
 
 __all__ = [
     "FileState",
+    "NodeStats",
     "ReplicaState",
     "DataNodeState",
     "User",
@@ -41,10 +42,18 @@ class FileState(StrEnum):
 class ReplicaState(StrEnum):
     PENDING = "PENDING"
     STORED = "STORED"
+    #: El nodo que la tenia dejo de reportarla, o perdio su disco. El ControlNode NUNCA
+    #: borra datos por esto: solo lo anota. En la Etapa 3, MISSING es lo que dispara la
+    #: re-replicacion.
+    MISSING = "MISSING"
 
 
 class DataNodeState(StrEnum):
     ALIVE = "ALIVE"
+    #: Sin heartbeat el tiempo suficiente para dejar de darle bloques nuevos, pero no
+    #: tanto como para dar sus replicas por perdidas. Es el estado que evita que un
+    #: hipo de red cueste una re-replicacion entera.
+    SUSPECT = "SUSPECT"
     DEAD = "DEAD"
 
 
@@ -138,13 +147,50 @@ class BlockReplica:
 
 
 @dataclass(frozen=True, slots=True)
+class NodeStats:
+    """Lo que el nodo reporto en su ultimo heartbeat.
+
+    `disk_free_bytes` sale de `shutil.disk_usage` en el DataNode, nunca de
+    `capacity - used`: si el disco se llena por logs o por otro contenedor, la resta
+    miente y la colocacion mandaria bloques a un nodo que no puede recibirlos.
+    """
+
+    used_bytes: int = 0
+    capacity_bytes: int = 0
+    disk_free_bytes: int = 0
+    block_count: int = 0
+    writes_in_flight: int = 0
+    reads_in_flight: int = 0
+    bytes_written_60s: int = 0
+
+    @property
+    def load_ratio(self) -> float:
+        """Fraccion de capacidad ocupada. Un nodo sin capacidad conocida se considera
+        lleno, para que no gane el desempate por accidente."""
+        if self.capacity_bytes <= 0:
+            return 1.0
+        return min(1.0, self.used_bytes / self.capacity_bytes)
+
+
+@dataclass(frozen=True, slots=True)
 class DataNode:
     id: str
-    base_url: str
+    #: Direccion alcanzable por el CLIENTE. El DTO que viaja al cliente la llama
+    #: `base_url` por compatibilidad con el contrato de la Etapa 1.
+    advertise_url: str
     capacity_bytes: int
     used_bytes: int
     state: DataNodeState
     registered_at: datetime
+    #: Cadena opaca: el ControlNode solo compara igualdad. Eso hace que el mismo codigo
+    #: sirva para simular dominios en local y para ser real en AWS.
+    fault_domain: str = ""
+    #: UUID nuevo en cada arranque con disco vacio. Distinguir "volvio el mismo nodo" de
+    #: "volvio con el disco perdido" es lo que decide si sus replicas se recuperan.
+    boot_id: str = ""
+    last_heartbeat_at: datetime | None = None
+    last_sequence: int = 0
+    stats: NodeStats = field(default_factory=NodeStats)
 
     @property
     def is_alive(self) -> bool:

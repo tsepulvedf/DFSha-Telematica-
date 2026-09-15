@@ -188,6 +188,24 @@ class BlockStorage:
 
     # --- Estado ------------------------------------------------------------
 
+    def list_block_ids(self) -> list[str]:
+        """Todos los bloques que hay en disco ahora mismo.
+
+        Es la entrada del block report completo, y por tanto lo unico que puede detectar
+        un `.blk` borrado por fuera del sistema: los reports incrementales solo cuentan
+        lo que paso por la API.
+        """
+        ids: list[str] = []
+        for shard in self.blocks_dir.iterdir():
+            if not shard.is_dir():
+                continue
+            ids.extend(
+                entrada.stem
+                for entrada in shard.iterdir()
+                if entrada.suffix == BLOCK_SUFFIX and entrada.is_file()
+            )
+        return sorted(ids)
+
     def stats(self) -> StorageStats:
         """Recorre el disco de verdad, sin contadores en memoria.
 

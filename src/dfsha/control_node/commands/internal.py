@@ -1,4 +1,9 @@
-"""Comandos del plano interno: los que invocan el DataNode y el GC, no el cliente."""
+"""Comandos del plano interno REST: los que invocan el DataNode y el GC, no el cliente.
+
+El registro del DataNode vivia aqui en la Etapa 1 y ahora esta en `control_plane.py`,
+detras de gRPC. Lo que queda es lo que tiene que seguir siendo sincrono con la peticion
+del cliente (la confirmacion de bloque) y lo que usa un script humano (el GC).
+"""
 
 from __future__ import annotations
 
@@ -7,15 +12,7 @@ from dfsha.control_node.domain.entities import utcnow
 from dfsha.control_node.repositories.sql import SqlUnitOfWork
 from dfsha.control_node.tracing import command
 
-__all__ = ["register_data_node", "mark_block_stored", "confirm_gc"]
-
-
-@command("internal.datanode_register")
-def register_data_node(uow: SqlUnitOfWork, base_url: str, capacity_bytes: int) -> str:
-    with uow:
-        nodo = uow.data_nodes.register(base_url, capacity_bytes, utcnow())
-        uow.commit()
-        return nodo.id
+__all__ = ["mark_block_stored", "confirm_gc"]
 
 
 @command("internal.block_stored")

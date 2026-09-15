@@ -68,7 +68,7 @@ def open_file(uow: SqlUnitOfWork, owner_id: str, raw_path: str) -> ReadPlan:
                 )
 
             nodos = [
-                (r.data_node_id, nodo.base_url)
+                (r.data_node_id, nodo.advertise_url)
                 for r in almacenadas
                 if (nodo := uow.data_nodes.get(r.data_node_id)) is not None
             ]

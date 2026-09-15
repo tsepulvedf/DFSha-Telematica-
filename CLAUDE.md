@@ -214,6 +214,27 @@ GET  /files/open?path=/a/b/c
                   replicas:[{data_node_id, base_url}]}]}
 ```
 
+### Alcance de gRPC (Etapa 2) — material del informe
+
+**gRPC solo entre ControlNode y DataNode.** Cliente<->ControlNode y cliente<->DataNode
+siguen en REST, sin cambios. Es una decision razonada, no una concesion a medias:
+
+- El **trafico de control** son mensajes frecuentes (uno cada 3 s por nodo), pequenos y de
+  esquema fijo, sobre una conexion que conviene mantener abierta. Ahi Protobuf y HTTP/2
+  pagan: menos bytes, menos handshakes, y un contrato con tipos que el compilador revisa.
+- El **trafico de cliente** mueve bytes crudos, se depura con `curl`, y se beneficia de
+  una API legible y de herramientas HTTP estandar. Meterlo en gRPC solo anadiria una capa
+  de opacidad sobre un `PUT` de un bloque.
+
+Solo migran tres RPC: `Register`, `Heartbeat` y `BlockReport`. **`POST
+/internal/v1/blocks/{block_id}/stored` se queda en REST**, y la razon importa: el DataNode
+lo llama de forma sincrona antes de responder 201 al cliente, de modo que cuando el
+cliente ve su bloque subido, el ControlNode ya lo sabe. Si esa confirmacion viajara en el
+block report incremental del heartbeat, un `commit` inmediato podria llegar hasta 3 s
+antes que la noticia y fallar con 409 por una carrera. La latencia del commit no puede
+quedar atada al periodo del heartbeat. Los dos endpoints del GC tambien siguen en REST,
+porque los usa el script, no el DataNode.
+
 ### ControlNode `/internal/v1` — lo consumen el DataNode y el GC
 
 ```
@@ -295,13 +316,25 @@ la lee el DataNode al registrarse, nunca el cliente, asi que ponerla en el servi
 `client` de compose no tiene ningun efecto.
 
 El contenedor `client` de compose tiene dos limitaciones conocidas, ambas comprobadas
-en ejecucion y documentadas en el README. No se arreglan en la Etapa 1 porque el
-escenario soportado es el cliente del host, y el contenedor es solo una comodidad:
+en ejecucion y documentadas en el README. El escenario soportado es el cliente del host;
+el contenedor es solo una comodidad:
 
 1. `put`, `get` y el GC fallan con "Connection refused", porque el plan trae `localhost`
    y ahi `localhost` es el propio contenedor del cliente. Los comandos de namespace si
-   funcionan. Se resuelve en la Etapa 2, en el sitio correcto: el ControlNode anunciando
-   a cada cliente la direccion visible desde donde esta.
+   funcionan.
+
+   **Sigue vigente al cerrar la Etapa 2, y es una decision, no un olvido.** La Etapa 1
+   anoto aqui que la Etapa 2 lo resolveria; al disenar la Etapa 2 se decidio lo
+   contrario, porque con N DataNodes el coste real quedo a la vista: soportarlo exigiria
+   que **cada** nodo anunciara dos direcciones distintas (la del host y la de la red de
+   compose) y que el ControlNode **eligiera entre ellas segun el origen de cada
+   peticion**. Eso mete en el plano de control una inferencia sobre la topologia de red
+   del cliente, que es justo el tipo de magia que rompe de formas dificiles de
+   diagnosticar cuando aparecen NAT, tuneles o varias interfaces. La Etapa 2 fija
+   **una sola direccion anunciada por nodo** (`DFSHA_DATANODE_ADVERTISE_URL`), elegida
+   por la configuracion del despliegue. Quien quiera revertir esta decision en la
+   Etapa 3 debe saber que el precio es ese, no un ajuste de una linea.
+
 2. La sesion no sobrevive entre invocaciones de `docker compose run --rm client`, pese
    al volumen montado en `/home/dfsha/.dfsha`, que es donde `DFSHA_HOME` apunta. Si
    alguien lo retoma: el cliente ya dice por pantalla donde guardo la sesion y que
