@@ -96,6 +96,17 @@ class DirectoryRow(Base):
 
     __table_args__ = (
         UniqueConstraint("parent_id", "name", name="uq_directories_parent_name"),
+        # El UNIQUE de arriba no protege las raices: en SQL dos NULL nunca colisionan, asi
+        # que nada impediria dos filas con parent_id NULL para el mismo usuario, es decir
+        # dos arboles para una sola cuenta. Este indice parcial es el que garantiza
+        # una raiz por usuario.
+        Index(
+            "uq_directories_root_per_owner",
+            "owner_id",
+            unique=True,
+            sqlite_where=text("parent_id IS NULL"),
+            postgresql_where=text("parent_id IS NULL"),
+        ),
         Index("ix_directories_parent", "parent_id"),
     )
 

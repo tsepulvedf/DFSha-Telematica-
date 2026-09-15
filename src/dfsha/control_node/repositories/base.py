@@ -174,7 +174,12 @@ class DataNodeRepository(Protocol):
 
     def add_used_bytes(self, data_node_id: str, delta: int) -> None:
         """Ajusta el ocupado registrado. Positivo al confirmar un bloque, negativo cuando
-        el GC lo borra."""
+        el GC lo borra.
+
+        Es una cache del ControlNode, no la fuente de verdad: esa es el disco del
+        DataNode, que la reporta en `/health`. La politica de colocacion de la Etapa 2
+        debe usar el valor del heartbeat, no este contador.
+        """
         ...
 
 

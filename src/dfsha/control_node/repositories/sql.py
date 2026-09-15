@@ -359,6 +359,14 @@ class SqlBlockRepository:
         self._session = session
 
     def add_plan(self, blocks: Iterable[Block], replicas: Iterable[BlockReplica]) -> None:
+        """Inserta el plan completo con exactamente dos flushes, pase lo que pase.
+
+        Aqui no vale la regla de "un flush por add" del resto del modulo: un archivo de
+        50 MB con bloques de 1 MB son 100 filas, y un flush por fila serian 100 viajes a
+        la base de datos en la ruta caliente de `create`. Un flush para todos los bloques
+        y otro para todas las replicas basta para respetar el orden de las claves
+        foraneas. Sigue siendo una sola transaccion.
+        """
         for block in blocks:
             self._session.add(
                 BlockRow(
@@ -521,6 +529,18 @@ class SqlDataNodeRepository:
         return [_to_data_node(row) for row in rows]
 
     def add_used_bytes(self, data_node_id: str, delta: int) -> None:
+        """Ajusta el ocupado que el ControlNode tiene registrado de ese nodo.
+
+        Esto es una cache, no la fuente de verdad. La fuente de verdad es el disco del
+        DataNode, que la reporta en `/health` calculandola del estado real de los
+        ficheros. Este contador se desvia en cuanto haya un bloque escrito cuya
+        notificacion se perdio, una notificacion duplicada o un borrado hecho fuera del
+        GC.
+
+        Importa para la Etapa 2: la politica de colocacion debe leer `used_bytes` y
+        `disk_free_bytes` del heartbeat, no este contador. Sirve para decisiones baratas
+        entre heartbeats, nunca para decidir si un nodo tiene sitio de verdad.
+        """
         # Se calcula en la base de datos, no leyendo y reescribiendo desde Python, para
         # que dos confirmaciones simultaneas no se pisen la una a la otra.
         # El CASE mantiene el contador en cero o mas. Nada de `max(a, b)`: en SQLite es

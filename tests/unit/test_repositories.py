@@ -105,6 +105,21 @@ class TestUsuariosYDirectorios:
         assert uow.directories.get_root(beto.id).id == raiz_beto.id
         assert raiz_ana.id != raiz_beto.id
 
+    def test_un_usuario_no_puede_tener_dos_raices(self, uow: SqlUnitOfWork) -> None:
+        # UNIQUE(parent_id, name) no cubre esto: en SQL dos NULL no colisionan, asi que
+        # sin el indice parcial sobre owner_id una cuenta podria acabar con dos arboles.
+        usuario, _ = sembrar_usuario(uow)
+        with pytest.raises(IntegrityError):
+            uow.directories.add(
+                Directory(
+                    id=new_id(),
+                    parent_id=None,
+                    name="",
+                    owner_id=usuario.id,
+                    created_at=AHORA,
+                )
+            )
+
     def test_las_fechas_vuelven_con_zona_horaria(self, uow: SqlUnitOfWork) -> None:
         # Sin esto, comparar expires_at con utcnow() lanzaria TypeError justo en la
         # comprobacion de reservas vencidas.
