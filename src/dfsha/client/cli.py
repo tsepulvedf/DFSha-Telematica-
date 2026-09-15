@@ -286,14 +286,17 @@ def cluster() -> None:
         box=None,
         pad_edge=False,
     )
-    tabla.add_column("estado", width=8)
+    tabla.add_column("estado", width=7)
     tabla.add_column("dominio", style="cyan")
-    tabla.add_column("direccion")
+    # `fold` y no truncar: la direccion es justo el dato que hace falta para ir a
+    # hablar con el nodo, y un "http://12..." no sirve de nada.
+    tabla.add_column("direccion", overflow="fold")
     tabla.add_column("usado", justify="right", style="magenta")
+    tabla.add_column("cap.", justify="right", style="magenta")
     tabla.add_column("libre", justify="right", style="magenta")
-    tabla.add_column("bloques", justify="right")
-    tabla.add_column("replicas", justify="right", style="dim")
-    tabla.add_column("ultimo latido", justify="right")
+    tabla.add_column("bloq.", justify="right")
+    tabla.add_column("repl.", justify="right", style="dim")
+    tabla.add_column("latido", justify="right")
 
     for nodo in sorted(estado.nodes, key=lambda n: (n.fault_domain, n.advertise_url)):
         color = colores.get(nodo.state, "white")
@@ -313,6 +316,7 @@ def cluster() -> None:
             nodo.fault_domain or "-",
             nodo.advertise_url,
             _humano(nodo.used_bytes),
+            _humano(nodo.capacity_bytes),
             _humano(nodo.disk_free_bytes),
             str(nodo.block_count),
             replicas,
