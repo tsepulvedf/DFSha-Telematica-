@@ -592,18 +592,29 @@ class SqlUnitOfWork:
     def __init__(self, session_factory) -> None:
         self._session_factory = session_factory
         self._session: Session | None = None
+        # Los repositorios existen desde la construccion, no desde el `with`: hay
+        # colaboradores (la politica de colocacion) que se construyen por inyeccion de
+        # dependencias antes de que el caso de uso abra la unidad de trabajo. SQLAlchemy
+        # no toca la base de datos hasta la primera consulta, asi que una unidad que se
+        # crea y no se usa no abre ninguna conexion.
+        self._abrir_sesion()
 
-    def __enter__(self) -> "SqlUnitOfWork":
+    def _abrir_sesion(self) -> None:
         self._session = self._session_factory()
         self.users = SqlUserRepository(self._session)
         self.directories = SqlDirectoryRepository(self._session)
         self.files = SqlFileRepository(self._session)
         self.blocks = SqlBlockRepository(self._session)
         self.data_nodes = SqlDataNodeRepository(self._session)
+
+    def __enter__(self) -> "SqlUnitOfWork":
+        if self._session is None:
+            self._abrir_sesion()
         return self
 
     def __exit__(self, exc_type, exc, tb) -> None:
-        assert self._session is not None
+        if self._session is None:
+            return
         try:
             # Rollback incondicional: si ya hubo commit no deshace nada, y si el caso de
             # uso salio a medias sin confirmar, deja la transaccion cerrada en vez de
