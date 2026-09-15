@@ -18,11 +18,28 @@
 
 name: "dfsha"
 
+# --- Etapa 3: el metadato vive en PostgreSQL -------------------------------
+#
+# Un primario y una replica en streaming. La replica sirve el lado de CONSULTA de CQRS
+# (ls, stat, open); los comandos y las lecturas que tienen que ver su propia escritura
+# van al primario. Ver "Enrutado CQRS" en CLAUDE.md.
+#
+# La promocion de la replica ante caida del primario es MANUAL y esta escrita en
+# deploy/RUNBOOK-postgres.md. Un failover de base de datos automatico y correcto es otro
+# proyecto, y uno a medias es peor que ninguno.
+
+x-postgres-secrets: &postgres-secrets
+  POSTGRES_USER: "dfsha"
+  POSTGRES_DB: "dfsha"
+  POSTGRES_PASSWORD: "${DFSHA_PG_PASSWORD:?falta DFSHA_PG_PASSWORD; copia .env.example a .env}"
+  DFSHA_REPLICATION_USER: "replicador"
+  DFSHA_REPLICATION_PASSWORD: "${DFSHA_PG_REPLICATION_PASSWORD:?falta DFSHA_PG_REPLICATION_PASSWORD; copia .env.example a .env}"
+
 x-datanode-base: &datanode-base
   build:
     context: "."
     dockerfile: "docker/data_node.Dockerfile"
-  image: "dfsha/data-node:0.2.0"
+  image: "dfsha/data-node:0.3.0"
   restart: "unless-stopped"
   depends_on:
     control-node:
@@ -41,17 +58,87 @@ x-datanode-env: &datanode-env
   DFSHA_REGISTER_RETRY_SECONDS: "2"
 
 services:
+  postgres-primary:
+    image: "postgres:16"
+    container_name: "dfsha-postgres-primary"
+    environment:
+      <<: *postgres-secrets
+      # wal_level=replica y los slots son lo que permite que la replica siga el WAL.
+      # Sin ellos el primario arranca igual y la replica falla al engancharse, que es
+      # el orden de fallos mas confuso posible.
+      POSTGRES_INITDB_ARGS: "--data-checksums"
+    command:
+      - "postgres"
+      - "-c"
+      - "wal_level=replica"
+      - "-c"
+      - "max_wal_senders=10"
+      - "-c"
+      - "max_replication_slots=10"
+      - "-c"
+      - "wal_keep_size=256MB"
+    volumes:
+      - "dfsha-pg-primary:/var/lib/postgresql/data"
+      - "./docker/postgres/primary-init.sh:/docker-entrypoint-initdb.d/10-replicacion.sh:ro"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U dfsha -d dfsha"]
+      interval: "5s"
+      timeout: "3s"
+      retries: 20
+    restart: "unless-stopped"
+
+  postgres-replica:
+    image: "postgres:16"
+    container_name: "dfsha-postgres-replica"
+    environment:
+      <<: *postgres-secrets
+      DFSHA_PRIMARY_HOST: "postgres-primary"
+      DFSHA_PRIMARY_PORT: "5432"
+    # Se invoca bash explicitamente: un bind mount desde Windows no siempre conserva el
+    # bit de ejecucion, y el fallo seria "permission denied" sin mas explicacion.
+    entrypoint: ["/bin/bash", "/dfsha/replica-entrypoint.sh"]
+    volumes:
+      - "dfsha-pg-replica:/var/lib/postgresql/data"
+      - "./docker/postgres/replica-entrypoint.sh:/dfsha/replica-entrypoint.sh:ro"
+    depends_on:
+      postgres-primary:
+        condition: "service_healthy"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U dfsha -d dfsha"]
+      interval: "5s"
+      timeout: "3s"
+      retries: 30
+    restart: "unless-stopped"
+
+  # Un solo uso: aplica las migraciones y termina. Los ControlNodes dependen de que
+  # haya terminado bien; ellos NO migran, solo comprueban que la base esta al dia.
+  # Con tres instancias arrancando a la vez, migrar desde cada una seria una carrera.
+  migrate:
+    build:
+      context: "."
+      dockerfile: "docker/control_node.Dockerfile"
+    image: "dfsha/control-node:0.3.0"
+    container_name: "dfsha-migrate"
+    environment:
+      DFSHA_DB_URL: "postgresql+psycopg://dfsha:${DFSHA_PG_PASSWORD:?falta DFSHA_PG_PASSWORD}@postgres-primary:5432/dfsha"
+    command: ["alembic", "upgrade", "head"]
+    depends_on:
+      postgres-primary:
+        condition: "service_healthy"
+    restart: "no"
+
   control-node:
     build:
       context: "."
       dockerfile: "docker/control_node.Dockerfile"
-    image: "dfsha/control-node:0.2.0"
+    image: "dfsha/control-node:0.3.0"
     container_name: "dfsha-control-node"
     ports:
       - "8000:8000"   # REST, lo consume el cliente
       - "9000:9000"   # gRPC, plano de control
     environment:
-      DFSHA_DB_URL: "sqlite:////var/lib/dfsha-meta/dfsha.db"
+      DFSHA_DB_URL: "postgresql+psycopg://dfsha:${DFSHA_PG_PASSWORD:?falta DFSHA_PG_PASSWORD}@postgres-primary:5432/dfsha"
+      DFSHA_DB_REPLICA_URL: "postgresql+psycopg://dfsha:${DFSHA_PG_PASSWORD:?falta DFSHA_PG_PASSWORD}@postgres-replica:5432/dfsha"
       DFSHA_JWT_SECRET: "${DFSHA_JWT_SECRET:?falta DFSHA_JWT_SECRET; copia .env.example a .env}"
       DFSHA_INTERNAL_SECRET: "${DFSHA_INTERNAL_SECRET:?falta DFSHA_INTERNAL_SECRET; copia .env.example a .env}"
       DFSHA_BLOCK_SIZE: "${DFSHA_BLOCK_SIZE:-67108864}"
@@ -67,8 +154,11 @@ services:
       DFSHA_REPLICATION_FACTOR: "${DFSHA_REPLICATION_FACTOR:-1}"
       DFSHA_PLACEMENT_D: "${DFSHA_PLACEMENT_D:-3}"
       DFSHA_MIN_FREE_BYTES: "${DFSHA_MIN_FREE_BYTES:-134217728}"
-    volumes:
-      - "dfsha-meta:/var/lib/dfsha-meta"
+    depends_on:
+      migrate:
+        condition: "service_completed_successfully"
+      postgres-replica:
+        condition: "service_healthy"
     restart: "unless-stopped"
 
   # Cuatro DataNodes, cada uno en su dominio de falla. En local la separacion es logica
@@ -138,7 +228,7 @@ services:
     build:
       context: "."
       dockerfile: "docker/client.Dockerfile"
-    image: "dfsha/client:0.2.0"
+    image: "dfsha/client:0.3.0"
     environment:
       DFSHA_CONTROL_URL: "http://control-node:8000"
       DFSHA_INTERNAL_SECRET: "${DFSHA_INTERNAL_SECRET:-}"
@@ -151,7 +241,8 @@ services:
         condition: "service_healthy"
 
 volumes:
-  dfsha-meta:
+  dfsha-pg-primary:
+  dfsha-pg-replica:
   dfsha-blocks-1:
   dfsha-blocks-2:
   dfsha-blocks-3:

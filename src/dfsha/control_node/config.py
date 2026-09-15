@@ -30,6 +30,11 @@ class ControlNodeSettings(BaseSettings):
 
     block_size: int = Field(default=64 * 1024 * 1024, gt=0)
     db_url: str = "sqlite:///./dfsha.db"
+    #: Replica de lectura para el lado de consulta de CQRS. Vacia = todo al primario,
+    #: que es un modo soportado: el sistema se comporta como en las etapas anteriores.
+    #: Esa propiedad es deliberada, porque convierte "prescindir de la replica" en
+    #: borrar una variable de entorno en vez de deshacer codigo.
+    db_replica_url: str = ""
 
     # Sin default a proposito: son obligatorios.
     jwt_secret: str

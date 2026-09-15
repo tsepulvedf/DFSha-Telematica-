@@ -24,13 +24,14 @@ RUN pip install --no-cache-dir -e "." "grpcio-tools>=1.60"
 COPY "scripts/gen_proto.py" "./scripts/gen_proto.py"
 RUN python scripts/gen_proto.py
 
-# La base de datos vive en un volumen, no en la capa de imagen.
-RUN mkdir -p "/var/lib/dfsha-meta"
-ENV DFSHA_DB_URL="sqlite:////var/lib/dfsha-meta/dfsha.db"
+# Sin DFSHA_DB_URL por defecto: desde la Etapa 3 el metadato es PostgreSQL y vive
+# fuera de esta imagen. Un default de SQLite aqui haria que un despliegue al que se le
+# olvido la variable arrancara feliz contra un fichero dentro del contenedor, y
+# perdiera el metadato entero al reiniciarlo.
 
 # Sin usuario root: el proceso no necesita privilegios para servir HTTP.
 RUN useradd --create-home --uid 1000 dfsha \
-    && chown -R dfsha:dfsha "/var/lib/dfsha-meta" "/app"
+    && chown -R dfsha:dfsha "/app"
 USER dfsha
 
 EXPOSE 8000
