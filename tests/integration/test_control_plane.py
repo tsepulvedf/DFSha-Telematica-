@@ -159,14 +159,58 @@ class TestHeartbeat:
     def test_un_boot_id_distinto_pide_registro(self, plano: _Plano) -> None:
         nodo_id = plano.registrar(boot_id="boot-A").data_node_id
         respuestas = plano.latir(nodo_id, boot_id="boot-OTRO")
-        pedidos = [m for m in respuestas if m.HasField("full_report")]
-        assert pedidos, "deberia pedir un report completo"
-        assert "registr" in pedidos[0].full_report.reason
+        razones = " ".join(
+            m.full_report.reason for m in respuestas if m.HasField("full_report")
+        )
+        assert "registr" in razones
 
     def test_un_bloque_desconocido_provoca_peticion_de_report(self, plano: _Plano) -> None:
         nodo_id = plano.registrar().data_node_id
         respuestas = plano.latir(nodo_id, added=["bloque-fantasma"])
-        assert any(m.HasField("full_report") for m in respuestas)
+        razones = " ".join(
+            m.full_report.reason for m in respuestas if m.HasField("full_report")
+        )
+        assert "desconocido" in razones
+
+    def test_al_abrir_el_stream_se_pide_un_report_completo(self, plano: _Plano) -> None:
+        """Cada reconexion pide un report completo, y esto tapa un agujero real.
+
+        El contador de "cada N latidos" vive en el DataNode. Si un stream se rompe antes
+        de llegar al latido N, ese contador se queda a medias; con un ControlNode que se
+        reinicia o una red inestable, el nodo podria no mandar un report completo
+        **nunca**, y la vision del ControlNode no se contrastaria jamas. Justo despues de
+        una reconexion es cuando mas probable es que esa vision haya quedado vieja.
+        """
+        nodo_id = plano.registrar().data_node_id
+
+        # `latir` abre un stream nuevo cada vez: son dos reconexiones.
+        for secuencia in (1, 2):
+            respuestas = plano.latir(nodo_id, sequence=secuencia)
+            razones = [
+                m.full_report.reason for m in respuestas if m.HasField("full_report")
+            ]
+            assert razones, f"el latido {secuencia} deberia pedir un report completo"
+            assert "reconexion" in razones[0]
+
+    def test_solo_se_pide_al_primer_latido_del_stream(self, plano: _Plano) -> None:
+        # Dentro de un stream estable no se repite: seria pedir un report completo cada
+        # 3 segundos, que con muchos bloques es caro y no aporta nada.
+        nodo_id = plano.registrar().data_node_id
+        peticiones = [
+            control_pb2.HeartbeatRequest(
+                data_node_id=nodo_id,
+                boot_id="boot-A",
+                sequence=n,
+                stats=control_pb2.NodeStats(capacity_bytes=100 * MB),
+            )
+            for n in (1, 2, 3)
+        ]
+        mensajes = list(plano.stub.Heartbeat(iter(peticiones), timeout=10))
+
+        acks = [m for m in mensajes if m.HasField("ack")]
+        reports = [m for m in mensajes if m.HasField("full_report")]
+        assert len(acks) == 3
+        assert len(reports) == 1
 
 
 class TestEstados:
@@ -289,14 +333,54 @@ class TestBlockReport:
             replicas = u.blocks.list_replicas(["blk-1"])
         assert replicas["blk-1"][0].state is ReplicaState.STORED
 
-    def test_un_incremental_no_marca_nada_como_perdido(self, plano: _Plano) -> None:
-        nodo_id = plano.registrar().data_node_id
-        self._sembrar_replica(plano, nodo_id, "blk-1")
+    def test_report_incremental_nunca_marca_missing(self, plano: _Plano) -> None:
+        """Un report con `is_full=false` NO puede marcar MISSING. Nunca.
 
+        Es el fallo mas caro de esta etapa, y por eso esta blindado aqui y no solo en la
+        prueba unitaria de `divergence.compare`.
+
+        El porque: en un report incremental el DataNode manda **solo lo que cambio**
+        desde el anterior. Que un bloque no aparezca no significa que no este, significa
+        que no se toco. Si esto marcara MISSING, cada latido de cada nodo daria por
+        perdido todo su disco menos lo que acabara de cambiar: con R=1 eso deja todos los
+        archivos ilegibles, y en la Etapa 3 dispararia una re-replicacion del cluster
+        entero contra si mismo.
+
+        Solo un report completo autoriza a concluir que falta algo.
+        """
+        nodo_id = plano.registrar().data_node_id
+        for block_id in ("blk-1", "blk-2", "blk-3"):
+            self._sembrar_replica(plano, nodo_id, block_id)
+
+        # Un incremental que no menciona NINGUNO de los tres bloques que el metadato si
+        # espera en ese nodo. El caso mas agresivo posible.
         respuesta = self._reportar(plano, nodo_id, [], completo=False)
+
         assert respuesta.missing_blocks == 0
         with plano.uow() as u:
-            assert u.blocks.list_replicas(["blk-1"])["blk-1"][0].state is ReplicaState.STORED
+            replicas = u.blocks.list_replicas(["blk-1", "blk-2", "blk-3"])
+        for block_id, copias in replicas.items():
+            assert copias[0].state is ReplicaState.STORED, f"{block_id} no debe ser MISSING"
+
+        # Y el mismo contenido marcado como completo si las da por perdidas: la
+        # diferencia esta en `is_full` y en nada mas.
+        completo = self._reportar(plano, nodo_id, [], completo=True)
+        assert completo.missing_blocks == 3
+
+    def test_el_heartbeat_incremental_tampoco_marca_missing(self, plano: _Plano) -> None:
+        """Misma garantia por el otro camino: el report incremental que viaja pegado al
+        heartbeat. Son dos rutas distintas en el codigo y las dos tienen que cumplirlo."""
+        nodo_id = plano.registrar().data_node_id
+        for block_id in ("hb-1", "hb-2"):
+            self._sembrar_replica(plano, nodo_id, block_id)
+
+        # Latido normal: no menciona ninguno de los dos bloques.
+        plano.latir(nodo_id, sequence=1, block_count=2)
+
+        with plano.uow() as u:
+            replicas = u.blocks.list_replicas(["hb-1", "hb-2"])
+        for block_id, copias in replicas.items():
+            assert copias[0].state is ReplicaState.STORED, f"{block_id} no debe ser MISSING"
 
 
 class TestDiscoPerdido:

@@ -112,6 +112,8 @@ class HeartbeatClient:
         #: Para poder comprobar en las pruebas que el bucle sigue vivo tras un fallo.
         self.heartbeats_sent = 0
         self.reconnects = 0
+        self.full_reports_sent = 0
+        self._acks = 0
 
     # --- Conexion ----------------------------------------------------------
 
@@ -197,6 +199,7 @@ class HeartbeatClient:
             ),
             timeout=30,
         )
+        self.full_reports_sent += 1
         self._log.info(
             "block_report.sent",
             data_node_id=self.data_node_id,
@@ -236,14 +239,15 @@ class HeartbeatClient:
         self.connect()
         assert self._stub is not None
 
-        latidos_en_sesion = 0
         for mensaje in self._stub.Heartbeat(self._peticiones()):
             if mensaje.HasField("ack"):
-                latidos_en_sesion += 1
-                if (
-                    self.full_report_every_n
-                    and latidos_en_sesion % self.full_report_every_n == 0
-                ):
+                # El contador es del cliente, no de la sesion. Si se reiniciara con cada
+                # stream, un nodo que reconecta cada pocos segundos no llegaria nunca al
+                # latido N y no mandaria un report completo jamas. El ControlNode pide
+                # uno al reconectar, y este contador cubre el caso contrario: un stream
+                # largo y estable.
+                self._acks += 1
+                if self.full_report_every_n and self._acks % self.full_report_every_n == 0:
                     self.send_full_report(reason="cada N latidos")
             elif mensaje.HasField("full_report"):
                 self.send_full_report(reason=mensaje.full_report.reason or "peticion")

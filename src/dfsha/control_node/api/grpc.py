@@ -89,6 +89,7 @@ class ControlPlaneServicer(control_pb2_grpc.ControlPlaneServicer):
         meter un caso mas en el `oneof`, no rehacer el transporte.
         """
         data_node_id = ""
+        primer_latido = True
         try:
             for peticion in request_iterator:
                 data_node_id = peticion.data_node_id
@@ -116,9 +117,26 @@ class ControlPlaneServicer(control_pb2_grpc.ControlPlaneServicer):
                 yield control_pb2.ControlMessage(
                     ack=control_pb2.Ack(acked_sequence=peticion.sequence)
                 )
-                if resultado.request_full_report:
+
+                razones: list[str] = []
+                if primer_latido:
+                    # Un report completo por CADA stream que se abre, no solo al
+                    # arrancar el nodo. Sin esto hay un agujero real: el contador de
+                    # "cada N latidos" vive en la sesion del DataNode, asi que un stream
+                    # que se rompe cada pocos segundos no llega nunca al latido N y el
+                    # ControlNode se queda con una vision que nadie vuelve a contrastar.
+                    # Una reconexion es justo cuando mas probable es que su vision haya
+                    # quedado vieja: entre medias pudo perderse cualquier cambio.
+                    razones.append("reconexion: primer latido de este stream")
+                    primer_latido = False
+                if resultado.request_full_report and resultado.reason:
+                    razones.append(resultado.reason)
+
+                if razones:
+                    # Un solo mensaje con las razones juntas, en vez de dos seguidos que
+                    # provocarian dos reports completos identicos.
                     yield control_pb2.ControlMessage(
-                        full_report=control_pb2.FullReportReq(reason=resultado.reason)
+                        full_report=control_pb2.FullReportReq(reason="; ".join(razones))
                     )
         except grpc.RpcError:
             # El nodo colgo. No es un error del ControlNode: la deteccion de caidas es
