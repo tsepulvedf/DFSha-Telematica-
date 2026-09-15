@@ -39,19 +39,23 @@ Reglas transversales que se derivan de lo anterior:
 - Acceso a datos **detrás de repositorios**. Nada de SQL suelto en los routers.
 - Los routers de FastAPI solo traducen HTTP <-> casos de uso. Las reglas de dominio viven
   en `domain/`.
-- Sin demonios ni tareas en background en la Etapa 1. Las comprobaciones de expiración son
-  **perezosas**, en el momento en que se consulta o se pisa el nombre.
+- Las comprobaciones de expiración de reservas son **perezosas**, en el momento en que se
+  consulta o se pisa el nombre; nunca un barrido en background.
+- La Etapa 1 no tenía ninguna tarea en background. La Etapa 2 introduce dos, y solo dos:
+  el bucle de heartbeat del DataNode y el evaluador de pertenencia del ControlNode.
+  Ninguna puede tumbar su proceso: las dos capturan, registran y siguen.
 
 ---
 
 ## 2. Hoja de ruta
 
-- **Etapa 1 (hito-1, actual)** — RF1 + RF2, un ControlNode y un DataNode, JWT, SHA-256 por
+- **Etapa 1 (hito-1)** — RF1 + RF2, un ControlNode y un DataNode, JWT, SHA-256 por
   bloque, GC manual, logging estructurado.
-- **Etapa 2 (hito-2)** — N DataNodes reales, gRPC ControlNode<->DataNode, heartbeat cada
-  3 s con métricas de carga, block report incremental, política de colocación *power of d
-  choices* (filtrar candidatos vivos con espacio -> tomar los 3 menos cargados -> elegir al
-  azar entre esos) con restricción de dominios de falla.
+- **Etapa 2 (hito-2, actual)** — N DataNodes reales, gRPC ControlNode<->DataNode,
+  heartbeat cada 3 s con métricas de carga, block report incremental, maquina de estados
+  ALIVE/SUSPECT/DEAD, politica de colocacion *power of d choices* con restriccion de
+  dominios de falla, deteccion de divergencia sin borrado automatico, y despliegue en
+  AWS.
 - **Etapa 3 (hito-3)** — replicación R=3 con pipeline y commit W=2, re-replicación ante
   caída, ControlNode primary/standby con edit log, réplicas de lectura CQRS, RF3 con
   leases, mTLS y cifrado en reposo.
@@ -61,9 +65,9 @@ Diseñar contra esta hoja de ruta, no adelantarla.
 
 ---
 
-## 3. Alcance de la Etapa 1
+## 3. Alcance por etapa
 
-### Sí entra
+### Etapa 1 — sí entra
 
 - **RF1** namespace: `ls`, `cd`, `mkdir`, `rmdir`, `rm`, `mv`, `stat`.
 - **RF2** transferencia: `put` (particiona y sube) y `get` (descarga y reconstruye).
@@ -73,14 +77,64 @@ Diseñar contra esta hoja de ruta, no adelantarla.
 - Recolector manual de bloques huérfanos (`scripts/gc.py`).
 - Logging estructurado JSON con tiempos, desde el primer commit.
 
-### No entra — no lo implementes ni lo simules
+### Etapa 2 — sí entra
 
-- Replicación. En esta etapa R=1.
-- Pipeline de escritura entre DataNodes, heartbeats, block reports, re-replicación.
-- gRPC, mTLS, cifrado en reposo, 2FA, ACLs por grupo.
-- Alta disponibilidad del ControlNode, edit log, failover.
+- gRPC para el plano de control: `Register`, `Heartbeat` (bidireccional), `BlockReport`.
+- Heartbeat cada 3 s con métricas de carga, `fault_domain` y `boot_id`.
+- Block report incremental en cada latido, completo cada 20 y en cada reconexión.
+- Máquina de estados `ALIVE`/`SUSPECT`/`DEAD` con reincorporación por `boot_id`.
+- Colocación *power of d choices* con restricción de dominios de falla.
+- Una dirección anunciada por nodo, fijada por la configuración del despliegue.
+- Detección de divergencia **sin borrado automático**.
+- `GET /api/v1/cluster/status` y `dfsha cluster`.
+- Compose con cuatro DataNodes y material de despliegue en AWS.
+
+### No entra hasta la Etapa 3 — no lo implementes ni lo simules
+
+- Replicación efectiva. `DFSHA_REPLICATION_FACTOR` sigue en **1**: la política soporta
+  R>1 y está probada para ello, pero el default no cambia hasta la Etapa 3.
+- Pipeline de escritura entre DataNodes, quórum W, re-replicación automática.
+- Alta disponibilidad del ControlNode, edit log, failover, réplicas de lectura.
+- mTLS, cifrado en reposo, 2FA, ACLs por grupo.
 - RF3 (`open`/`read`/`write`/`lock`), leases, lecturas por rango.
-- Cualquier demonio o tarea en background. El GC se corre a mano.
+- El GC se sigue corriendo a mano.
+
+### Decisiones de la Etapa 2
+
+1. **Estado derivado, no almacenado.** El estado de un DataNode se calcula del ultimo
+   heartbeat cada vez que se consulta (`membership.state_for`). La columna `state` solo
+   se persiste para detectar la transicion y emitir el evento; si las dos discrepan,
+   manda lo derivado. Asi no puede haber deriva silenciosa.
+2. **SUSPECT no toca las replicas.** Saca al nodo de la colocacion pero sus bloques se
+   siguen sirviendo. Es lo que evita que un hipo de red cueste una re-replicacion entera
+   en la Etapa 3.
+3. **`boot_id` dentro del volumen de datos** (`node.json`, junto a los bloques). Perder
+   el volumen pierde el `boot_id`, que es justo lo que el ControlNode necesita detectar
+   para dar las replicas por perdidas. Guardarlo fuera mentiria en ese caso.
+4. **Un report incremental NUNCA marca MISSING.** El nodo solo manda lo que cambio, asi
+   que la ausencia de un bloque no significa nada. Marcar MISSING con un incremental
+   daria por perdido el disco entero en cada latido. Solo un report completo autoriza a
+   concluir que falta algo. Blindado en `test_report_incremental_nunca_marca_missing`.
+5. **Un report completo por cada reconexion.** El contador de "cada N latidos" vive en el
+   DataNode; un stream que se rompe antes del latido N lo deja a medias, y con una red
+   inestable podria no mandarse un completo nunca. El ControlNode manda `FullReportReq`
+   en el primer latido de cada stream.
+6. **La colocacion cuenta lo que ya asigno en la misma llamada.** Los bloques de un `put`
+   se colocan todos en una unica llamada a `/files/create`, con una sola foto de carga.
+   Sin ese recuento, con d=3 y cuatro nodos iguales el cuarto no entraria en la ventana ni
+   una vez: el efecto manada que el power of d evita entre peticiones, reaparecido dentro
+   de una.
+7. **Nunca dos replicas en el mismo `data_node_id`.** Cuando no quedan dominios de falla
+   libres se relaja el dominio y se avisa (`placement.domain_relaxed`), pero jamas se
+   repite nodo: dos copias en el mismo disco se pierden juntas.
+8. **El ControlNode no borra datos por una divergencia.** Un bloque de mas cuesta disco;
+   uno de menos cuesta datos. Los huerfanos van al GC, que es manual, y las replicas
+   ausentes a MISSING.
+9. **Migracion de esquema: fallar pronto.** Un metadato de la Etapa 1 no tiene las
+   columnas nuevas y `create_all` no las anade. Se detecta al arrancar y se falla con el
+   comando exacto (`docker compose down -v`) y el aviso de que eso borra los datos.
+10. **El evaluador de pertenencia no puede tumbar el ControlNode.** Captura `Exception`,
+    registra y sigue; su intervalo es configurable.
 
 ### Costuras dejadas listas para N nodos
 
@@ -93,6 +147,16 @@ Aunque hoy haya un DataNode y una réplica, el diseño soporta N sin refactor:
   `SingleNodePlacement`. La Etapa 2 solo añade *power of d choices*.
 - El ControlNode devuelve al cliente un **plan** de escritura/lectura que ya es una lista
   de réplicas por bloque, aunque hoy cada lista tenga un elemento.
+
+Y las que la Etapa 2 deja para la Etapa 3:
+
+- El stream de `Heartbeat` es **bidireccional** y el ControlNode ya empuja mensajes no
+  solicitados (`FullReportReq`). Las ordenes de re-replicacion son un caso mas en el
+  `oneof` de `ControlMessage`, no un transporte nuevo.
+- El estado `MISSING` de una replica ya se detecta, se registra y se ve en los logs: es
+  lo que disparara la recuperacion.
+- `select(block_size, replication_factor)` no cambia de firma: la Etapa 3 solo sube el
+  default de `DFSHA_REPLICATION_FACTOR`, que hoy es 1.
 
 ---
 
@@ -299,11 +363,28 @@ DFSHA_JWT_SECRET=
 DFSHA_JWT_TTL_SECONDS=3600
 DFSHA_INTERNAL_SECRET=
 DFSHA_DATA_DIR=/var/lib/dfsha
-DFSHA_DATANODE_BASE_URL=http://localhost:8001
 DFSHA_DATANODE_CAPACITY_BYTES=
 DFSHA_WRITE_TTL_SECONDS=600      # vencimiento de reservas en WRITING
 DFSHA_LOG_LEVEL=INFO
+
+# --- Etapa 2 ---
+DFSHA_DATANODE_ADVERTISE_URL=http://localhost:8001   # alcanzable por el CLIENTE
+DFSHA_DATANODE_FAULT_DOMAIN=local-1                  # cadena opaca
+DFSHA_CONTROL_GRPC_URL=control-node:9000
+DFSHA_GRPC_PORT=9000
+DFSHA_HEARTBEAT_INTERVAL_MS=3000
+DFSHA_FULL_REPORT_EVERY_N=20
+DFSHA_SUSPECT_AFTER_MS=10000     # menor que DEAD, o el servicio no arranca
+DFSHA_DEAD_AFTER_MS=30000
+DFSHA_MEMBERSHIP_INTERVAL_MS=1000
+DFSHA_REPLICATION_FACTOR=1       # la Etapa 3 sube este default
+DFSHA_PLACEMENT_D=3
+DFSHA_MIN_FREE_BYTES=134217728
 ```
+
+`DFSHA_DATANODE_BASE_URL` de la Etapa 1 pasó a llamarse `DFSHA_DATANODE_ADVERTISE_URL`,
+sin alias: mantener dos nombres para lo mismo envejece mal. Un `.env` de la Etapa 1 falla
+al arrancar con un mensaje claro.
 
 `DFSHA_DATANODE_BASE_URL` no estaba en la lista original y la exige el contrato: el
 DataNode tiene que decirle al ControlNode con que URL anunciarse, porque los bytes van
@@ -361,12 +442,22 @@ Eventos obligatorios, todos con `duration_ms`:
 - `metadata.command` / `metadata.query` — `operation`, `duration_ms` (la separación CQRS
   tiene que verse también en las trazas)
 
+Etapa 2:
+
+- `node.registered` — `data_node_id`, `advertise_url`, `fault_domain`, `boot_id`,
+  `rejoin_kind`
+- `node.state_changed` — `from`, `to`, `data_node_id`, `fault_domain`, `silence_seconds`
+- `heartbeat.received` — `data_node_id`, `sequence`, `used_bytes`, `lag_ms`
+- `placement.selected` — `block_id`, `candidates`, `chosen`, `fault_domains`
+- `placement.domain_relaxed`, `placement.insufficient_candidates`
+- `divergence.unknown_block`, `divergence.missing_block`
+
 ---
 
 ## 9. Cliente CLI
 
 Comandos: `login`, `register`, `ls`, `cd`, `pwd`, `mkdir`, `rmdir`, `rm`, `mv`, `stat`,
-`put <local> <remoto>`, `get <remoto> <local>`.
+`put <local> <remoto>`, `get <remoto> <local>`, `cluster`.
 
 - `cd` y `pwd` operan sobre un cwd **del lado del cliente**, persistido junto al token en
   `~/.dfsha/session.json`. El ControlNode no guarda sesión: es stateless.
@@ -435,6 +526,8 @@ src/dfsha/
 │   └── services/    # auth, placement
 ├── data_node/
 │   ├── main.py, config.py, api/, storage.py
+│   ├── heartbeat.py     # cliente gRPC del plano de control
+│   └── runtime.py       # carga instantanea que alimenta el heartbeat
 └── client/
     ├── cli.py, session.py, chunker.py, transfer.py
 tests/{unit,integration}/

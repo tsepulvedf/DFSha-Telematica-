@@ -1,0 +1,39 @@
+# Un DataNode en su propia instancia t3.micro.
+#
+# Un solo servicio a proposito: t3.micro es 1 GB de RAM, y dos DataNodes en la
+# misma maquina anularian el sentido de los dominios de falla.
+#
+# Los tres valores que cambian por instancia (URL anunciada, dominio de falla y
+# direccion del ControlNode) estan en el .env. Ver deploy/.env.datanode.example.
+#
+#   docker compose -f deploy/docker-compose.datanode.yml up --build -d
+#   docker compose -f deploy/docker-compose.datanode.yml logs -f
+
+name: "dfsha-datanode"
+
+services:
+  data-node:
+    build:
+      context: ".."
+      dockerfile: "docker/data_node.Dockerfile"
+    image: "dfsha/data-node:0.2.0"
+    container_name: "dfsha-data-node"
+    env_file:
+      - "../.env"
+    ports:
+      # Mismo puerto en las cuatro instancias: cada una tiene su propia IP, asi
+      # que no hace falta el 8001-8004 del compose local, que existe solo porque
+      # alli los cuatro comparten el host.
+      - "8001:8001"
+    environment:
+      DFSHA_DATA_DIR: "/var/lib/dfsha"
+    volumes:
+      # El node.json con data_node_id y boot_id vive en este volumen, junto a los
+      # bloques. Es deliberado: perder el volumen es perder el boot_id, y eso es
+      # justo lo que le dice al ControlNode que las replicas de este nodo ya no
+      # existen. Borrar el volumen equivale a reemplazar el disco.
+      - "dfsha-blocks:/var/lib/dfsha"
+    restart: "unless-stopped"
+
+volumes:
+  dfsha-blocks:
