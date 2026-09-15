@@ -112,8 +112,9 @@ OpenTelemetry ni exportadores de métricas. Logs JSON y nada más.
 ```
 users(id, username UNIQUE, password_hash, created_at)
 
-directories(id, parent_id NULL, name, owner_id, created_at)
-    UNIQUE(parent_id, name)
+directories(id, parent_id NULL, name, owner_id, created_at, deleted_at NULL)
+    UNIQUE(parent_id, name) solo sobre filas con deleted_at NULL
+    UNIQUE(owner_id) solo sobre filas con parent_id NULL: una raiz por usuario
     el root de cada usuario es una fila con parent_id NULL
 
 files(id, directory_id, name, owner_id, size, block_size,
@@ -132,6 +133,19 @@ block_replicas(block_id, data_node_id, state, created_at)
 data_nodes(id, base_url, capacity_bytes, used_bytes, state, registered_at)
     state in {ALIVE, DEAD}
 ```
+
+Dos desviaciones respecto al esquema y los contratos originales, ambas descubiertas al
+implementar y ambas deliberadas:
+
+1. **`directories.deleted_at`**: los directorios se borran de forma lógica. `rmdir -r`
+   marca `DELETED` los archivos que contiene, y esas filas tienen que sobrevivir hasta
+   que el GC recoja sus bloques; pero `files.directory_id` apunta a `directories`, así
+   que borrar físicamente la fila del directorio violaría la clave foránea, y quitar la
+   clave foránea dejaría el metadato sin quien lo sostenga. Un directorio con
+   `deleted_at` es invisible y su nombre queda libre.
+2. **`GET /gc/orphan-blocks` devuelve también `size`**: el ControlNode ya conoce el
+   tamaño de cada bloque. Sin ese campo, el GC tendría que hacer una petición extra por
+   bloque al DataNode solo para poder informar cuántos bytes liberó.
 
 Reglas de dominio, a hacer cumplir en `domain/`:
 
@@ -205,7 +219,7 @@ GET  /files/open?path=/a/b/c
 ```
 POST /datanodes/register        {base_url, capacity_bytes} -> {data_node_id}
 POST /blocks/{block_id}/stored  {data_node_id, size, checksum_sha256} -> 204
-GET  /gc/orphan-blocks          -> {blocks:[{block_id, replicas:[{data_node_id, base_url}]}]}
+GET  /gc/orphan-blocks          -> {blocks:[{block_id, size, replicas:[{data_node_id, base_url}]}]}
 POST /gc/confirm                {block_ids:[...]} -> 204
 ```
 
@@ -213,8 +227,8 @@ POST /gc/confirm                {block_ids:[...]} -> 204
 `POST /gc/confirm` borra esas filas del metadato una vez el script confirmó que los bloques
 ya no están en disco.
 
-Autenticación interna: secreto compartido por header `X-DFSha-Internal-Secret`. En la
-Etapa 3 esto pasa a gRPC con mTLS.
+Autenticación interna: secreto compartido por header `X-DFSha-Internal-Secret`,
+comparado en tiempo constante. En la Etapa 3 esto pasa a gRPC con mTLS.
 
 ### DataNode `/api/v1` — lo consume el cliente
 
