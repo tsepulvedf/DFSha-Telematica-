@@ -289,6 +289,10 @@ son los sucesos de verdad, van a INFO y WARNING.
    propaga por la cadena. El coste es un bloque en memoria por subida concurrente, que ya
    era el comportamiento del DataNode desde la Etapa 1.
 
+   Dicho de otro modo, para el informe: **no se puede verificar y reenviar a la vez**, asi
+   que hay que elegir que se solapa con que. Solapar el reenvio con la ESCRITURA (no con
+   la recepcion) da las dos garantias a la vez y solo cuesta memoria.
+
 2. **Todo lo bloqueante sale del bucle de eventos. Esto costo un interbloqueo.** La
    primera version hacia la escritura y el reenvio dentro del `async def`, lo que deja el
    bucle de eventos del nodo parado: **mientras escribe o espera, el nodo deja de aceptar
@@ -298,9 +302,20 @@ son los sucesos de verdad, van a INFO y WARNING.
        bloque B: cliente -> DN2 -> DN1 -> DN4
 
    DN1 espera a DN2, DN2 espera a DN1, y ninguno puede atender al otro. Las dos subidas
-   mueren por timeout. Se reprodujo en las pruebas de integracion, que pasaron de 248 s en
-   timeouts a 50 s. El trabajo bloqueante va ahora a un hilo del pool
-   (`run_in_threadpool`), y el porque esta escrito en el docstring del handler.
+   mueren por timeout. Se reprodujo en las pruebas de integracion, que pasaron de **248 s
+   en timeouts a 50 s**. El trabajo bloqueante va ahora a un hilo del pool
+   (`run_in_threadpool`).
+
+   **Aviso para quien refactorice esto.** `_escribir_y_reenviar` parece una funcion
+   sincrona suelta que "podria" volver a meterse en el handler para ahorrarse una
+   indireccion, y el `run_in_threadpool` parece una ceremonia innecesaria alrededor de
+   codigo que no es lento. Las dos lecturas son erroneas por el mismo motivo: **el
+   problema no es que el trabajo tarde, es que mientras tarda el nodo no puede atender a
+   nadie**, y quien le esta llamando es un nodo que a su vez no puede atenderle a el. Un
+   solo nodo con una sola subida no reproduce nada; hacen falta dos nodos y dos subidas
+   cruzadas, que es por lo que un refactor puede deshacerlo y ver la suite en verde
+   localmente. Las pruebas que lo atrapan son las de `test_replication.py` con
+   `parallel=2` y cuatro nodos.
 
 3. **Un fallo aguas abajo no tumba la subida.** Si el nodo escribio bien pero el
    siguiente falla, responde 201 con un `acked` menor. Fallar la peticion convertiria W=3
