@@ -222,6 +222,38 @@ Las cuatro reglas que lo cortan:
 `services/leadership.py` **propone** una epoca (vista local, puede estar obsoleta);
 `commands/leadership.require_leadership` la **verifica**. Esa division es el diseno.
 
+#### Aviso para quien refactorice esto
+
+En algun momento alguien va a mirar este codigo y va a pensar que falta algo obvio:
+
+```python
+# NO. Esto deshace el Bloque A entero.
+if not leadership.soy_el_lider():
+    return
+hacer_el_trabajo()
+```
+
+Parece una simplificacion evidente y es **la vulnerabilidad exacta** que la epoca existe
+para cerrar. Dos motivos, y el segundo es el que no se ve:
+
+1. **`soy_el_lider()` solo puede responder con la vista local**, que es precisamente lo
+   que esta mal en el unico caso que importa: un proceso congelado cree que sigue
+   mandando. Responder desde la base tampoco arregla nada, por el motivo siguiente.
+2. **Entre la comprobacion y la escritura hay una ventana.** Aunque `soy_el_lider()`
+   consultara la base, el lease puede cambiar de manos entre esa consulta y el `UPDATE`
+   de mas abajo. La unica forma de cerrarla es que la comprobacion y la escritura esten
+   en la misma transaccion y bajo el mismo cerrojo de fila, y eso obliga a que la epoca
+   entre como **parametro** de la operacion, no como una pregunta previa.
+
+Por eso `evaluate_membership` recibe `fencing: Fencing` y llama a `require_leadership`
+**dentro** de su propio `with uow:`. La incomodidad de tener que pasar la epoca por todas
+partes no es un descuido de diseno: es la firma del tipo obligando a que nadie pueda
+escribir sin ella. Si esa incomodidad desaparece en un refactor, la proteccion tambien.
+
+La misma regla se aplica a todo lo que el Bloque B anade (programar re-replicacion) y a
+lo que quede del recolector: si escribe y exige liderazgo, recibe `Fencing` y lo verifica
+dentro de su transaccion.
+
 Lo comprueban `test_el_lider_congelado_es_rechazado_y_no_escribe_nada` (rechazo **y**
 cero escrituras) y `test_el_lider_congelado_que_recupera_el_lease_sigue_sin_validar_lo
 _viejo`.
