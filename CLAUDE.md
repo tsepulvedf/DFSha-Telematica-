@@ -187,6 +187,60 @@ Y las que la Etapa 2 deja para la Etapa 3:
    replicar: filtrarlo no da acceso al metadato. Su clave va en un `.pgpass` con
    permisos 0600, nunca en la linea de comandos, que cualquiera ve con `ps`.
 
+### Liderazgo: la epoca es un token de aislamiento
+
+Varios ControlNodes sin estado contra la misma base. Uno sostiene el lease (tabla
+`leadership`, una fila) y es el unico que evalua la pertenencia de los DataNodes,
+programa re-replicaciones (Bloque B) y recolecta. **Todos** sirven lecturas, planes de
+escritura y autenticacion, y **todos** aceptan heartbeats por gRPC: el heartbeat escribe
+en la base compartida, no en la memoria del proceso que lo recibe.
+
+El lease solo no basta. El escenario que obliga a la epoca:
+
+    t=0   A toma el lease (epoca 7) y empieza a evaluar la pertenencia
+    t=1   A se congela: pausa larga del recolector, particion, contenedor sin CPU
+    t=7   el lease de A vence sin que A se entere
+    t=8   B lo toma con epoca 8 y empieza a trabajar
+    t=9   A despierta EN MEDIO de su operacion, convencido de que sigue mandando
+
+Si lo unico que A comprobo fue "soy el lider" antes de empezar, en t=9 escribe, y hay dos
+lideres marcando nodos muertos y programando la misma re-replicacion dos veces.
+
+Las cuatro reglas que lo cortan:
+
+1. **La epoca viaja con la operacion** (`Fencing(leader_id, epoch)`), no se consulta.
+   **No existe ningun `soy_el_lider()`** consultable por separado: ese es exactamente el
+   patron que deja pasar a A.
+2. **Se verifica dentro de la misma transaccion que la escritura**, con `SELECT ... FOR
+   UPDATE` sobre la fila del lease. Comprobar en una transaccion y escribir en otra deja
+   una ventana entre ambas, y por esa ventana se cuela A.
+3. **La epoca solo sube.** Nunca baja ni se reinicia.
+4. **Recuperar el propio lease vencido tambien sube la epoca.** Si un lease vencido
+   propio se tratara como renovacion, A volveria con la epoca 7 intacta y validaria el
+   trabajo que empezo antes de la pausa. Entre la 7 y la 9 pudo pasar cualquier cosa.
+
+`services/leadership.py` **propone** una epoca (vista local, puede estar obsoleta);
+`commands/leadership.require_leadership` la **verifica**. Esa division es el diseno.
+
+Lo comprueban `test_el_lider_congelado_es_rechazado_y_no_escribe_nada` (rechazo **y**
+cero escrituras) y `test_el_lider_congelado_que_recupera_el_lease_sigue_sin_validar_lo
+_viejo`.
+
+**Que se prueba donde, y por que.** SQLite no implementa `FOR UPDATE` y SQLAlchemy lo
+omite en ese dialecto. En SQLite se prueba la **comparacion de epoca**; la **exclusion
+mutua** solo puede probarse contra PostgreSQL de verdad, en
+`tests/integration/test_leadership_postgres.py`, que se salta sin `DFSHA_TEST_PG_URL` y
+corre en el CI, que levanta un servicio PostgreSQL para eso. Ocho hilos saliendo de una
+barrera comun: gana exactamente uno.
+
+Medido en el stack desechable: matar al lider da relevo en **5,8 s** con la epoca subiendo
+de 2 a 3, dentro de los 10 s exigidos.
+
+**`leadership.renewed` se emite a nivel DEBUG**, no INFO. Con el default de 2 s y tres
+instancias son 1,5 lineas por segundo para siempre, y ahogarian los eventos que si
+cuentan algo. `leadership.acquired`, `leadership.lost` y `leadership.epoch_rejected`, que
+son los sucesos de verdad, van a INFO y WARNING.
+
 ### Enrutado CQRS: que consulta va a donde
 
 La separacion `commands/` / `queries/` existe desde la Etapa 1. Aqui se cobra.
@@ -221,9 +275,16 @@ error apunta a un primario acaban sirviendo desde el primario.
 
 ## 4. Stack
 
-Python 3.11+ · FastAPI + Uvicorn · Pydantic v2 (+ pydantic-settings) · SQLAlchemy 2.x +
-SQLite · Typer + Rich · httpx · passlib[bcrypt] · pyjwt · structlog · pytest +
-pytest-asyncio · Docker + docker-compose.
+Python 3.11+ · FastAPI + Uvicorn · Pydantic v2 (+ pydantic-settings) · SQLAlchemy 2.x ·
+**PostgreSQL** (SQLite solo en pruebas) · **Alembic** · Typer + Rich · httpx ·
+passlib[bcrypt] · pyjwt · structlog · pytest + pytest-asyncio · Docker + docker-compose ·
+nginx como balanceador.
+
+Dependencias anadidas en la Etapa 3, con permiso explicito: `alembic`, `psycopg[binary]`
+y (en el Bloque C) `cryptography`. **Se descarto `argon2-cffi`**: la clave del usuario se
+deriva con PBKDF2-HMAC-SHA256 a 600 000 iteraciones, que esta en la biblioteca estandar.
+Argon2id seria preferible por su resistencia a hardware especializado (GPU y ASIC); se
+eligio PBKDF2 por no anadir dependencia. Es un limite reconocido, no una omision.
 
 **No añadir dependencias sin preguntar.** En particular: nada de Prometheus,
 OpenTelemetry ni exportadores de métricas. Logs JSON y nada más.
@@ -511,6 +572,14 @@ Etapa 2:
 - `placement.domain_relaxed`, `placement.insufficient_candidates`
 - `divergence.unknown_block`, `divergence.missing_block`
 
+Etapa 3 (Bloque A):
+
+- `leadership.acquired` — `leader_id`, `epoch`, `previous_leader`, `self_recovery`
+- `leadership.lost` — `leader_id`, `epoch`
+- `leadership.renewed` — **a nivel DEBUG**; ver la nota de la seccion de liderazgo
+- `leadership.epoch_rejected` — `epoch`, `current_epoch`, `expired`. El lider congelado
+- `query.routed_to_primary` — `reason`, `client_lsn`, `replica_lsn`
+
 ---
 
 ## 9. Cliente CLI
@@ -580,16 +649,19 @@ src/dfsha/
 │   ├── api/         # routers FastAPI, solo traducción HTTP <-> casos de uso
 │   ├── commands/    # lado escritura CQRS
 │   ├── queries/     # lado lectura CQRS
-│   ├── domain/      # entidades y reglas: Path, File, Block, User
+│   ├── domain/      # entidades y reglas: Path, File, Block, User, Lease
 │   ├── repositories/
-│   └── services/    # auth, placement
+│   └── services/    # auth, placement, leadership, read_routing
 ├── data_node/
 │   ├── main.py, config.py, api/, storage.py
 │   ├── heartbeat.py     # cliente gRPC del plano de control
 │   └── runtime.py       # carga instantanea que alimenta el heartbeat
 └── client/
     ├── cli.py, session.py, chunker.py, transfer.py
+alembic/{env.py,versions/}      # migraciones del metadato (Etapa 3)
 tests/{unit,integration}/
 scripts/{gen_testfile.py,gc.py}
 docker/{control_node,data_node,client}.Dockerfile
+docker/{nginx/dfsha.conf,postgres/*.sh}
+deploy/RUNBOOK-postgres.md      # promocion manual de la replica
 ```
