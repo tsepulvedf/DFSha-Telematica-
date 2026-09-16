@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import sys
 from functools import lru_cache
+from pathlib import Path
 
 from pydantic import Field, ValidationError, field_validator, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
@@ -36,9 +37,27 @@ class ControlNodeSettings(BaseSettings):
     #: borrar una variable de entorno en vez de deshacer codigo.
     db_replica_url: str = ""
 
-    # Sin default a proposito: son obligatorios.
+    # Sin default a proposito: es obligatorio.
     jwt_secret: str
-    internal_secret: str
+
+    # --- mTLS del plano interno (Etapa 3, Bloque C) ------------------------
+    #
+    # SUSTITUYEN a DFSHA_INTERNAL_SECRET, que ya no existe. Un secreto compartido
+    # protege contra quien no lo conoce, pero no dice QUIEN esta al otro lado:
+    # cualquiera que lo tenga es todos a la vez. Con mTLS cada rol presenta su propio
+    # certificado y revocar a uno no obliga a rotar el de todos.
+    #
+    # Sin default, igual que el secreto de JWT: un plano interno que arranca sin
+    # autenticacion porque se olvido una variable es peor que uno que no arranca.
+    tls_ca_cert: str
+    tls_cert: str
+    tls_key: str
+    #: Puerto del plano interno. Va SEPARADO del de cliente a proposito: uvicorn no
+    #: expone el certificado del cliente a la aplicacion, asi que no se puede exigir
+    #: certificado para unas rutas y no para otras dentro del mismo puerto. Con un
+    #: puerto propio, la exigencia la hace el propio TLS: quien no presente un
+    #: certificado firmado por la CA no llega ni a enviar la peticion.
+    internal_port: int = Field(default=8443, gt=0, lt=65536)
 
     jwt_ttl_seconds: int = Field(default=3600, gt=0)
     write_ttl_seconds: int = Field(default=600, gt=0)
@@ -131,7 +150,25 @@ class ControlNodeSettings(BaseSettings):
             )
         return self
 
-    @field_validator("jwt_secret", "internal_secret")
+    @field_validator("tls_ca_cert", "tls_cert", "tls_key")
+    @classmethod
+    def _fichero_existe(cls, value: str, info) -> str:
+        """Que el fichero este, y decirlo al arrancar si no.
+
+        Un certificado que falta se manifestaria como un handshake fallido en la primera
+        conexion de un DataNode, que es un sintoma varias capas por debajo de la causa.
+        """
+        ruta = Path(value.strip())
+        if not value.strip():
+            raise ValueError("es obligatorio; generalos con python scripts/gen_certs.py")
+        if not ruta.is_file():
+            raise ValueError(
+                f"no existe el fichero '{ruta}'; generalos con "
+                "python scripts/gen_certs.py"
+            )
+        return str(ruta)
+
+    @field_validator("jwt_secret")
     @classmethod
     def _secreto_con_cuerpo(cls, value: str) -> str:
         if len(value.strip()) < MIN_SECRET_LENGTH:

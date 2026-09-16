@@ -13,6 +13,8 @@ from dfsha.client.api import ControlApi
 from dfsha.client.session import Session
 from dfsha.client.transfer import upload_blocks
 
+from tests.certs import material
+
 from .cluster import MB, Cluster, start_cluster
 
 
@@ -77,17 +79,16 @@ def blk_en_disco(cluster: Cluster) -> set[str]:
 
 
 def huerfanos(cluster: Cluster) -> list[dict]:
-    respuesta = httpx.get(
-        f"{cluster.control_url}/internal/v1/gc/orphan-blocks",
-        headers=cluster.internal_headers,
-        timeout=30,
-    )
+    with cluster.internal_client() as plano:
+        respuesta = plano.get("/internal/v1/gc/orphan-blocks")
     respuesta.raise_for_status()
     return respuesta.json()["blocks"]
 
 
 def correr_gc(cluster: Cluster, dry_run: bool = False):
-    return gc_script.recolectar(cluster.control_url, cluster.internal_secret, dry_run=dry_run)
+    return gc_script.recolectar(
+        cluster.control_internal_url, material("client"), dry_run=dry_run
+    )
 
 
 class TestCicloCompleto:
@@ -229,10 +230,29 @@ class TestReservasVencidas:
 
 
 class TestSeguridad:
-    def test_el_gc_exige_el_secreto_interno(self, cluster: Cluster) -> None:
+    """Lo que protege al GC cambio de naturaleza en el Bloque C.
+
+    Antes: un secreto compartido por cabecera, comprobado en el codigo. Ahora: un puerto
+    propio con TLS mutuo, donde quien no presenta un certificado de la CA **no llega a
+    enviar la peticion**. Estas pruebas afirman las dos caras de ese cambio.
+    """
+
+    def test_el_plano_del_gc_no_esta_en_el_puerto_de_cliente(
+        self, cluster: Cluster
+    ) -> None:
+        """Ni con el secreto de las etapas anteriores, que ya no significa nada."""
         respuesta = httpx.get(
             f"{cluster.control_url}/internal/v1/gc/orphan-blocks",
-            headers={"X-DFSha-Internal-Secret": "equivocado"},
+            headers={"X-DFSha-Internal-Secret": "el-de-la-etapa-2"},
             timeout=10,
         )
-        assert respuesta.status_code == 401
+        assert respuesta.status_code == 404
+
+    def test_sin_certificado_no_se_entra_al_plano_del_gc(self, cluster: Cluster) -> None:
+        """El fallo es de TRANSPORTE, no un 401: la peticion nunca sale."""
+        import ssl as _ssl
+
+        solo_ca = _ssl.create_default_context(cafile=str(material("client").ca_cert))
+        with httpx.Client(verify=solo_ca, timeout=10) as sin_cert:
+            with pytest.raises(httpx.TransportError):
+                sin_cert.get(f"{cluster.control_internal_url}/internal/v1/gc/orphan-blocks")

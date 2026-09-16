@@ -23,6 +23,7 @@ from dfsha.common.errors import DFShaError, NotFoundError
 from dfsha.common.logging import get_logger
 from dfsha.common.proto.gen import control_pb2, control_pb2_grpc
 from dfsha.control_node.commands import control_plane as commands
+from dfsha.common.tls import TlsMaterial, grpc_server_credentials
 from dfsha.control_node.commands import rereplication
 from dfsha.control_node.domain.entities import NodeStats
 from dfsha.control_node.domain.membership import MembershipThresholds
@@ -244,15 +245,28 @@ def build_grpc_server(
     servicer: ControlPlaneServicer,
     port: int,
     max_workers: int = 16,
+    tls: TlsMaterial | None = None,
 ) -> grpc.Server:
-    """Servidor gRPC escuchando en `port`.
+    """Servidor gRPC escuchando en `port`, con TLS mutuo.
 
     `max_workers` tiene que ser holgadamente mayor que el numero de DataNodes: cada
     stream de heartbeat ocupa un hilo mientras esta abierto. Con el pool justo, el nodo
     N+1 se queda esperando un hilo libre y el ControlNode lo declararia muerto sin que
     le pase nada.
+
+    **`tls=None` abre un puerto sin cifrar.** Solo lo usan las pruebas que ejercitan la
+    maquinaria del plano de control sin montar una CA. En el arranque real el material
+    TLS es obligatorio (no tiene default en la configuracion), asi que un despliegue no
+    puede acabar aqui por un descuido.
     """
     servidor = grpc.server(futures.ThreadPoolExecutor(max_workers=max_workers))
     control_pb2_grpc.add_ControlPlaneServicer_to_server(servicer, servidor)
-    servidor.add_insecure_port(f"[::]:{port}")
+
+    if tls is None:
+        servidor.add_insecure_port(f"[::]:{port}")
+    else:
+        # require_client_auth=True es lo que sustituye al secreto compartido: quien no
+        # presente un certificado firmado por nuestra CA no llega a mandar ni un latido.
+        servidor.add_secure_port(f"[::]:{port}", grpc_server_credentials(tls))
+
     return servidor

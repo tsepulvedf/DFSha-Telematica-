@@ -11,6 +11,7 @@ from fastapi import FastAPI
 
 from dfsha.common.logging import configure_logging, get_logger
 from dfsha.common.proto.gen import control_pb2
+from dfsha.common.tls import TlsMaterial
 from dfsha.control_node.api.errors import install_error_handlers
 from dfsha.data_node.config import DataNodeSettings, load_settings_or_exit
 from dfsha.data_node.control_client import ControlClient, Identity, NodeIdentity
@@ -62,7 +63,12 @@ def create_app(
     identity_store = NodeIdentity(settings.data_dir)
     identity = identity_store.load_or_create()
     capacity = settings.resolved_capacity_bytes()
-    control = control or ControlClient(settings.control_url, settings.internal_secret)
+    tls = (
+        TlsMaterial.from_paths(settings.tls_ca_cert, settings.tls_cert, settings.tls_key)
+        if settings.tls_ca_cert and settings.tls_cert and settings.tls_key
+        else None
+    )
+    control = control or ControlClient(settings.control_internal_url, tls=tls)
     load = LoadTracker()
     changes = BlockChangeLog()
 
@@ -97,6 +103,7 @@ def create_app(
         data_node_id=identity.data_node_id,
         retry_seconds=settings.register_retry_seconds,
         orders=orders,
+        tls=tls,
     )
 
     @asynccontextmanager
@@ -134,6 +141,7 @@ def create_app(
             fault_domain=settings.datanode_fault_domain,
             boot_id=identity.boot_id,
             capacity_bytes=capacity,
+            mtls=tls is not None,
             used_bytes=estado.used_bytes,
             block_count=estado.block_count,
             disk_free_bytes=estado.disk_free_bytes,

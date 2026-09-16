@@ -7,7 +7,6 @@ temporal sin parchear modulos.
 
 from __future__ import annotations
 
-import secrets
 from typing import Annotated, Callable
 
 from fastapi import Depends, Header, Request
@@ -24,7 +23,6 @@ from dfsha.control_node.services.placement import (
 from dfsha.control_node.services.read_routing import ReadRouter
 
 __all__ = [
-    "INTERNAL_SECRET_HEADER",
     "get_settings_dep",
     "get_uow_factory",
     "get_uow",
@@ -32,7 +30,6 @@ __all__ = [
     "get_query_uow",
     "get_placement",
     "current_user",
-    "require_internal_secret",
     "Settings",
     "Uow",
     "QueryUow",
@@ -40,9 +37,6 @@ __all__ = [
     "Placement",
     "CurrentUser",
 ]
-
-INTERNAL_SECRET_HEADER = "X-DFSha-Internal-Secret"
-
 
 def get_settings_dep(request: Request) -> ControlNodeSettings:
     return request.app.state.settings
@@ -114,19 +108,11 @@ def current_user(
     return decode_access_token(token.strip(), settings.jwt_secret)
 
 
-def require_internal_secret(
-    settings: Annotated[ControlNodeSettings, Depends(get_settings_dep)],
-    x_dfsha_internal_secret: Annotated[str | None, Header()] = None,
-) -> None:
-    """Protege `/internal/v1`, que solo deben tocar el DataNode y el GC.
-
-    Comparacion en tiempo constante: con `==`, el tiempo de respuesta filtra cuantos
-    caracteres iniciales acerto quien prueba. En la Etapa 3 esto pasa a mTLS.
-    """
-    if not x_dfsha_internal_secret or not secrets.compare_digest(
-        x_dfsha_internal_secret, settings.internal_secret
-    ):
-        raise AuthenticationError("secreto interno invalido o ausente")
+# El `require_internal_secret` de las Etapas 1 y 2 ya no existe. El plano interno vive
+# ahora en un puerto propio con TLS mutuo, asi que la puerta la guarda el propio TLS:
+# quien no presente un certificado firmado por la CA de DFSha no llega a enviar la
+# peticion, y no hay ninguna comprobacion en el codigo que se pueda olvidar en una ruta
+# nueva. Ver `common/tls.py` y `create_internal_app`.
 
 
 Settings = Annotated[ControlNodeSettings, Depends(get_settings_dep)]

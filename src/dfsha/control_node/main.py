@@ -9,12 +9,14 @@ terminaria el proceso, incluido el de pytest al recolectar las pruebas.
 
 from __future__ import annotations
 
+import threading
 from contextlib import asynccontextmanager
 from datetime import timedelta
 
 from fastapi import FastAPI, Request
 
 from dfsha.common.logging import configure_logging, get_logger
+from dfsha.common.tls import TlsMaterial
 from dfsha.control_node.config import ControlNodeSettings, load_settings_or_exit
 from dfsha.control_node.repositories.database import (
     build_engine,
@@ -44,9 +46,92 @@ from .api.routers import (
     internal_router,
 )
 
-__all__ = ["create_app"]
+__all__ = ["create_app", "create_internal_app"]
 
 API_PREFIX = "/api/v1"
+
+
+def create_internal_app(app_padre: FastAPI) -> FastAPI:
+    """App del plano interno: solo `/internal/v1`, en su propio puerto con TLS mutuo.
+
+    ## Por que un puerto aparte y no una ruta protegida
+
+    Uvicorn **no expone a la aplicacion el certificado del cliente**. Eso significa que
+    no se puede exigir certificado para `/internal/v1` y no para `/api/v1` dentro del
+    mismo puerto: la decision de pedir certificado se toma en el handshake, antes de que
+    exista una ruta.
+
+    Se podria haber terminado el mTLS en nginx y pasar el certificado en una cabecera,
+    pero entonces la seguridad del plano interno dependeria de que nadie pueda llegar al
+    ControlNode sin pasar por nginx, que es una suposicion de red que se rompe sola en
+    cuanto alguien publica un puerto por comodidad.
+
+    Con un puerto propio, **la exigencia la hace TLS**: quien no presente un certificado
+    firmado por la CA de DFSha no llega a enviar la peticion. Y como este router no lleva
+    ninguna dependencia de autenticacion, tampoco hay forma de anadir aqui una ruta y
+    olvidarse de protegerla: no hay nada que olvidar.
+
+    Comparte `state` con la app principal a proposito: la misma unidad de trabajo, el
+    mismo motor y el mismo servicio de liderazgo. Son dos puertas al mismo proceso, no
+    dos procesos.
+    """
+    interna = FastAPI(
+        title="DFSha ControlNode - plano interno",
+        version="0.3.0",
+        summary=(
+            "Solo lo consumen el DataNode y el recolector, y solo con certificado de "
+            "la CA de DFSha."
+        ),
+    )
+    interna.state = app_padre.state
+    install_error_handlers(interna)
+    interna.include_router(internal_router)
+
+    @interna.get("/health", tags=["operacion"])
+    def health() -> dict[str, str]:
+        return {"status": "ok", "service": "control-node-internal"}
+
+    return interna
+
+
+class _ServidorInterno:
+    """Uvicorn en un hilo para el plano interno.
+
+    En un hilo y no en un proceso aparte porque comparte el estado con la app principal.
+    Uvicorn intenta instalar manejadores de senales al arrancar y no puede fuera del hilo
+    principal; lo detecta y sigue, asi que la parada se pide con `should_exit`.
+    """
+
+    def __init__(self, app: FastAPI, port: int, tls: TlsMaterial) -> None:
+        import ssl
+
+        import uvicorn
+
+        config = uvicorn.Config(
+            app,
+            host="0.0.0.0",
+            port=port,
+            log_level="warning",
+            access_log=False,
+            ssl_certfile=str(tls.cert),
+            ssl_keyfile=str(tls.key),
+            ssl_ca_certs=str(tls.ca_cert),
+            # LA linea. Sin CERT_REQUIRED esto seria TLS sin autenticacion: cifrado con
+            # cualquiera, que para un plano de control es casi peor que nada porque
+            # parece seguro.
+            ssl_cert_reqs=ssl.CERT_REQUIRED,
+        )
+        self._server = uvicorn.Server(config)
+        self._hilo = threading.Thread(
+            target=self._server.run, name="dfsha-internal", daemon=True
+        )
+
+    def start(self) -> None:
+        self._hilo.start()
+
+    def stop(self, timeout: float = 5.0) -> None:
+        self._server.should_exit = True
+        self._hilo.join(timeout=timeout)
 
 
 def create_app(settings: ControlNodeSettings | None = None) -> FastAPI:
@@ -79,6 +164,13 @@ def create_app(settings: ControlNodeSettings | None = None) -> FastAPI:
     lease_timings = LeaseTimings.from_millis(
         settings.lease_ttl_ms, settings.lease_renew_ms
     )
+    # `None` solo cuando la configuracion viene de una prueba que no monta CA. En el
+    # arranque real los tres ficheros son obligatorios y los valida `config.py`.
+    tls = (
+        TlsMaterial.from_paths(settings.tls_ca_cert, settings.tls_cert, settings.tls_key)
+        if settings.tls_ca_cert and settings.tls_cert and settings.tls_key
+        else None
+    )
     rereplication_policy = RereplicationPolicy(
         replication_factor=settings.replication_factor,
         grace=timedelta(milliseconds=settings.rereplication_grace_ms),
@@ -98,7 +190,10 @@ def create_app(settings: ControlNodeSettings | None = None) -> FastAPI:
             full_report_every_n=settings.full_report_every_n,
         )
         grpc_server = build_grpc_server(
-            servicer, settings.grpc_port, max_workers=settings.grpc_max_workers
+            servicer,
+            settings.grpc_port,
+            max_workers=settings.grpc_max_workers,
+            tls=tls,
         )
         grpc_server.start()
 
@@ -132,9 +227,20 @@ def create_app(settings: ControlNodeSettings | None = None) -> FastAPI:
         )
         replicador.start()
 
+        # Plano interno en su propio puerto, con TLS mutuo. Se arranca aqui y no como
+        # un proceso aparte porque comparte todo el estado con la app principal: el
+        # motor, la unidad de trabajo y el servicio de liderazgo.
+        servidor_interno = None
+        if tls is not None:
+            servidor_interno = _ServidorInterno(
+                create_internal_app(app), settings.internal_port, tls
+            )
+            servidor_interno.start()
+
         app.state.grpc_server = grpc_server
         app.state.membership_monitor = monitor
         app.state.rereplication = replicador
+        app.state.internal_server = servidor_interno
 
         log.info(
             "control_node.start",
@@ -151,6 +257,8 @@ def create_app(settings: ControlNodeSettings | None = None) -> FastAPI:
             lease_ttl_ms=settings.lease_ttl_ms,
             write_quorum=settings.write_quorum,
             rereplication_grace_ms=settings.rereplication_grace_ms,
+            mtls=tls is not None,
+            internal_port=settings.internal_port if tls is not None else None,
         )
         yield
 
@@ -159,6 +267,8 @@ def create_app(settings: ControlNodeSettings | None = None) -> FastAPI:
         replicador.stop()
         monitor.stop()
         liderazgo.stop()
+        if servidor_interno is not None:
+            servidor_interno.stop()
         # `grace` da margen a los streams de heartbeat abiertos para cerrarse solos en
         # vez de cortarlos a mitad y llenar los logs de los DataNodes de errores.
         grpc_server.stop(grace=2.0).wait(timeout=5.0)
@@ -227,7 +337,9 @@ def create_app(settings: ControlNodeSettings | None = None) -> FastAPI:
     app.include_router(cluster_router, prefix=API_PREFIX)
     app.include_router(fs_router, prefix=API_PREFIX)
     app.include_router(files_router, prefix=API_PREFIX)
-    app.include_router(internal_router)  # ya trae su propio /internal/v1
+    # `internal_router` NO se monta aqui: vive en `create_internal_app`, que se sirve en
+    # otro puerto con TLS mutuo. Montarlo tambien aqui abriria el plano interno al
+    # puerto de cliente, que es justo lo que el puerto aparte existe para impedir.
 
     @app.get("/health", tags=["operacion"])
     def health() -> dict[str, str]:

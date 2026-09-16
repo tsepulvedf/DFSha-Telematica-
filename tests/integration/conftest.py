@@ -14,7 +14,8 @@ import pytest
 from fastapi.testclient import TestClient
 
 from dfsha.control_node.config import ControlNodeSettings
-from dfsha.control_node.main import create_app
+from tests.certs import material
+from dfsha.control_node.main import create_app, create_internal_app
 
 MB = 1024 * 1024
 
@@ -38,7 +39,13 @@ def build_settings(tmp_path: FsPath, **overrides) -> ControlNodeSettings:
     valores = dict(
         db_url=f"sqlite:///{(tmp_path / 'dfsha.db').as_posix()}",
         jwt_secret=SECRETO_JWT,
-        internal_secret=SECRETO_INTERNO,
+        # El plano interno ya no se protege con un secreto compartido: vive en su propio
+        # puerto con TLS mutuo. Estas pruebas no abren ese puerto (ver la fixture
+        # `internal`), pero la configuracion sigue exigiendo el material.
+        tls_ca_cert=str(material("control").ca_cert),
+        tls_cert=str(material("control").cert),
+        tls_key=str(material("control").key),
+        internal_port=puerto_libre(),
         block_size=MB,
         write_ttl_seconds=600,
         log_level="WARNING",
@@ -67,8 +74,21 @@ def control(settings: ControlNodeSettings):
 
 
 @pytest.fixture()
-def internal_headers() -> dict[str, str]:
-    return {"X-DFSha-Internal-Secret": SECRETO_INTERNO}
+def internal(settings: ControlNodeSettings):
+    """Cliente del plano interno, montado **sin** TLS a proposito.
+
+    Estas pruebas ejercitan las RUTAS del plano interno: que `/gc/orphan-blocks` liste lo
+    que toca, que `/blocks/{id}/stored` confirme. Levantar TLS aqui no las haria mejores
+    y las haria mucho mas lentas.
+
+    Que el puerto exija certificado se prueba donde se puede probar de verdad, abriendo
+    un socket: `tests/integration/test_mtls.py`. Separarlo asi es deliberado — una prueba
+    que mezcle las dos cosas no dice cual de las dos fallo.
+    """
+    app = create_app(settings)
+    with TestClient(app) as principal:
+        with TestClient(create_internal_app(principal.app)) as cliente:
+            yield cliente
 
 
 class Sesion:

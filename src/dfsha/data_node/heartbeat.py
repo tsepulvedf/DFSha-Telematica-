@@ -19,6 +19,7 @@ from typing import Callable, Iterator
 import grpc
 
 from dfsha.common.logging import get_logger
+from dfsha.common.tls import grpc_channel_credentials
 from dfsha.common.proto.gen import control_pb2, control_pb2_grpc
 
 __all__ = ["BlockChangeLog", "HeartbeatClient", "RegistrationInfo"]
@@ -90,6 +91,7 @@ class HeartbeatClient:
         retry_seconds: float = 2.0,
         orders=None,
         peer_url: str = "",
+        tls=None,
     ) -> None:
         self._grpc_url = grpc_url
         self._advertise_url = advertise_url
@@ -106,6 +108,9 @@ class HeartbeatClient:
         #: nodo late igual y simplemente ignora las ordenes, que es lo que hace falta en
         #: las pruebas que solo miran el heartbeat.
         self._orders = orders
+        #: Material TLS. `None` solo en pruebas que no montan CA; en el arranque real es
+        #: obligatorio y lo valida la configuracion.
+        self._tls = tls
 
         self.data_node_id = data_node_id
         self.heartbeat_interval_ms = 3000
@@ -126,9 +131,21 @@ class HeartbeatClient:
     # --- Conexion ----------------------------------------------------------
 
     def connect(self) -> None:
-        if self._channel is None:
+        """Abre el canal con el ControlNode.
+
+        Con material TLS, el canal es mutuo: este nodo valida que el ControlNode presenta
+        un certificado de nuestra CA (para que nadie se haga pasar por el y reciba los
+        heartbeats del cluster) y se presenta a su vez con el suyo.
+        """
+        if self._channel is not None:
+            return
+        if self._tls is None:
             self._channel = grpc.insecure_channel(self._grpc_url)
-            self._stub = control_pb2_grpc.ControlPlaneStub(self._channel)
+        else:
+            self._channel = grpc.secure_channel(
+                self._grpc_url, grpc_channel_credentials(self._tls)
+            )
+        self._stub = control_pb2_grpc.ControlPlaneStub(self._channel)
 
     def close(self) -> None:
         if self._channel is not None:

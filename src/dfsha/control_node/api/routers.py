@@ -7,7 +7,7 @@ devolver un DTO, la logica esta en el sitio equivocado.
 
 from __future__ import annotations
 
-from fastapi import APIRouter, Depends, Request, Response, status
+from fastapi import APIRouter, Request, Response, status
 
 from dfsha.common.dto import (
     BlockReadPlan,
@@ -47,14 +47,7 @@ from dfsha.control_node.queries import namespace as namespace_queries
 from dfsha.control_node.domain.entities import utcnow
 from dfsha.control_node.domain.membership import MembershipThresholds
 
-from .deps import (
-    CurrentUser,
-    Placement,
-    QueryUow,
-    Settings,
-    Uow,
-    require_internal_secret,
-)
+from .deps import CurrentUser, Placement, QueryUow, Settings, Uow
 
 __all__ = [
     "auth_router",
@@ -68,11 +61,11 @@ auth_router = APIRouter(prefix="/auth", tags=["auth"])
 cluster_router = APIRouter(prefix="/cluster", tags=["cluster"])
 fs_router = APIRouter(prefix="/fs", tags=["namespace"])
 files_router = APIRouter(prefix="/files", tags=["transferencia"])
-internal_router = APIRouter(
-    prefix="/internal/v1",
-    tags=["interno"],
-    dependencies=[Depends(require_internal_secret)],
-)
+#: Sin dependencia de autenticacion, y no es un descuido: este router se monta en una
+#: app aparte, servida en un puerto propio con TLS mutuo. La puerta la guarda el
+#: handshake, no el codigo, asi que no hay forma de anadir una ruta aqui y olvidarse de
+#: protegerla. Ver `create_internal_app` en main.py.
+internal_router = APIRouter(prefix="/internal/v1", tags=["interno"])
 
 
 def _replicas(pares: list[tuple[str, str]]) -> list[ReplicaRef]:

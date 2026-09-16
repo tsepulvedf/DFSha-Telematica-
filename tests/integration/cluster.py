@@ -21,6 +21,7 @@ from dfsha.control_node.config import ControlNodeSettings
 from dfsha.control_node.main import create_app as create_control_app
 from dfsha.data_node.config import DataNodeSettings
 from dfsha.data_node.main import create_app as create_data_app
+from tests.certs import material
 
 __all__ = ["Cluster", "DataNodeHandle", "start_cluster", "MB"]
 
@@ -104,7 +105,8 @@ class Cluster:
     control_url: str
     control_grpc_port: int
     nodes: list[DataNodeHandle]
-    internal_secret: str = SECRETO_INTERNO
+    #: Plano interno, en su propio puerto y con TLS mutuo.
+    control_internal_url: str = ""
     _control: _ServidorEnHilo | None = None
     settings: ControlNodeSettings | None = None
 
@@ -124,9 +126,18 @@ class Cluster:
 
     # --- Cluster -----------------------------------------------------------
 
-    @property
-    def internal_headers(self) -> dict[str, str]:
-        return {"X-DFSha-Internal-Secret": self.internal_secret}
+    def internal_client(self, rol: str = "client") -> httpx.Client:
+        """Cliente del plano interno con certificado, como lo usaria el recolector.
+
+        El secreto compartido de las etapas anteriores ya no existe: quien no presente un
+        certificado de la CA no llega ni a enviar la peticion.
+        """
+        tls = material(rol)
+        return httpx.Client(
+            base_url=self.control_internal_url,
+            verify=tls.httpx_verify(),
+            timeout=30,
+        )
 
     def uow_factory(self):
         """Acceso al metadato del ControlNode desde una prueba.
@@ -228,12 +239,16 @@ def start_cluster(
     """
     puerto_control = puerto_libre()
     puerto_grpc = puerto_libre()
+    puerto_interno = puerto_libre()
     control_url = f"http://127.0.0.1:{puerto_control}"
 
     control_settings = ControlNodeSettings(
         db_url=f"sqlite:///{(tmp_path / 'dfsha.db').as_posix()}",
         jwt_secret=SECRETO_JWT,
-        internal_secret=SECRETO_INTERNO,
+        tls_ca_cert=str(material("control").ca_cert),
+        tls_cert=str(material("control").cert),
+        tls_key=str(material("control").key),
+        internal_port=puerto_interno,
         block_size=block_size,
         write_ttl_seconds=write_ttl_seconds,
         log_level="WARNING",
@@ -265,7 +280,10 @@ def start_cluster(
             datanode_advertise_url=anunciada,
             datanode_peer_url=url if advertise_muerta else "",
             datanode_fault_domain=dominios[indice],
-            internal_secret=SECRETO_INTERNO,
+            control_internal_url=f"https://127.0.0.1:{puerto_interno}",
+            tls_ca_cert=str(material("data").ca_cert),
+            tls_cert=str(material("data").cert),
+            tls_key=str(material("data").key),
             datanode_capacity_bytes=capacidades[indice],
             log_level="WARNING",
             register_retry_seconds=0.1,
@@ -285,6 +303,7 @@ def start_cluster(
     cluster = Cluster(
         control_url=control_url,
         control_grpc_port=puerto_grpc,
+        control_internal_url=f"https://127.0.0.1:{puerto_interno}",
         nodes=handles,
         _control=control,
         settings=control_settings,

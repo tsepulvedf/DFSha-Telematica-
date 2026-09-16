@@ -23,7 +23,12 @@ class DataNodeSettings(BaseSettings):
     )
 
     data_dir: str = "/var/lib/dfsha"
-    control_url: str = "http://localhost:8000"
+    #: Plano INTERNO del ControlNode, no el de cliente. Variable propia y no reutilizar
+    #: DFSHA_CONTROL_URL porque desde la Etapa 3 son endpoints de verdad distintos:
+    #: otro puerto, otro esquema y otra forma de autenticarse (certificado en vez de
+    #: token). Llamarlos igual invitaria a apuntar el DataNode al puerto de cliente y
+    #: descubrirlo con un 404 en la primera subida.
+    control_internal_url: str = "https://localhost:8443"
 
     #: Con que URL se anuncia el DataNode. Tiene que ser la alcanzable POR EL CLIENTE:
     #: el ControlNode se limita a repetirsela, porque los bytes van directos. Una sola
@@ -58,20 +63,28 @@ class DataNodeSettings(BaseSettings):
     #: ofrecerse como destino porque estaba menos cargado.
     order_workers: int = Field(default=2, gt=0)
 
-    internal_secret: str  # sin default: obligatorio
+    # --- mTLS (Etapa 3, Bloque C) ------------------------------------------
+    # Sustituyen a DFSHA_INTERNAL_SECRET. Sin default: un DataNode que hablara con el
+    # plano de control sin autenticarse seria justo el agujero que esto cierra.
+    tls_ca_cert: str
+    tls_cert: str
+    tls_key: str
     log_level: str = "INFO"
     register_retry_seconds: float = Field(default=2.0, gt=0)
     register_max_attempts: int = Field(default=30, gt=0)
 
-    @field_validator("internal_secret")
+    @field_validator("tls_ca_cert", "tls_cert", "tls_key")
     @classmethod
-    def _secreto_con_cuerpo(cls, value: str) -> str:
-        if len(value.strip()) < MIN_SECRET_LENGTH:
+    def _fichero_existe(cls, value: str) -> str:
+        ruta = Path(value.strip())
+        if not value.strip():
+            raise ValueError("es obligatorio; generalos con python scripts/gen_certs.py")
+        if not ruta.is_file():
             raise ValueError(
-                f"debe tener al menos {MIN_SECRET_LENGTH} caracteres; genera uno con "
-                "python -c \"import secrets; print(secrets.token_urlsafe(48))\""
+                f"no existe el fichero '{ruta}'; generalos con "
+                "python scripts/gen_certs.py"
             )
-        return value
+        return str(ruta)
 
     def resolved_capacity_bytes(self) -> int:
         """Capacidad anunciada.
