@@ -88,6 +88,7 @@ class HeartbeatClient:
         changes: BlockChangeLog,
         data_node_id: str = "",
         retry_seconds: float = 2.0,
+        orders=None,
     ) -> None:
         self._grpc_url = grpc_url
         self._advertise_url = advertise_url
@@ -98,6 +99,10 @@ class HeartbeatClient:
         self._block_ids_provider = block_ids_provider
         self._changes = changes
         self._retry_seconds = retry_seconds
+        #: Ejecutor de las ordenes del plano de control (Etapa 3). Opcional: sin el, el
+        #: nodo late igual y simplemente ignora las ordenes, que es lo que hace falta en
+        #: las pruebas que solo miran el heartbeat.
+        self._orders = orders
 
         self.data_node_id = data_node_id
         self.heartbeat_interval_ms = 3000
@@ -251,9 +256,41 @@ class HeartbeatClient:
                     self.send_full_report(reason="cada N latidos")
             elif mensaje.HasField("full_report"):
                 self.send_full_report(reason=mensaje.full_report.reason or "peticion")
+            elif mensaje.HasField("replicate_block"):
+                # Se encola y se sigue. Copiar aqui mismo dejaria de mandar latidos
+                # mientras dura la copia, y el ControlNode daria por muerto justo al
+                # nodo que esta haciendo el trabajo. Ver el docstring de orders.py.
+                self._despachar_orden(mensaje.replicate_block, replicar=True)
+            elif mensaje.HasField("delete_block"):
+                self._despachar_orden(mensaje.delete_block, replicar=False)
 
             if self._parar.is_set():
                 return
+
+    def _despachar_orden(self, orden, replicar: bool) -> None:
+        """Entrega la orden al ejecutor sin bloquear el stream.
+
+        Nunca lanza: una orden que no se puede encolar no puede cortar el heartbeat. El
+        ControlNode la volvera a mandar cuando venza la tarea.
+        """
+        if self._orders is None:
+            self._log.debug(
+                "control.order_ignored",
+                block_id=orden.block_id,
+                detail="este nodo no tiene ejecutor de ordenes",
+            )
+            return
+        try:
+            if replicar:
+                self._orders.submit_replicate(orden)
+            else:
+                self._orders.submit_delete(orden)
+        except Exception as exc:
+            self._log.error(
+                "control.order_dispatch_failed",
+                block_id=orden.block_id,
+                error=type(exc).__name__,
+            )
 
     def _bucle(self) -> None:
         while not self._parar.is_set():

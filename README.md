@@ -1,6 +1,6 @@
 # DFSha — sistema de archivos distribuido por bloques
 
-**Hito 3 (en curso · Bloque A completo)** · SI3007 / ST0263 Sistemas Distribuidos
+**Hito 3 (en curso · Bloques A y B completos)** · SI3007 / ST0263 Sistemas Distribuidos
 
 DFSha parte archivos en bloques de tamaño fijo, los reparte entre DataNodes y guarda todo
 el metadato en un ControlNode. La arquitectura es de tipo HDFS, opción cliente/servidor:
@@ -16,17 +16,23 @@ heartbeats cada 3 s, detección de caídas en segundos, y una política de coloc
 *power of d choices* que reparte los bloques según la carga real de cada nodo y su
 dominio de falla.
 
-El **Hito 3** quita el último punto único de fallo que quedaba: el ControlNode. El
-metadato pasa a **PostgreSQL** (primario y réplica de lectura), el esquema se versiona
-con **Alembic**, y hay **tres ControlNodes** tras un balanceador de los que uno sostiene
-un **lease con época** — un token de aislamiento que impide que un ControlNode congelado
-despierte y siga dando órdenes creyendo que todavía manda. Con el Bloque A cerrado,
-matar al líder se recupera en menos de 6 segundos sin intervención.
+El **Hito 3** quita los dos puntos únicos de fallo que quedaban.
 
-> **Estado.** El Bloque A (PostgreSQL, CQRS con réplica de lectura, elección de líder)
-> está terminado y probado. Los Bloques B (replicación R=3 con quórum y re-replicación)
-> y C (mTLS, cifrado extremo a extremo, ACLs y RF3) están en curso. `R` sigue en **1**
-> hasta el Bloque B.
+El **ControlNode**: el metadato pasa a **PostgreSQL** (primario y réplica de lectura), el
+esquema se versiona con **Alembic**, y hay **tres ControlNodes** tras un balanceador de
+los que uno sostiene un **lease con época** — un token de aislamiento que impide que un
+ControlNode congelado despierte y siga dando órdenes creyendo que todavía manda. Matar al
+líder se recupera en menos de 6 segundos sin intervención.
+
+Y los **datos**: cada bloque pasa a tener **tres copias en tres dominios de falla**,
+subidas *en cadena* para que el cliente mande los bytes una sola vez. El `commit` pasa con
+**dos** copias confirmadas y la tercera se completa después; si un nodo muere, la copia
+que falta se **restaura sola** pasada una espera de gracia. Un archivo sobrevive a perder
+dos de sus tres nodos.
+
+> **Estado.** Los Bloques A (PostgreSQL, CQRS con réplica de lectura, elección de
+> líder) y B (replicación R=3 con pipeline, quórum W=2 y re-replicación) están terminados
+> y probados. El Bloque C (mTLS, cifrado extremo a extremo, ACLs y RF3) está en curso.
 
 ---
 
@@ -251,6 +257,109 @@ flowchart LR
 La línea gruesa es el camino de los datos; la punteada, el plano de control. El
 ControlNode no es un cuello de botella de ancho de banda: cada DataNode que se añade suma
 capacidad de transferencia en lugar de saturar un nodo central.
+
+### Replicación R=3: el cliente sube una vez
+
+Con tres copias, la alternativa ingenua es que el cliente suba el mismo bloque tres veces.
+DFSha lo sube **en cadena**: el cliente manda el bloque a la primera réplica del plan con
+las otras dos en una cabecera, y cada DataNode lo reenvía al siguiente quitándose de la
+lista. Con instancias pequeñas y un enlace doméstico, el ancho de subida del cliente es el
+recurso más escaso, y multiplicarlo por tres es justo lo que no se puede permitir.
+
+Dentro de cada nodo el orden es **verificar, luego escribir y reenviar a la vez**:
+
+- **Verificar antes de reenviar** impide que una corrupción se propague por la cadena. Lo
+  que sale de un nodo ya está comprobado.
+- **Escribir y reenviar en paralelo** evita que la cadena sea la suma de las latencias de
+  disco de tres nodos: el reenvío no espera al `fsync`.
+
+Un fallo aguas abajo **no tumba la subida**. Si el primer nodo escribió bien y el tercero
+falla, el cliente recibe `201` con un `X-DFSha-Replicas-Acked` menor. Fallar la petición
+convertiría W=3 en el mínimo de hecho, que es lo contrario de lo que se decidió.
+
+> **Un interbloqueo que costó encontrar, y que explica una línea del código.** La primera
+> versión hacía la escritura y el reenvío dentro del handler asíncrono, lo que deja el
+> bucle de eventos del nodo parado: mientras escribe, **el nodo deja de aceptar
+> peticiones**. Con dos subidas concurrentes eso es una espera circular — DN1 esperando a
+> DN2 y DN2 esperando a DN1 — y las dos mueren por *timeout*. Por eso todo el trabajo
+> bloqueante sale a un hilo del pool. Las pruebas de integración pasaron de 248 s en
+> timeouts a 50 s.
+
+### Quórum W=2: legible con dos copias, completo con tres
+
+El `commit` pasa con **dos** réplicas confirmadas. El archivo queda legible y la tercera se
+completa en segundo plano.
+
+Un archivo con 2 de 3 copias **no está roto**: todavía tolera perder un nodo. Rechazar su
+commit pondría la durabilidad por encima de la disponibilidad, que es la elección contraria
+a la que hacen estos sistemas. Con **menos de dos**, el commit falla y el cliente reintenta:
+no hay medias tintas.
+
+Quien decide el quórum es el ControlNode, contando filas de `block_replicas` — no la
+cabecera que ve el cliente, que es informativa. Que eso no tenga carreras depende de una
+decisión del Hito 2: el aviso de bloque almacenado es **síncrono y anterior** al `201`, así
+que cuando el cliente puede pedir el commit, el ControlNode ya sabe de esas copias.
+
+Se ve donde importa:
+
+```bash
+dfsha stat /video.mp4
+  ...
+  replicacion    FULLY_REPLICATED (3 de 3 copias por bloque)
+
+dfsha cluster
+  ...
+  12 bloques sub-replicados (menos de 3 copias) · 1 con UNA sola copia — a un fallo de perderse
+```
+
+Los críticos se cuentan aparte de los sub-replicados porque **no cuestan lo mismo**: uno
+con dos copias todavía tolera una caída; uno con una sola está a un fallo de desaparecer.
+
+### Re-replicación: tres frenos
+
+Cuando un nodo muere de verdad, sus copias se rehacen solas. El mecanismo tiene más
+capacidad de hacerse daño a sí mismo que ningún otro del sistema —reacciona a una caída
+moviendo gigabytes, justo cuando el clúster ya va justo—, así que lleva tres frenos:
+
+| Freno | Por defecto | Qué evita |
+|---|---|---|
+| Espera de gracia | 5 min desde `DEAD` | Copiar el disco entero de un nodo por un **reinicio de contenedor**, que tarda segundos. Es el error clásico, y se encadena: la copia satura la red, otro nodo deja de latir a tiempo, y se dispara otra copia |
+| Tope por destino | 2 copias a la vez | Que la recuperación se concentre en el nodo más vacío y lo **tumbe por saturación** — el nodo que se ofreció como destino justo por estar libre |
+| Prioridad | por copias restantes | Que un bloque con **una sola** copia espere detrás de uno con dos. Si el clúster no da abasto, el orden en que se rinde decide si se pierden datos |
+
+**El destino tira, el origen no empuja.** La orden llega a quien tiene que hacer el
+trabajo y puede negarse si no le cabe; el origen solo ve una descarga más, que es lo que ya
+sabe hacer. Las órdenes viajan por el stream de heartbeat, en el `oneof` que el Hito 2
+dejó preparado: un caso más, no un transporte nuevo.
+
+La cola vive en PostgreSQL, no en la memoria del líder — si viviera en memoria se perdería
+justo cuando más falta hace, que es cuando el líder cambia de manos — y **solo el líder la
+programa**, con su época verificada dentro de la transacción. Dos líderes programando a la
+vez no duplicarían un log: duplicarían el tráfico de copia de un clúster que ya se está
+recuperando de algo.
+
+Para verlo en vivo, con la gracia bajada:
+
+```bash
+DFSHA_REREPLICATION_GRACE_MS=30000 docker compose up -d
+dfsha put ./archivo.bin /archivo.bin
+docker kill dfsha-data-node-2
+dfsha stat /archivo.bin     # UNDER_REPLICATED (2 de 3)
+# ... 30 s ...
+dfsha stat /archivo.bin     # FULLY_REPLICATED (3 de 3)
+```
+
+### El GC, ahora por dos vías
+
+`scripts/gc.py` sigue siendo el recolector manual que pide el enunciado. La novedad es
+`--via-control-plane`, que encola los borrados como órdenes que viajan por el heartbeat.
+
+La diferencia no es de eficiencia: por esa vía **no hace falta tener ruta hasta los
+DataNodes**, solo hasta el ControlNode. En AWS es el único caso posible desde fuera de la
+VPC, porque los nodos anuncian su IP privada. A cambio el borrado es asíncrono, así que esa
+vía **no confirma**: las filas del metadato se quitan en una pasada posterior, cuando
+conste que el bloque ya no está en ningún disco. El ControlNode no borra metadato sobre una
+promesa.
 
 ### Elección de líder: la época es un token de aislamiento
 
@@ -680,7 +789,13 @@ Todo por variables de entorno; `.env.example` las lista todas.
 | `DFSHA_MEMBERSHIP_INTERVAL_MS` | `1000` | Cada cuánto se evalúan las transiciones de estado |
 | `DFSHA_LEASE_TTL_MS` | `6000` | Vida del lease de líder sin renovar |
 | `DFSHA_LEASE_RENEW_MS` | `2000` | Cada cuánto renueva el líder. Debe ser menor que el TTL o el servicio no arranca |
-| `DFSHA_REPLICATION_FACTOR` | `1` | R=1 en esta etapa; la replicación efectiva llega en la Etapa 3 |
+| `DFSHA_WRITE_QUORUM` | `2` | Réplicas confirmadas que exige el `commit`. No puede ser mayor que R o el servicio no arranca |
+| `DFSHA_REREPLICATION_GRACE_MS` | `300000` | Espera desde que un nodo entra en `DEAD` antes de copiar sus bloques |
+| `DFSHA_REREPLICATION_MAX_PER_NODE` | `2` | Copias simultáneas hacia el mismo destino |
+| `DFSHA_REREPLICATION_MAX_PER_PASS` | `8` | Copias despachadas por pasada del planificador |
+| `DFSHA_REREPLICATION_INTERVAL_MS` | `5000` | Cada cuánto corre el planificador |
+| `DFSHA_ORDER_WORKERS` | `2` | Copias simultáneas que un DataNode acepta ejecutar |
+| `DFSHA_REPLICATION_FACTOR` | `3` | Copias por bloque |
 | `DFSHA_PLACEMENT_D` | `3` | Tamaño de la ventana del *power of d choices* |
 | `DFSHA_MIN_FREE_BYTES` | `134217728` | Margen de disco que un nodo debe conservar para ser candidato |
 | `DFSHA_WRITE_TTL_SECONDS` | `600` | Vencimiento de las reservas de escritura |
@@ -726,7 +841,7 @@ distintos.
 ```bash
 pip install -e ".[dev]"
 python scripts/gen_proto.py    # genera el codigo del .proto (no se versiona)
-pytest -q                      # toda la suite: 319 pruebas
+pytest -q                      # toda la suite
 pytest tests/unit -q           # rápido, sin red
 pytest tests/integration -q    # levanta ControlNode y DataNode reales en puertos reales
 
@@ -751,9 +866,22 @@ nodo con menos capacidad recibiendo una fracción menor, el ciclo completo de ca
 reincorporación), y un `.blk` borrado a mano que acaba en `MISSING` sin que el ControlNode
 borre nada.
 
-Y los del Hito 3, Bloque A: que la migración de Alembic y `models.py` describen
+Y los del Hito 3. **Bloque A**: que la migración de Alembic y `models.py` describen
 **exactamente** el mismo esquema (`compare_metadata` con cero diferencias), el enrutado de
 consultas con sus cuatro caminos de fallo, y el lease de líder.
+
+**Bloque B**, con cuatro DataNodes reales: cada bloque en tres nodos y tres dominios; el
+cliente hablando con **un** nodo por bloque mientras los otros dos reciben su copia de la
+cadena; un nodo caído durante la subida que no impide el `commit` y deja el archivo
+`UNDER_REPLICATED`; el archivo legible con **dos de tres nodos caídos** y el SHA-256
+intacto; y el ciclo completo de recuperación —matar un nodo, espera de gracia,
+re-replicación, vuelta a `FULLY_REPLICATED`— comprobando además que el archivo se sigue
+bajando bien desde la copia nueva.
+
+Y la otra mitad, que es la que no se ve si solo se prueba el camino feliz:
+`test_un_reinicio_rapido_NO_dispara_una_copia`. Un nodo que se reinicia y vuelve enseguida
+no debe costar ni una copia; sin ese freno, cada despliegue rodante movería el disco
+entero.
 
 Los umbrales van comprimidos en las pruebas (1,5 s y 3 s) para que la suite no tarde
 minutos; la aritmética de los valores reales está cubierta por las unitarias de

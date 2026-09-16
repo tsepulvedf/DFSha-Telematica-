@@ -15,12 +15,33 @@ from dfsha.control_node.api.errors import install_error_handlers
 from dfsha.data_node.config import DataNodeSettings, load_settings_or_exit
 from dfsha.data_node.control_client import ControlClient, Identity, NodeIdentity
 from dfsha.data_node.heartbeat import BlockChangeLog, HeartbeatClient
+from dfsha.data_node.orders import OrderExecutor
 from dfsha.data_node.runtime import LoadTracker
 from dfsha.data_node.storage import BlockStorage
 
 from .api.routers import blocks_router, health_router
 
 __all__ = ["create_app"]
+
+
+class _EstadoDiferido:
+    """Referencia al `app.state` que todavia no existe cuando se construye el ejecutor.
+
+    El `data_node_id` definitivo lo devuelve el ControlNode al registrarse, dentro del
+    lifespan, asi que el ejecutor de ordenes no puede quedarse con una copia de los
+    valores: tiene que leerlos cuando los use. Esto es esa indireccion, y nada mas.
+    """
+
+    def __init__(self) -> None:
+        self._state = None
+
+    def bind(self, state) -> None:
+        self._state = state
+
+    def __getattr__(self, nombre: str):
+        if self._state is None:
+            raise RuntimeError("el estado del DataNode todavia no esta construido")
+        return getattr(self._state, nombre)
 
 
 def create_app(
@@ -57,6 +78,12 @@ def create_app(
             bytes_written_60s=load.bytes_written_60s(),
         )
 
+    # El ejecutor se construye antes que el heartbeat porque este lo necesita, pero
+    # recibe `app.state` y no las piezas sueltas: el `data_node_id` definitivo no se
+    # conoce hasta despues del registro, que ocurre en el lifespan.
+    app_state_holder = _EstadoDiferido()
+    orders = OrderExecutor(app_state_holder, max_workers=settings.order_workers)
+
     heartbeat = HeartbeatClient(
         grpc_url=settings.control_grpc_url,
         advertise_url=settings.datanode_advertise_url,
@@ -68,6 +95,7 @@ def create_app(
         changes=changes,
         data_node_id=identity.data_node_id,
         retry_seconds=settings.register_retry_seconds,
+        orders=orders,
     )
 
     @asynccontextmanager
@@ -111,6 +139,7 @@ def create_app(
         yield
 
         heartbeat.stop()
+        orders.shutdown()
         log.info("data_node.stop", data_node_id=app.state.data_node_id)
 
     app = FastAPI(
@@ -120,7 +149,10 @@ def create_app(
         lifespan=lifespan,
     )
 
+    app_state_holder.bind(app.state)
+
     app.state.settings = settings
+    app.state.orders = orders
     app.state.storage = storage
     app.state.control = control
     app.state.capacity_bytes = capacity

@@ -43,7 +43,10 @@ Reglas transversales que se derivan de lo anterior:
   consulta o se pisa el nombre; nunca un barrido en background.
 - La Etapa 1 no tenía ninguna tarea en background. La Etapa 2 introduce dos, y solo dos:
   el bucle de heartbeat del DataNode y el evaluador de pertenencia del ControlNode.
-  Ninguna puede tumbar su proceso: las dos capturan, registran y siguen.
+  La Etapa 3 añade dos más, cada una con su justificación escrita: el **renovador del
+  lease de liderazgo** (Bloque A) y el **planificador de re-replicación** (Bloque B).
+  **Ninguna de las cuatro puede tumbar su proceso**: todas capturan `Exception`,
+  registran y siguen. Esa regla no se negocia al añadir la siguiente.
 
 ---
 
@@ -93,7 +96,9 @@ Diseñar contra esta hoja de ruta, no adelantarla.
 
 - Replicación efectiva. `DFSHA_REPLICATION_FACTOR` sigue en **1**: la política soporta
   R>1 y está probada para ello, pero el default no cambia hasta la Etapa 3.
+  **Hecho en la Etapa 3, Bloque B**: R=3, W=2.
 - Pipeline de escritura entre DataNodes, quórum W, re-replicación automática.
+  **Hecho en la Etapa 3, Bloque B.**
 - Alta disponibilidad del ControlNode, edit log, failover, réplicas de lectura.
 - mTLS, cifrado en reposo, 2FA, ACLs por grupo.
 - RF3 (`open`/`read`/`write`/`lock`), leases, lecturas por rango.
@@ -273,6 +278,127 @@ instancias son 1,5 lineas por segundo para siempre, y ahogarian los eventos que 
 cuentan algo. `leadership.acquired`, `leadership.lost` y `leadership.epoch_rejected`, que
 son los sucesos de verdad, van a INFO y WARNING.
 
+### Decisiones de la Etapa 3 — Bloque B
+
+1. **El pipeline necesita un buffer, y no es una chapuza.** El enunciado pide verificar
+   el checksum **antes** de reenviar y reenviar **mientras** se escribe. Un SHA-256 no se
+   puede verificar sin ver el ultimo byte, asi que reenviar en streaming puro y verificar
+   antes de reenviar son incompatibles. La lectura que satisface las dos: recibir entero,
+   verificar, y **escribir a disco y reenviar en paralelo**. El reenvio no espera al
+   `fsync`, y lo que sale del nodo ya esta comprobado, asi que una corrupcion no se
+   propaga por la cadena. El coste es un bloque en memoria por subida concurrente, que ya
+   era el comportamiento del DataNode desde la Etapa 1.
+
+2. **Todo lo bloqueante sale del bucle de eventos. Esto costo un interbloqueo.** La
+   primera version hacia la escritura y el reenvio dentro del `async def`, lo que deja el
+   bucle de eventos del nodo parado: **mientras escribe o espera, el nodo deja de aceptar
+   peticiones**. Con dos subidas concurrentes eso es una espera circular:
+
+       bloque A: cliente -> DN1 -> DN2 -> DN3
+       bloque B: cliente -> DN2 -> DN1 -> DN4
+
+   DN1 espera a DN2, DN2 espera a DN1, y ninguno puede atender al otro. Las dos subidas
+   mueren por timeout. Se reprodujo en las pruebas de integracion, que pasaron de 248 s en
+   timeouts a 50 s. El trabajo bloqueante va ahora a un hilo del pool
+   (`run_in_threadpool`), y el porque esta escrito en el docstring del handler.
+
+3. **Un fallo aguas abajo no tumba la subida.** Si el nodo escribio bien pero el
+   siguiente falla, responde 201 con un `acked` menor. Fallar la peticion convertiria W=3
+   en el minimo de hecho, que es lo contrario de la decision de quorum. El hueco lo recoge
+   la cola de re-replicacion.
+
+4. **El quorum se decide en el `commit` y solo ahi.** El `X-DFSha-Replicas-Acked` que ve
+   el cliente es informativo; la cuenta buena es la de `block_replicas`, que cada DataNode
+   actualiza por su cuenta. Que no haya carreras depende de una decision de la Etapa 2: el
+   aviso `/internal/v1/blocks/{id}/stored` es **sincrono y anterior al 201**, asi que
+   cuando el cliente puede pedir el commit, el ControlNode ya sabe de esas copias.
+
+5. **W < R deja el archivo sub-replicado, no roto.** Con 2 de 3 todavia tolera perder un
+   nodo. Rechazar el commit pondria la durabilidad por encima de la disponibilidad, que es
+   la eleccion contraria a la que hacen estos sistemas. Con menos de W el commit falla y el
+   cliente reintenta: no hay medias tintas.
+
+6. **Leer prueba las replicas por orden.** Sin relevo en la lectura, tener tres copias no
+   servia para leer: perder el primer nodo del plan hacia fallar el `get` aunque los otros
+   dos tuvieran los bytes. Una replica que devuelve bytes **corruptos** tambien se descarta
+   y se pasa a la siguiente, que es exactamente el caso para el que existe tener mas de una
+   copia.
+
+7. **`DFSHA_REPLICATION_FACTOR=1` en las pruebas de las etapas anteriores, fijado a
+   mano.** No es un parche: esas pruebas describen el comportamiento con una replica por
+   bloque, y heredar R=3 no las haria mejores, las haria medir otra cosa. Quien necesita
+   tres nodos, los levanta.
+
+### Re-replicacion: tres frenos y una regla que costo un 404
+
+La dispara el hueco entre las copias que un bloque deberia tener y las que tiene. **Solo
+la programa el lider, con epoca verificada dentro de la transaccion**, por la misma razon
+del Bloque A agravada: dos lideres programando a la vez no duplicarian un evento de log,
+duplicarian el trafico de copia de un cluster que ya se esta recuperando de una caida.
+
+**Los tres frenos**, y ninguno es opcional:
+
+1. **Espera de gracia** (`DFSHA_REREPLICATION_GRACE_MS`, 5 min; 30 s para el video). No se
+   programa nada hasta que el nodo lleva ese tiempo muerto. Reiniciar un contenedor tarda
+   segundos, y copiar su disco entero por un reinicio no solo es caro: se **encadena**, la
+   copia satura la red, otro nodo deja de latir a tiempo, y se dispara otra copia. Se mide
+   desde el ultimo latido: como un nodo pasa a DEAD en `dead_after`, exigir
+   `dead_after + gracia` de silencio es exactamente "gracia desde que entro en DEAD".
+2. **Tope por destino** (`DFSHA_REREPLICATION_MAX_PER_NODE`, 2). Sin el, la recuperacion
+   se concentra en el nodo mas vacio y lo tumba por saturacion — el nodo que precisamente
+   se ofrecio como destino por estar libre.
+3. **Prioridad por copias restantes.** Un bloque con **una sola** copia va antes que uno
+   con dos. No es una optimizacion: uno esta a un fallo de desaparecer y el otro todavia
+   tolera una caida. Si el cluster no da abasto, el orden en que se rinde decide si se
+   pierden datos. El desempate es por `block_id` y no por antiguedad, para que dos
+   ControlNodes que miren el mismo estado decidan lo mismo.
+
+**El destino tira, el origen no empuja.** La orden le llega a quien tiene que hacer el
+trabajo y puede negarse si no le cabe; el origen solo ve una descarga mas, que es lo que
+ya sabe hacer, y no se le carga de escrituras mientras quiza sirve lecturas. Ademas no hay
+endpoint nuevo: se reutiliza `GET /blocks/{id}`.
+
+**La regla que costo un 404, y que conviene no volver a aprender.** Al despachar una copia
+hay que **crear la fila PENDING en `block_replicas` para el nodo destino**. Es la decision
+3 de la seccion 1 aplicada tambien aqui: el ControlNode elige el destino y **registra la
+eleccion**. La primera version no lo hacia, y el sintoma fue este: el nodo destino copiaba
+el bloque correctamente, avisaba con `/blocks/{id}/stored`, y recibia
+`404 bloque desconocido en el metadato`, porque `mark_stored` solo sabe actualizar una fila
+que ya existe. Resultado: la copia quedaba en su disco como **huerfana**, la tarea no se
+cerraba nunca, y el bloque aparecia en los logs como `divergence.unknown_block` cada seis
+segundos. Todo el mecanismo funcionaba salvo el registro de la decision.
+
+**Las ordenes viajan por el `oneof` de `ControlMessage`** (`ReplicateBlock`,
+`DeleteBlock`), que es la costura que la Etapa 2 dejo hecha al declarar el stream
+bidireccional: un caso mas, no un transporte nuevo. Y se leen de la **base**, no de la
+memoria: el stream de un nodo lo puede estar atendiendo una instancia que no es la lider.
+
+**Entregar una orden NO exige liderazgo; decidirla si.** Negarse a entregar una orden ya
+tomada porque la atiende otra instancia dejaria la copia esperando a que el lease cambiara
+de manos. Lo mismo con cerrar una tarea cumplida: no es una decision, es registrar un
+hecho que ya ocurrio.
+
+**El DataNode ejecuta las ordenes fuera del hilo del heartbeat.** Copiar 64 MB tarda;
+hacerlo en el hilo del stream dejaria de mandar latidos mientras dura, el ControlNode
+daria por muerto justo al nodo que esta haciendo el trabajo, y la respuesta a eso seria
+programar todavia mas copias.
+
+**La tercera y ultima tarea en background.** La Etapa 2 fijo que solo hubiera dos y que
+anadir una se justificara. Esta se justifica porque un hueco de replicacion no lo provoca
+ninguna peticion: lo provoca que algo **deje** de pasar, y nadie va a preguntar por el. Va
+aparte del evaluador de pertenencia porque sus cadencias son muy distintas (1 s frente a
+5 s con una gracia de 5 minutos) y porque un fallo escaneando la replicacion no debe
+impedir que se siga detectando que un nodo se cayo.
+
+**El GC tiene ahora dos vias.** El script de `scripts/gc.py` sigue siendo el que pide el
+enunciado; `--via-control-plane` encola los borrados como `DeleteBlock` y viajan por el
+heartbeat. La diferencia no es de eficiencia: por esa via **no hace falta tener ruta hasta
+los DataNodes**, solo hasta el ControlNode, que en AWS es el unico caso posible desde
+fuera de la VPC porque los nodos anuncian su IP privada. A cambio el borrado es asincrono,
+y por eso esa via **no confirma**: las filas del metadato se quitan en una pasada
+posterior, cuando conste que el bloque ya no esta en ningun disco. El ControlNode no borra
+metadato sobre una promesa.
+
 ### Enrutado CQRS: que consulta va a donde
 
 La separacion `commands/` / `queries/` existe desde la Etapa 1. Aqui se cobra.
@@ -343,8 +469,23 @@ blocks(block_id UUID PK, file_id, index, size, checksum_sha256)
     UNIQUE(file_id, index)
 
 block_replicas(block_id, data_node_id, state, created_at)
-    state in {PENDING, STORED}
+    state in {PENDING, STORED, MISSING}
     PK(block_id, data_node_id)
+    la re-replicacion TAMBIEN inserta filas aqui al despachar una copia: el
+    ControlNode elige el destino y registra la eleccion (ver Bloque B)
+
+leadership(id=1, leader_id NULL, epoch, acquired_at, renewed_at, expires_at)
+    una sola fila, sembrada por la migracion 0002
+    epoch solo sube; es el token de aislamiento del Bloque A
+
+rereplication_tasks(id, block_id, kind, state, source_node_id, target_node_id,
+                    replicas_at_schedule, created_at, dispatched_at, sent_at,
+                    expires_at, attempts, last_error)
+    kind in {REPLICATE, DELETE}
+    state in {PENDING, IN_FLIGHT, DONE, FAILED}
+    UNIQUE(block_id) solo sobre filas PENDING o IN_FLIGHT: una tarea viva por
+    bloque, que es lo que impide programar la misma copia dos veces cuando dos
+    lideres se solapan durante un relevo
 
 data_nodes(id, base_url, capacity_bytes, used_bytes, state, registered_at)
     state in {ALIVE, DEAD}
@@ -611,6 +752,18 @@ Etapa 3 (Bloque A):
 - `leadership.renewed` — **a nivel DEBUG**; ver la nota de la seccion de liderazgo
 - `leadership.epoch_rejected` — `epoch`, `current_epoch`, `expired`. El lider congelado
 - `query.routed_to_primary` — `reason`, `client_lsn`, `replica_lsn`
+
+Etapa 3 (Bloque B):
+
+- `replication.pipeline` — `block_id`, `nodes`, `acked`, `duration_ms`, `ok`
+- `replication.partial` — la cadena no confirmo todas las replicas planificadas
+- `replication.quorum_met` / `replication.quorum_failed` — `quorum`, `min_replicas`,
+  `under_replicated_blocks`
+- `rereplication.scheduled` — `block_id`, `current_replicas`, `critical`, `epoch`
+- `rereplication.dispatched` — `source`, `target`, `critical`
+- `rereplication.completed` / `rereplication.failed`
+- `rereplication.expired` — `requeued`, `gave_up`
+- `block.replica_failed` — una replica no sirvio la lectura; se prueba la siguiente
 
 ---
 

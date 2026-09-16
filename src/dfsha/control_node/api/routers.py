@@ -19,6 +19,7 @@ from dfsha.common.dto import (
     CreateFileRequest,
     CreateFileResponse,
     GcConfirmRequest,
+    GcDispatchResponse,
     LeadershipResponse,
     LoginRequest,
     LsEntry,
@@ -332,6 +333,31 @@ def orphan_blocks(uow: Uow) -> OrphanBlocksResponse:
             )
             for b in gc_queries.orphan_blocks(uow)
         ]
+    )
+
+
+@internal_router.post("/gc/dispatch")
+def gc_dispatch(uow: Uow, settings: Settings) -> GcDispatchResponse:
+    """Encola el borrado de los huerfanos por el **canal de control**.
+
+    Es el GC por el camino que ya esta abierto: las ordenes viajan en el stream de
+    heartbeat, asi que el recolector no necesita alcanzar a cada DataNode por REST desde
+    fuera. En AWS eso importa, porque los DataNodes anuncian su IP privada.
+
+    El script de `scripts/gc.py` sigue existiendo y sigue siendo el que pide el
+    enunciado; esto es una segunda via, no un reemplazo. Y la diferencia practica es
+    real: por el canal de control no hace falta que quien recolecta tenga ruta hasta los
+    DataNodes, solo hasta el ControlNode.
+
+    **No borra el metadato.** Encola el borrado en disco y ya esta; las filas se quitan
+    con `/gc/confirm` cuando conste que el bloque no esta en ningun disco, igual que
+    siempre. El ControlNode nunca borra datos por su cuenta.
+    """
+    resultado = internal_commands.dispatch_gc_deletions(
+        uow, ttl_seconds=settings.write_ttl_seconds
+    )
+    return GcDispatchResponse(
+        blocks=resultado.blocks, orders=resultado.orders, skipped=resultado.skipped
     )
 
 

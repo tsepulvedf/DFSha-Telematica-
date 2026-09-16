@@ -31,6 +31,7 @@ __all__ = [
     "DataNodeRow",
     "LeadershipRow",
     "LEADERSHIP_ROW_ID",
+    "RereplicationTaskRow",
 ]
 
 ID_LEN = 36
@@ -266,3 +267,61 @@ class LeadershipRow(Base):
     acquired_at: Mapped[datetime | None] = mapped_column(UtcDateTime, nullable=True)
     renewed_at: Mapped[datetime | None] = mapped_column(UtcDateTime, nullable=True)
     expires_at: Mapped[datetime | None] = mapped_column(UtcDateTime, nullable=True)
+
+
+class RereplicationTaskRow(Base):
+    """Una copia pendiente de hacer.
+
+    La cola vive en la base y no en la memoria del lider, y eso no es casualidad: si
+    viviera en memoria se perderia justo cuando mas falta hace, que es cuando el lider
+    cambia de manos. Ademas el stream de heartbeat del nodo destino lo puede estar
+    atendiendo OTRA instancia, que tiene que poder leer la orden para empujarsela.
+    """
+
+    __tablename__ = "rereplication_tasks"
+
+    id: Mapped[str] = mapped_column(String(ID_LEN), primary_key=True)
+    block_id: Mapped[str] = mapped_column(
+        String(ID_LEN), ForeignKey("blocks.block_id", ondelete="CASCADE"), nullable=False
+    )
+    #: REPLICATE (copiar de un nodo a otro) o DELETE (borrar un huerfano).
+    #:
+    #: Las dos ordenes comparten tabla porque comparten TODO lo que las hace no
+    #: triviales: van por el mismo stream, tienen que sobrevivir a un cambio de lider,
+    #: no se pueden reenviar en cada latido, y hay que saber si el nodo las cumplio.
+    #: Dos tablas serian dos copias del mismo mecanismo.
+    kind: Mapped[str] = mapped_column(String(16), nullable=False, default="REPLICATE")
+    #: PENDING -> IN_FLIGHT -> DONE | FAILED
+    state: Mapped[str] = mapped_column(String(16), nullable=False)
+    #: De donde tirar los bytes. Se decide al despachar, no al detectar el hueco: entre
+    #: una cosa y otra el origen elegido puede haberse caido.
+    source_node_id: Mapped[str | None] = mapped_column(String(ID_LEN), nullable=True)
+    target_node_id: Mapped[str | None] = mapped_column(String(ID_LEN), nullable=True)
+    #: Copias que tenia el bloque cuando se detecto el hueco. Es la clave de prioridad.
+    replicas_at_schedule: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+
+    created_at: Mapped[datetime] = mapped_column(UtcDateTime, nullable=False)
+    dispatched_at: Mapped[datetime | None] = mapped_column(UtcDateTime, nullable=True)
+    #: Ultima vez que la orden se empujo por el stream. Sin esto se reenviaria en cada
+    #: latido, tres veces por segundo y por nodo.
+    sent_at: Mapped[datetime | None] = mapped_column(UtcDateTime, nullable=True)
+    #: Si el destino no confirma antes de esto, la tarea vuelve a PENDING. Es el mismo
+    #: mecanismo de expiracion que las reservas de escritura de la Etapa 1 y el lease de
+    #: liderazgo: un cliente (aqui, un DataNode) que se cae no bloquea el recurso.
+    expires_at: Mapped[datetime | None] = mapped_column(UtcDateTime, nullable=True)
+    attempts: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    last_error: Mapped[str | None] = mapped_column(String(255), nullable=True)
+
+    __table_args__ = (
+        # Una sola tarea VIVA por bloque. Sin esto, dos pasadas del planificador (o dos
+        # lideres solapados durante un relevo) programarian la misma copia dos veces.
+        Index(
+            "uq_rereplication_block_activa",
+            "block_id",
+            unique=True,
+            sqlite_where=text("state IN ('PENDING', 'IN_FLIGHT')"),
+            postgresql_where=text("state IN ('PENDING', 'IN_FLIGHT')"),
+        ),
+        Index("ix_rereplication_state", "state"),
+        Index("ix_rereplication_target", "target_node_id", "state"),
+    )

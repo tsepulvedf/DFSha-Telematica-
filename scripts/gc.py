@@ -158,6 +158,53 @@ def recolectar(
     return resumen
 
 
+def _por_el_canal_de_control(
+    control_url: str, internal_secret: str, dry_run: bool, timeout: float = 30.0
+) -> int:
+    """Encola los borrados en el ControlNode y deja que viajen por el heartbeat.
+
+    La diferencia con el camino normal no es de eficiencia: es que por aqui **no hace
+    falta tener ruta hasta los DataNodes**, solo hasta el ControlNode. En AWS los nodos
+    anuncian su IP privada, asi que recolectar desde fuera de la VPC solo es posible por
+    esta via.
+
+    A cambio, el borrado es asincrono: se encola y se cumple cuando cada nodo recibe su
+    orden en el siguiente latido. Por eso aqui NO se llama a `/gc/confirm`: las filas del
+    metadato se quitan en una pasada posterior, cuando conste que el bloque ya no esta en
+    ningun disco. El ControlNode no borra metadato sobre una promesa.
+    """
+    cabeceras = {INTERNAL_SECRET_HEADER: internal_secret}
+    control = control_url.rstrip("/")
+
+    if dry_run:
+        respuesta = httpx.get(
+            f"{control}/internal/v1/gc/orphan-blocks", headers=cabeceras, timeout=timeout
+        )
+        respuesta.raise_for_status()
+        huerfanos = respuesta.json()["blocks"]
+        print(f"[simulacion] encolaria el borrado de {len(huerfanos)} bloques huerfanos")
+        for bloque in huerfanos:
+            destinos = ", ".join(r["data_node_id"][:8] for r in bloque["replicas"])
+            print(f"  [simulacion] {bloque['block_id']} -> {destinos}")
+        return 0
+
+    respuesta = httpx.post(
+        f"{control}/internal/v1/gc/dispatch", headers=cabeceras, timeout=timeout
+    )
+    respuesta.raise_for_status()
+    datos = respuesta.json()
+
+    print(
+        f"encoladas {datos['orders']} ordenes de borrado para {datos['blocks']} bloques "
+        f"huerfanos ({datos['skipped']} ya tenian una orden en curso)."
+    )
+    print(
+        "Las ordenes viajan en el proximo latido de cada DataNode. Vuelve a correr el "
+        "GC sin --via-control-plane mas tarde para confirmar y limpiar el metadato."
+    )
+    return 0
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     parser.add_argument(
@@ -178,6 +225,15 @@ def main(argv: list[str] | None = None) -> int:
         action="store_true",
         help="Muestra que se borraria sin tocar nada.",
     )
+    parser.add_argument(
+        "--via-control-plane",
+        action="store_true",
+        help=(
+            "Encola los borrados por el canal de control en vez de llamar a cada "
+            "DataNode por REST. Util cuando quien recolecta no tiene ruta hasta los "
+            "DataNodes, que es el caso en AWS: ahi anuncian su IP privada."
+        ),
+    )
     args = parser.parse_args(argv)
 
     if not args.internal_secret:
@@ -191,6 +247,11 @@ def main(argv: list[str] | None = None) -> int:
             file=sys.stderr,
         )
         return 2
+
+    if args.via_control_plane:
+        return _por_el_canal_de_control(
+            args.control_url, args.internal_secret, args.dry_run
+        )
 
     try:
         resumen = recolectar(args.control_url, args.internal_secret, args.dry_run)

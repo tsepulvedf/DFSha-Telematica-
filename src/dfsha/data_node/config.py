@@ -39,6 +39,11 @@ class DataNodeSettings(BaseSettings):
     #: Vacio = se deduce del espacio libre del disco al arrancar.
     datanode_capacity_bytes: int | None = None
 
+    #: Copias simultaneas que este nodo acepta ejecutar. Acotado a proposito: sin tope,
+    #: veinte ordenes a la vez saturarian el disco del nodo que precisamente acaba de
+    #: ofrecerse como destino porque estaba menos cargado.
+    order_workers: int = Field(default=2, gt=0)
+
     internal_secret: str  # sin default: obligatorio
     log_level: str = "INFO"
     register_retry_seconds: float = Field(default=2.0, gt=0)

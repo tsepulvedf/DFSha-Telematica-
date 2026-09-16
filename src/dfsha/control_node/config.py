@@ -83,6 +83,23 @@ class ControlNodeSettings(BaseSettings):
     #: Margen de seguridad: un nodo necesita block_size + esto para ser candidato.
     min_free_bytes: int = Field(default=128 * 1024 * 1024, ge=0)
 
+    # --- Re-replicacion (Etapa 3) ------------------------------------------
+    #: Cuanto se espera desde que un nodo entra en DEAD antes de copiar sus bloques.
+    #: Reiniciar un contenedor tarda segundos; copiar su disco entero por un reinicio es
+    #: el error clasico, y ademas se encadena: la copia satura la red, otro nodo deja de
+    #: latir a tiempo, y se dispara otra copia. Para el video se baja a 30 s.
+    rereplication_grace_ms: int = Field(default=300_000, ge=0)
+    #: Copias simultaneas como maximo hacia el mismo DataNode destino. Sin tope, la
+    #: recuperacion se concentra en el nodo mas vacio y lo tumba por saturacion.
+    rereplication_max_per_node: int = Field(default=2, gt=0)
+    #: Cada cuanto corre el planificador. Mucho mas lento que el evaluador de pertenencia
+    #: a proposito: con una gracia de 5 minutos, escanear cada segundo seria recorrer el
+    #: metadato 300 veces para no hacer nada.
+    rereplication_interval_ms: int = Field(default=5_000, gt=0)
+    #: Copias despachadas como maximo en una pasada, para que el cluster respire entre
+    #: tandas en vez de vaciar la cola de golpe.
+    rereplication_max_per_pass: int = Field(default=8, gt=0)
+
     @model_validator(mode="after")
     def _quorum_alcanzable(self) -> "ControlNodeSettings":
         if self.write_quorum > self.replication_factor:

@@ -62,14 +62,48 @@ message HeartbeatRequest {
 
 message ControlMessage {
   oneof payload {
-    Ack           ack            = 1;
-    FullReportReq full_report    = 2;
-    // Etapa 3: ReplicateBlock, DeleteBlock
+    Ack            ack             = 1;
+    FullReportReq  full_report     = 2;
+    // Etapa 3. Entran como un caso mas del oneof, no como un transporte nuevo: es
+    // exactamente la costura que la Etapa 2 dejo preparada al hacer el stream
+    // bidireccional.
+    ReplicateBlock replicate_block = 3;
+    DeleteBlock    delete_block    = 4;
   }
 }
 
 message Ack           { uint64 acked_sequence = 1; }
 message FullReportReq { string reason = 1; }
+
+// Orden de re-replicacion: "traete este bloque de aquel nodo".
+//
+// El DESTINO tira del bloque, no el origen empuja. Dos motivos: el destino es quien
+// conoce su propio disco y puede rechazar si no le cabe, y asi la orden se le manda a
+// quien tiene que hacer trabajo, que es el que puede decir que no. Ademas el origen
+// puede estar sirviendo lecturas y no conviene darle mas trabajo de escritura.
+//
+// La confirmacion NO viaja por aqui: el destino escribe el bloque y lo anuncia en su
+// siguiente block report, que es el mismo camino por el que se entera el ControlNode de
+// cualquier otro bloque. Un camino menos que mantener.
+message ReplicateBlock {
+  string task_id         = 1;  // para poder correlacionar en los logs
+  string block_id        = 2;
+  string source_base_url = 3;  // de donde tirar los bytes
+  string source_node_id  = 4;
+  uint64 size            = 5;
+  string checksum_sha256 = 6;  // se verifica antes de escribir, como en el pipeline
+}
+
+// Borrado de un bloque huerfano por el canal de control.
+//
+// El GC manual por script sigue existiendo y es el que pide el enunciado; esto es el
+// mismo borrado por el camino que ya esta abierto, sin tener que alcanzar al DataNode
+// por REST desde fuera.
+message DeleteBlock {
+  string task_id  = 1;
+  string block_id = 2;
+  string reason   = 3;
+}
 
 message BlockReportRequest {
   string   data_node_id = 1;

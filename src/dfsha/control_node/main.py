@@ -10,6 +10,7 @@ terminaria el proceso, incluido el de pytest al recolectar las pruebas.
 from __future__ import annotations
 
 from contextlib import asynccontextmanager
+from datetime import timedelta
 
 from fastapi import FastAPI, Request
 
@@ -23,7 +24,9 @@ from dfsha.control_node.repositories.database import (
 from dfsha.control_node.domain.leadership import LeaseTimings
 from dfsha.control_node.domain.membership import MembershipThresholds
 from dfsha.control_node.repositories.sql import SqlUnitOfWork
+from dfsha.control_node.commands.rereplication import RereplicationPolicy
 from dfsha.control_node.services.leadership import LeadershipService
+from dfsha.control_node.services.rereplication_scheduler import RereplicationScheduler
 from dfsha.control_node.services.membership_monitor import MembershipMonitor
 from dfsha.control_node.services.read_routing import (
     WRITE_LSN_HEADER,
@@ -76,6 +79,12 @@ def create_app(settings: ControlNodeSettings | None = None) -> FastAPI:
     lease_timings = LeaseTimings.from_millis(
         settings.lease_ttl_ms, settings.lease_renew_ms
     )
+    rereplication_policy = RereplicationPolicy(
+        replication_factor=settings.replication_factor,
+        grace=timedelta(milliseconds=settings.rereplication_grace_ms),
+        max_per_node=settings.rereplication_max_per_node,
+        max_per_pass=settings.rereplication_max_per_pass,
+    )
 
     @asynccontextmanager
     async def lifespan(app: FastAPI):
@@ -110,8 +119,22 @@ def create_app(settings: ControlNodeSettings | None = None) -> FastAPI:
         )
         monitor.start()
 
+        # La tercera y ultima tarea en background. Va aparte del evaluador de
+        # pertenencia porque sus cadencias son muy distintas (1 s frente a 5 s con una
+        # gracia de 5 minutos) y porque un fallo escaneando la replicacion no debe
+        # impedir que se siga detectando que un nodo se cayo.
+        replicador = RereplicationScheduler(
+            uow_factory=app.state.uow_factory,
+            policy=rereplication_policy,
+            thresholds=thresholds,
+            interval_seconds=settings.rereplication_interval_ms / 1000,
+            fencing_provider=liderazgo.current_fencing,
+        )
+        replicador.start()
+
         app.state.grpc_server = grpc_server
         app.state.membership_monitor = monitor
+        app.state.rereplication = replicador
 
         log.info(
             "control_node.start",
@@ -126,11 +149,14 @@ def create_app(settings: ControlNodeSettings | None = None) -> FastAPI:
             replication_factor=settings.replication_factor,
             instance_id=liderazgo.instance_id,
             lease_ttl_ms=settings.lease_ttl_ms,
+            write_quorum=settings.write_quorum,
+            rereplication_grace_ms=settings.rereplication_grace_ms,
         )
         yield
 
         # El evaluador para primero: si parara despues, podria arrancar una pasada con
         # una epoca que esta instancia acaba de soltar.
+        replicador.stop()
         monitor.stop()
         liderazgo.stop()
         # `grace` da margen a los streams de heartbeat abiertos para cerrarse solos en

@@ -41,6 +41,7 @@ __all__ = [
     "HealthResponse",
     "DataNodeStatus",
     "ClusterStatusResponse",
+    "GcDispatchResponse",
     "LeadershipResponse",
     "ErrorResponse",
 ]
@@ -274,6 +275,17 @@ class ClusterStatusResponse(_Dto):
     #: De esos, los que se quedaron con UNA sola copia. Van primero en la cola de
     #: re-replicacion y son los unicos que estan a un fallo de perderse.
     critical_blocks: int = 0
+
+
+class GcDispatchResponse(_Dto):
+    """Lo que dejo encolado una pasada del GC por el canal de control."""
+
+    #: Bloques huerfanos vistos.
+    blocks: int
+    #: Ordenes de borrado encoladas (un bloque puede estar en varios nodos).
+    orders: int
+    #: Bloques que no se encolaron porque ya tenian una tarea viva.
+    skipped: int
 
 
 class LeadershipResponse(_Dto):

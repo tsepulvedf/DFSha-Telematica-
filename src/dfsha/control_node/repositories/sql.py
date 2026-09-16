@@ -14,7 +14,8 @@ transaccion: el flush escribe, el commit es el que confirma.
 from __future__ import annotations
 
 import uuid
-from datetime import datetime
+from dataclasses import dataclass
+from datetime import datetime, timedelta
 from typing import Iterable, Sequence
 
 from sqlalchemy import case, delete, func, select, update
@@ -36,6 +37,7 @@ from dfsha.control_node.domain.entities import (
 
 from .models import (
     LEADERSHIP_ROW_ID,
+    RereplicationTaskRow,
     BlockReplicaRow,
     BlockRow,
     DataNodeRow,
@@ -53,6 +55,7 @@ __all__ = [
     "SqlBlockRepository",
     "SqlDataNodeRepository",
     "SqlLeadershipRepository",
+    "SqlRereplicationRepository",
     "SqlUnitOfWork",
 ]
 
@@ -443,6 +446,61 @@ class SqlBlockRepository:
             )
         self._session.flush()
 
+    def add_replica(
+        self, block_id: str, data_node_id: str, state: ReplicaState, now: datetime
+    ) -> bool:
+        """Registra una copia planificada en un nodo donde el bloque todavia no estaba.
+
+        Lo usa la re-replicacion. Es la decision 3 de CLAUDE.md aplicada tambien aqui:
+        **el ControlNode elige el destino y REGISTRA la eleccion**. Sin esta fila, el
+        nodo destino copia el bloque y al avisar recibe un 404 ("bloque desconocido en el
+        metadato"), porque `mark_stored` solo sabe actualizar una fila que ya existe; la
+        copia queda en disco como huerfana y la tarea nunca se cierra.
+
+        Idempotente: si la fila ya esta, no se toca.
+        """
+        existe = self._session.get(BlockReplicaRow, (block_id, data_node_id))
+        if existe is not None:
+            return False
+        self._session.add(
+            BlockReplicaRow(
+                block_id=block_id,
+                data_node_id=data_node_id,
+                state=state.value,
+                created_at=now,
+            )
+        )
+        self._session.flush()
+        return True
+
+    def drop_replica(self, block_id: str, data_node_id: str) -> bool:
+        """Quita una copia PLANIFICADA que nunca llego a escribirse.
+
+        Solo borra si sigue en PENDING: una fila STORED es una copia real y borrarla
+        seria perder la pista de bytes que estan en disco.
+        """
+        borradas = self._session.execute(
+            delete(BlockReplicaRow).where(
+                BlockReplicaRow.block_id == block_id,
+                BlockReplicaRow.data_node_id == data_node_id,
+                BlockReplicaRow.state == ReplicaState.PENDING.value,
+            )
+        ).rowcount
+        return borradas > 0
+
+    def get_many(self, block_ids: Sequence[str]) -> list[Block]:
+        """Varios bloques por id, en una sola consulta.
+
+        Existe para que empujar N ordenes por el stream no cueste N consultas: el
+        heartbeat pasa por aqui cada 3 s y por cada nodo.
+        """
+        if not block_ids:
+            return []
+        filas = self._session.scalars(
+            select(BlockRow).where(BlockRow.block_id.in_(list(block_ids)))
+        )
+        return [_to_block(fila) for fila in filas]
+
     def list_for_file(self, file_id: str) -> list[Block]:
         rows = self._session.scalars(
             select(BlockRow).where(BlockRow.file_id == file_id).order_by(BlockRow.index)
@@ -814,6 +872,305 @@ class SqlDataNodeRepository:
         )
 
 
+@dataclass(frozen=True, slots=True)
+class ExpiredTasks:
+    """Lo que dejo una pasada de expiracion."""
+
+    requeued: int
+    gave_up: int
+    #: (block_id, data_node_id) de los destinos que no llegaron a escribir el bloque.
+    abandoned_targets: list[tuple[str, str]]
+
+
+class SqlRereplicationRepository:
+    """La cola de copias pendientes.
+
+    Aqui solo hay consultas y escrituras. Quien decide QUE copiar y ADONDE es
+    `domain/rereplication.py`, que es puro y se prueba sin base de datos.
+    """
+
+    def __init__(self, session: Session) -> None:
+        self._session = session
+
+    # --- Deteccion ---------------------------------------------------------
+
+    def blocks_missing_replicas(self, replication_factor: int) -> list[dict]:
+        """Bloques de archivos COMMITTED con menos de `replication_factor` copias STORED.
+
+        Devuelve TODAS sus filas de replica, no solo las STORED: quien decide necesita
+        saber que nodos las tienen (para no repetir destino), en que dominio estan, y
+        desde cuando llevan pendientes (para la espera de gracia).
+
+        Solo archivos COMMITTED. Los de una reserva en curso se estan subiendo ahora
+        mismo y programar su copia seria correr detras del cliente; los de archivos
+        DELETED son basura del GC, no replicacion que falte.
+        """
+        cortos = (
+            select(BlockRow.block_id)
+            .join(FileRow, FileRow.id == BlockRow.file_id)
+            .outerjoin(
+                BlockReplicaRow,
+                (BlockReplicaRow.block_id == BlockRow.block_id)
+                & (BlockReplicaRow.state == ReplicaState.STORED.value),
+            )
+            .where(FileRow.state == FileState.COMMITTED.value)
+            .group_by(BlockRow.block_id)
+            .having(func.count(BlockReplicaRow.block_id) < replication_factor)
+            .scalar_subquery()
+        )
+
+        filas = self._session.execute(
+            select(
+                BlockRow.block_id,
+                BlockRow.size,
+                BlockRow.checksum_sha256,
+                BlockReplicaRow.data_node_id,
+                BlockReplicaRow.state,
+                BlockReplicaRow.created_at,
+                DataNodeRow.fault_domain,
+                DataNodeRow.last_heartbeat_at,
+                DataNodeRow.advertise_url,
+            )
+            .outerjoin(BlockReplicaRow, BlockReplicaRow.block_id == BlockRow.block_id)
+            .outerjoin(DataNodeRow, DataNodeRow.id == BlockReplicaRow.data_node_id)
+            .where(BlockRow.block_id.in_(cortos))
+            .order_by(BlockRow.block_id)
+        )
+
+        agrupado: dict[str, dict] = {}
+        for fila in filas:
+            entrada = agrupado.setdefault(
+                fila.block_id,
+                {
+                    "block_id": fila.block_id,
+                    "size": fila.size,
+                    "checksum_sha256": fila.checksum_sha256,
+                    "replicas": [],
+                },
+            )
+            if fila.data_node_id is not None:
+                entrada["replicas"].append(
+                    {
+                        "data_node_id": fila.data_node_id,
+                        "state": fila.state,
+                        "created_at": fila.created_at,
+                        "fault_domain": fila.fault_domain or "",
+                        "last_heartbeat_at": fila.last_heartbeat_at,
+                        "advertise_url": fila.advertise_url or "",
+                    }
+                )
+        return list(agrupado.values())
+
+    # --- Cola --------------------------------------------------------------
+
+    def has_active_task(self, block_id: str) -> bool:
+        total = self._session.scalar(
+            select(func.count())
+            .select_from(RereplicationTaskRow)
+            .where(
+                RereplicationTaskRow.block_id == block_id,
+                RereplicationTaskRow.state.in_(("PENDING", "IN_FLIGHT")),
+            )
+        )
+        return (total or 0) > 0
+
+    def enqueue_delete(
+        self, block_id: str, target_node_id: str, now: datetime, expires_at: datetime
+    ) -> str | None:
+        """Encola un borrado dirigido a un nodo concreto.
+
+        Nace ya en IN_FLIGHT porque no hay nada que decidir: el destino lo dice quien
+        encola, que es el GC y ya sabe en que nodos esta el huerfano.
+        """
+        if self.has_active_task(block_id):
+            return None
+        task_id = new_id()
+        self._session.add(
+            RereplicationTaskRow(
+                id=task_id,
+                block_id=block_id,
+                kind="DELETE",
+                state="IN_FLIGHT",
+                target_node_id=target_node_id,
+                replicas_at_schedule=0,
+                created_at=now,
+                dispatched_at=now,
+                expires_at=expires_at,
+                attempts=1,
+            )
+        )
+        self._session.flush()
+        return task_id
+
+    def enqueue(self, block_id: str, replicas_now: int, now: datetime) -> str | None:
+        """Encola una copia. `None` si ya habia una tarea viva para ese bloque.
+
+        La comprobacion previa evita el caso normal, pero quien garantiza la unicidad es
+        el indice unico parcial del esquema: dos lideres solapados durante un relevo
+        pueden pasar los dos por aqui a la vez.
+        """
+        if self.has_active_task(block_id):
+            return None
+        task_id = new_id()
+        self._session.add(
+            RereplicationTaskRow(
+                id=task_id,
+                block_id=block_id,
+                kind="REPLICATE",
+                state="PENDING",
+                replicas_at_schedule=replicas_now,
+                created_at=now,
+                attempts=0,
+            )
+        )
+        self._session.flush()
+        return task_id
+
+    def list_pending(self) -> list[RereplicationTaskRow]:
+        return list(
+            self._session.scalars(
+                select(RereplicationTaskRow)
+                .where(
+                    RereplicationTaskRow.state == "PENDING",
+                    RereplicationTaskRow.kind == "REPLICATE",
+                )
+                .order_by(
+                    RereplicationTaskRow.replicas_at_schedule,
+                    RereplicationTaskRow.block_id,
+                )
+            )
+        )
+
+    def in_flight_by_target(self) -> dict[str, int]:
+        filas = self._session.execute(
+            select(RereplicationTaskRow.target_node_id, func.count())
+            .where(
+                RereplicationTaskRow.state == "IN_FLIGHT",
+                RereplicationTaskRow.target_node_id.is_not(None),
+            )
+            .group_by(RereplicationTaskRow.target_node_id)
+        )
+        return {node_id: n for node_id, n in filas}
+
+    def dispatch(
+        self,
+        task_id: str,
+        source_node_id: str,
+        target_node_id: str,
+        now: datetime,
+        expires_at: datetime,
+    ) -> None:
+        self._session.execute(
+            update(RereplicationTaskRow)
+            .where(RereplicationTaskRow.id == task_id)
+            .values(
+                state="IN_FLIGHT",
+                source_node_id=source_node_id,
+                target_node_id=target_node_id,
+                dispatched_at=now,
+                expires_at=expires_at,
+                attempts=RereplicationTaskRow.attempts + 1,
+            )
+        )
+
+    def orders_for(
+        self, target_node_id: str, now: datetime, resend_after: timedelta
+    ) -> list[RereplicationTaskRow]:
+        """Ordenes que hay que empujarle a este nodo por su stream de heartbeat.
+
+        `resend_after` evita reenviar la misma orden en cada latido: el nodo late cada
+        3 s y copiar un bloque tarda mas que eso.
+        """
+        limite = now - resend_after
+        return list(
+            self._session.scalars(
+                select(RereplicationTaskRow).where(
+                    RereplicationTaskRow.target_node_id == target_node_id,
+                    RereplicationTaskRow.state == "IN_FLIGHT",
+                    (RereplicationTaskRow.sent_at.is_(None))
+                    | (RereplicationTaskRow.sent_at < limite),
+                )
+            )
+        )
+
+    def mark_sent(self, task_ids: Sequence[str], now: datetime) -> None:
+        if not task_ids:
+            return
+        self._session.execute(
+            update(RereplicationTaskRow)
+            .where(RereplicationTaskRow.id.in_(list(task_ids)))
+            .values(sent_at=now)
+        )
+
+    def complete(self, block_id: str, target_node_id: str) -> int:
+        """Cierra la tarea cuando el destino confirma que ya tiene el bloque.
+
+        La confirmacion llega por el camino de siempre (el aviso de bloque almacenado, o
+        el block report), no por un mensaje propio: un camino menos que mantener.
+        """
+        return self._session.execute(
+            update(RereplicationTaskRow)
+            .where(
+                RereplicationTaskRow.block_id == block_id,
+                RereplicationTaskRow.target_node_id == target_node_id,
+                RereplicationTaskRow.state == "IN_FLIGHT",
+            )
+            .values(state="DONE", expires_at=None)
+        ).rowcount
+
+    def expire_stale(self, now: datetime, max_attempts: int) -> "ExpiredTasks":
+        """Devuelve a la cola las copias que el destino no confirmo a tiempo.
+
+        Mismo mecanismo de expiracion que las reservas de escritura de la Etapa 1 y que
+        el lease de liderazgo: quien se cae a mitad no bloquea el recurso para siempre.
+        Pasado `max_attempts` la tarea se marca FAILED en vez de reintentarse
+        eternamente: un bloque que falla una y otra vez es un problema que hay que mirar,
+        no uno que se arregle insistiendo.
+
+        Devuelve tambien los destinos abandonados, para que quien llama pueda quitar la
+        fila PENDING de `block_replicas` que quedo apuntando a un nodo que nunca escribio
+        el bloque. Sin eso, ese nodo seguiria contando como "ya lo tiene" y el proximo
+        despacho lo descartaria como destino para siempre.
+        """
+        vencidas = list(
+            self._session.scalars(
+                select(RereplicationTaskRow).where(
+                    RereplicationTaskRow.state == "IN_FLIGHT",
+                    RereplicationTaskRow.expires_at.is_not(None),
+                    RereplicationTaskRow.expires_at < now,
+                )
+            )
+        )
+        devueltas = rendidas = 0
+        abandonados: list[tuple[str, str]] = []
+        for tarea in vencidas:
+            if tarea.target_node_id:
+                abandonados.append((tarea.block_id, tarea.target_node_id))
+            if tarea.attempts >= max_attempts:
+                tarea.state = "FAILED"
+                tarea.last_error = f"sin confirmar tras {tarea.attempts} intentos"
+                rendidas += 1
+            else:
+                tarea.state = "PENDING"
+                tarea.target_node_id = None
+                tarea.source_node_id = None
+                tarea.sent_at = None
+                tarea.expires_at = None
+                devueltas += 1
+        self._session.flush()
+        return ExpiredTasks(
+            requeued=devueltas, gave_up=rendidas, abandoned_targets=abandonados
+        )
+
+    def counts_by_state(self) -> dict[str, int]:
+        filas = self._session.execute(
+            select(RereplicationTaskRow.state, func.count()).group_by(
+                RereplicationTaskRow.state
+            )
+        )
+        return {estado: n for estado, n in filas}
+
+
 class SqlLeadershipRepository:
     """El lease de liderazgo. Una fila, y toda la concurrencia del Bloque A pasa por ella.
 
@@ -965,6 +1322,7 @@ class SqlUnitOfWork:
         self.blocks = SqlBlockRepository(self._session)
         self.data_nodes = SqlDataNodeRepository(self._session)
         self.leadership = SqlLeadershipRepository(self._session)
+        self.rereplication = SqlRereplicationRepository(self._session)
 
     def __enter__(self) -> "SqlUnitOfWork":
         if self._session is None:
