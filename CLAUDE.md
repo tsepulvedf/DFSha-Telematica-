@@ -567,6 +567,52 @@ Fijado en `tests/unit/test_sobrereplicacion.py`, que ademas blinda lo que **no**
 pasar: no se encola re-replicacion, no se cuenta como sub-replicado ni critico, no se
 registra divergencia, y el GC no lo lista.
 
+### Trampa de httpx 0.28: `cert=` se ignora si `verify` es una ruta
+
+**Si tocas cualquier cliente HTTP con certificado, lee esto antes.** No es una
+peculiaridad nuestra: es el comportamiento de una version concreta de una libreria, y
+muerde en silencio.
+
+`httpx.Client(verify="ca.crt", cert=("cli.crt", "cli.key"))` **descarta el certificado de
+cliente**. Medido con httpx 0.28.1 contra un servidor con `ssl_cert_reqs=CERT_REQUIRED`:
+
+| Como se construye el cliente | Resultado |
+|---|---|
+| `verify=<ruta>` + `cert=(crt, key)` | **el servidor cierra la conexion** |
+| `verify=SSLContext(solo CA)` + `cert=(crt, key)` | 200 |
+| `verify=SSLContext(CA + cert cargado)` | 200 |
+
+`verify=<str>` esta deprecado en 0.28 y su camino construye el `SSLContext` por su cuenta
+**ignorando `cert`**. El unico aviso que emite httpx es sobre `verify`; sobre el
+certificado que acaba de tirar, ninguno.
+
+El sintoma es un error de transporte —«Server disconnected without sending a response»—
+que parece del servidor y es del cliente.
+
+**Por eso hay un unico sitio donde se construye el contexto de cliente**,
+`common/tls.client_ssl_context`, y lo usan el DataNode, el recolector y las pruebas. Si
+aparece un `verify=<ruta>` junto a un `cert=` en algun sitio nuevo, es este fallo otra vez.
+
+#### El patron, que es lo que va al informe
+
+Los **dos** fallos serios de la Etapa 3 han sido el mismo tipo de cosa: **configuracion
+que aparenta estar puesta y no lo esta**, y ninguno se detecto leyendo el codigo.
+
+| Fallo | Que parecia | Que era | Como se detecto |
+|---|---|---|---|
+| Direccionamiento (Bloque B) | El plan llevaba la direccion de cada replica | Llevaba la del **cliente** en un camino entre nodos | Validando en **Docker**, no en las pruebas |
+| `cert=` de httpx (Bloque C) | El cliente presentaba su certificado | httpx lo **descartaba** sin avisar | Midiendo tres combinaciones, no asumiendo |
+
+Los dos pasaban por caminos que en el entorno de prueba no se distinguen del correcto: el
+primero porque los nodos compartian espacio de red; el segundo porque todas las pruebas de
+rechazo pasaban —el servidor cerraba la conexion, que es justo lo que se esperaba de un
+intruso— y solo fallaba el camino bueno.
+
+La leccion, y es material del informe: **una prueba que solo comprueba que lo malo se
+rechaza no comprueba que lo bueno funciona**, y en seguridad las dos mitades hacen falta.
+De ahi que `test_mtls.py` empiece por el caso bueno con un comentario que lo dice: si ese
+falla, los demas no prueban nada.
+
 ### Enrutado CQRS: que consulta va a donde
 
 La separacion `commands/` / `queries/` existe desde la Etapa 1. Aqui se cobra.
