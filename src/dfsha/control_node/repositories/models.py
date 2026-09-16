@@ -29,6 +29,8 @@ __all__ = [
     "BlockRow",
     "BlockReplicaRow",
     "DataNodeRow",
+    "LeadershipRow",
+    "LEADERSHIP_ROW_ID",
 ]
 
 ID_LEN = 36
@@ -238,3 +240,29 @@ class DataNodeRow(Base):
     stat_bytes_written_60s: Mapped[int] = mapped_column(BigInteger, nullable=False, default=0)
 
     __table_args__ = (Index("ix_data_nodes_state", "state"),)
+
+
+#: El liderazgo es una fila unica. La clave primaria fija es lo que lo garantiza: no hay
+#: forma de insertar una segunda, ni por una carrera ni por un error de codigo.
+LEADERSHIP_ROW_ID = 1
+
+
+class LeadershipRow(Base):
+    """El lease de liderazgo del ControlNode. Una sola fila, id = 1.
+
+    Vive en la base y no en la memoria de ningun proceso a proposito: es lo unico que
+    tres instancias sin estado comparten, y por tanto el unico sitio donde pueden
+    ponerse de acuerdo. La exclusion la da `SELECT ... FOR UPDATE` sobre esta fila.
+    """
+
+    __tablename__ = "leadership"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=False)
+    #: Quien lo sostiene. NULL solo en la fila recien sembrada, antes del primer lider.
+    leader_id: Mapped[str | None] = mapped_column(String(ID_LEN), nullable=True)
+    #: Token de aislamiento. SOLO SUBE: nunca baja ni se reinicia, ni siquiera cuando el
+    #: mismo proceso recupera el lease que acababa de perder. Ver domain/leadership.py.
+    epoch: Mapped[int] = mapped_column(BigInteger, nullable=False, default=0)
+    acquired_at: Mapped[datetime | None] = mapped_column(UtcDateTime, nullable=True)
+    renewed_at: Mapped[datetime | None] = mapped_column(UtcDateTime, nullable=True)
+    expires_at: Mapped[datetime | None] = mapped_column(UtcDateTime, nullable=True)

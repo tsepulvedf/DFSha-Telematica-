@@ -276,6 +276,9 @@ def cluster() -> None:
 
     if not estado.nodes:
         console.print("[dim]no hay ningun DataNode registrado[/dim]")
+        # El liderazgo se muestra igualmente: un cluster sin DataNodes es justo cuando
+        # mas falta hace saber si el plano de control esta en pie.
+        _mostrar_liderazgo(api)
         return
 
     colores = {"ALIVE": "green", "SUSPECT": "yellow", "DEAD": "red"}
@@ -333,6 +336,40 @@ def cluster() -> None:
     console.print(
         f"[dim]{vivos}/{len(estado.nodes)} nodos vivos en {len(dominios)} "
         f"dominios de falla[/dim]"
+    )
+
+    _mostrar_liderazgo(api)
+
+
+def _mostrar_liderazgo(api: ControlApi) -> None:
+    """Quien sostiene el lease del ControlNode.
+
+    Se pide aparte y su fallo no tumba el comando: `dfsha cluster` existe desde la
+    Etapa 2 para ver los DataNodes, y perder esa informacion porque el endpoint nuevo
+    devuelva un error seria un mal cambio.
+
+    La epoca se muestra siempre, y no solo cuando cambia, porque es el numero que hay
+    que mirar en la demostracion: al matar al lider, el siguiente tiene que salir con
+    exactamente una mas.
+    """
+    try:
+        lease = api.leadership()
+    except DFShaError as error:
+        console.print(f"[dim]liderazgo: no disponible ({error.message})[/dim]")
+        return
+
+    if lease.leader_id is None:
+        console.print(
+            "[yellow]sin lider[/yellow] [dim]— el lease esta libre; la siguiente "
+            f"instancia que lo tome ira con epoca {lease.epoch + 1}[/dim]"
+        )
+        return
+
+    quien = "esta instancia" if lease.is_self else f"otra instancia ({lease.leader_id[:8]})"
+    console.print(
+        f"[dim]lider:[/dim] {quien} [dim]· epoca[/dim] {lease.epoch} "
+        f"[dim]· le quedan[/dim] {lease.expires_in_seconds:.1f}s "
+        f"[dim]· te atendio[/dim] {lease.instance_id[:8]}"
     )
 
 

@@ -31,6 +31,8 @@ __all__ = [
     "ChecksumMismatchError",
     "NoDataNodeAvailableError",
     "StorageError",
+    "NotLeaderError",
+    "StaleEpochError",
 ]
 
 
@@ -154,6 +156,31 @@ class NoDataNodeAvailableError(DFShaError):
     """Ningun DataNode vivo con espacio para colocar el bloque."""
 
     code = "no_datanode_available"
+
+
+# --- Liderazgo (Etapa 3) ---------------------------------------------------
+
+
+class NotLeaderError(DFShaError):
+    """Esta instancia no sostiene el lease y la operacion lo exige.
+
+    No es un fallo: con tres ControlNodes, dos de ellos no son lideres en todo momento.
+    """
+
+    code = "not_leader"
+
+
+class StaleEpochError(DFShaError):
+    """La epoca con la que se pidio la operacion ya no es la vigente.
+
+    Este es el error que atrapa al lider congelado: una pausa larga del recolector de
+    basura o una particion de red dejan a una instancia creyendo que sigue mandando
+    mientras otra ya tomo el lease. Se comprueba DENTRO de la misma transaccion que la
+    operacion, porque comprobarlo antes deja una ventana en la que el lease puede
+    cambiar entre la comprobacion y la escritura.
+    """
+
+    code = "stale_epoch"
 
 
 class StorageError(DFShaError):

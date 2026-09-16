@@ -60,11 +60,30 @@ class ControlNodeSettings(BaseSettings):
     #: asi que tiene que sobrar sitio respecto al numero de DataNodes.
     grpc_max_workers: int = Field(default=16, gt=0)
 
+    # --- Liderazgo (Etapa 3) ------------------------------------------------
+    #: Cuanto vale un lease sin renovar. Si el lider se calla mas de esto, otra
+    #: instancia puede tomarlo subiendo la epoca.
+    lease_ttl_ms: int = Field(default=6000, gt=0)
+    #: Cada cuanto renueva el lider. Tiene que ser bastante menor que el TTL: entre los
+    #: dos valores cabe el margen para una pausa, un pico de latencia de la base o un
+    #: reintento, sin que el liderazgo cambie de manos por nada.
+    lease_renew_ms: int = Field(default=2000, gt=0)
+
     # --- Colocacion --------------------------------------------------------
     replication_factor: int = Field(default=1, gt=0)
     placement_d: int = Field(default=3, gt=0)
     #: Margen de seguridad: un nodo necesita block_size + esto para ser candidato.
     min_free_bytes: int = Field(default=128 * 1024 * 1024, ge=0)
+
+    @model_validator(mode="after")
+    def _lease_coherente(self) -> "ControlNodeSettings":
+        if self.lease_renew_ms >= self.lease_ttl_ms:
+            raise ValueError(
+                "DFSHA_LEASE_RENEW_MS debe ser menor que DFSHA_LEASE_TTL_MS; si no, el "
+                "lider pierde el lease antes de tener ocasion de renovarlo y el "
+                "liderazgo cambiaria de manos continuamente sin que haya fallado nada"
+            )
+        return self
 
     @model_validator(mode="after")
     def _umbrales_coherentes(self) -> "ControlNodeSettings":

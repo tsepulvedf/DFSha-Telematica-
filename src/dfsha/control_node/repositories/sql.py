@@ -20,6 +20,7 @@ from typing import Iterable, Sequence
 from sqlalchemy import case, delete, func, select, update
 from sqlalchemy.orm import Session
 
+from dfsha.control_node.domain.leadership import Lease
 from dfsha.control_node.domain.entities import (
     Block,
     BlockReplica,
@@ -33,7 +34,16 @@ from dfsha.control_node.domain.entities import (
     User,
 )
 
-from .models import BlockReplicaRow, BlockRow, DataNodeRow, DirectoryRow, FileRow, UserRow
+from .models import (
+    LEADERSHIP_ROW_ID,
+    BlockReplicaRow,
+    BlockRow,
+    DataNodeRow,
+    DirectoryRow,
+    FileRow,
+    LeadershipRow,
+    UserRow,
+)
 
 __all__ = [
     "new_id",
@@ -42,6 +52,7 @@ __all__ = [
     "SqlFileRepository",
     "SqlBlockRepository",
     "SqlDataNodeRepository",
+    "SqlLeadershipRepository",
     "SqlUnitOfWork",
 ]
 
@@ -743,6 +754,131 @@ class SqlDataNodeRepository:
         )
 
 
+class SqlLeadershipRepository:
+    """El lease de liderazgo. Una fila, y toda la concurrencia del Bloque A pasa por ella.
+
+    `lock()` no es un `get()` con otro nombre: toma un cerrojo de fila. Todo lo que lea
+    o escriba el lease pasa por ahi, porque leerlo sin cerrojo y escribir despues deja
+    una ventana en la que otra instancia se cuela entre la lectura y la escritura, que es
+    exactamente el fallo que este mecanismo existe para evitar.
+    """
+
+    def __init__(self, session: Session) -> None:
+        self._session = session
+
+    def lock(self) -> Lease | None:
+        """Lee el lease tomando `SELECT ... FOR UPDATE` sobre su fila.
+
+        El cerrojo dura hasta el final de la transaccion, asi que si el llamador hace la
+        comprobacion de epoca y la escritura dentro del mismo `with`, ninguna otra
+        instancia puede adquirir el lease en medio.
+
+        **SQLite no implementa `FOR UPDATE`** y no se pide: escribe con un cerrojo de
+        base entera, asi que el efecto se consigue igual. La consecuencia para las
+        pruebas esta dicha en CLAUDE.md: la comparacion de epoca se prueba en SQLite, la
+        exclusion mutua real solo contra PostgreSQL.
+        """
+        consulta = select(LeadershipRow).where(LeadershipRow.id == LEADERSHIP_ROW_ID)
+        if self._session.bind is not None and self._session.bind.dialect.name != "sqlite":
+            consulta = consulta.with_for_update()
+
+        fila = self._session.execute(consulta).scalar_one_or_none()
+        return _to_lease(fila) if fila is not None else None
+
+    def peek(self) -> Lease | None:
+        """Lee el lease SIN cerrojo. Solo para exponerlo por la API.
+
+        Separada de `lock()` a proposito: un `GET /cluster/leadership` cada pocos
+        segundos tomando cerrojo sobre la fila que el lider renueva cada 2 s convertiria
+        una consulta informativa en un punto de contencion.
+        """
+        fila = self._session.get(LeadershipRow, LEADERSHIP_ROW_ID)
+        return _to_lease(fila) if fila is not None else None
+
+    def seed(self) -> Lease:
+        """Crea la fila si no esta. En PostgreSQL la siembra la migracion 0002; esto
+        cubre el esquema de SQLite de las pruebas, que se crea con `create_all`."""
+        fila = LeadershipRow(id=LEADERSHIP_ROW_ID, leader_id=None, epoch=0)
+        self._session.add(fila)
+        self._session.flush()
+        return _to_lease(fila)
+
+    def acquire(
+        self, leader_id: str, epoch: int, now: datetime, expires_at: datetime
+    ) -> Lease:
+        """Toma el lease con una epoca NUEVA. Nunca se reutiliza una epoca."""
+        self._session.execute(
+            update(LeadershipRow)
+            .where(LeadershipRow.id == LEADERSHIP_ROW_ID)
+            .values(
+                leader_id=leader_id,
+                epoch=epoch,
+                acquired_at=now,
+                renewed_at=now,
+                expires_at=expires_at,
+            )
+        )
+        return Lease(
+            leader_id=leader_id,
+            epoch=epoch,
+            acquired_at=now,
+            renewed_at=now,
+            expires_at=expires_at,
+        )
+
+    def renew(
+        self, leader_id: str, epoch: int, now: datetime, expires_at: datetime
+    ) -> Lease:
+        """Extiende el lease conservando la epoca.
+
+        El `where` repite leader_id y epoch aunque la fila ya se leyo bajo cerrojo: es
+        barato y convierte un error de programacion (renovar el lease de otro) en cero
+        filas afectadas en vez de en una usurpacion silenciosa.
+        """
+        resultado = self._session.execute(
+            update(LeadershipRow)
+            .where(
+                LeadershipRow.id == LEADERSHIP_ROW_ID,
+                LeadershipRow.leader_id == leader_id,
+                LeadershipRow.epoch == epoch,
+            )
+            .values(renewed_at=now, expires_at=expires_at)
+        )
+        if resultado.rowcount == 0:
+            raise RuntimeError(
+                "se intento renovar un lease que ya no es de esta instancia"
+            )
+        fila = self._session.get(LeadershipRow, LEADERSHIP_ROW_ID)
+        return _to_lease(fila)
+
+    def release(self, leader_id: str, epoch: int) -> None:
+        """Suelta el lease al apagarse limpiamente.
+
+        No hace falta para que el sistema sea correcto (el lease vence solo), pero hace
+        que un apagado ordenado no cueste un TTL entero sin lider. La epoca NO se toca:
+        el siguiente en tomarlo la subira.
+        """
+        self._session.execute(
+            update(LeadershipRow)
+            .where(
+                LeadershipRow.id == LEADERSHIP_ROW_ID,
+                LeadershipRow.leader_id == leader_id,
+                LeadershipRow.epoch == epoch,
+            )
+            .values(leader_id=None, expires_at=None)
+        )
+
+
+def _to_lease(fila: LeadershipRow) -> Lease:
+    return Lease(
+        leader_id=fila.leader_id,
+        epoch=fila.epoch,
+        acquired_at=fila.acquired_at,
+        renewed_at=fila.renewed_at,
+        expires_at=fila.expires_at,
+    )
+
+
 class SqlUnitOfWork:
     """Una sesion, una transaccion, todos los repositorios dentro.
 
@@ -768,6 +904,7 @@ class SqlUnitOfWork:
         self.files = SqlFileRepository(self._session)
         self.blocks = SqlBlockRepository(self._session)
         self.data_nodes = SqlDataNodeRepository(self._session)
+        self.leadership = SqlLeadershipRepository(self._session)
 
     def __enter__(self) -> "SqlUnitOfWork":
         if self._session is None:

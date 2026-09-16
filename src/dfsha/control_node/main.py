@@ -20,8 +20,10 @@ from dfsha.control_node.repositories.database import (
     build_session_factory,
     prepare_schema,
 )
+from dfsha.control_node.domain.leadership import LeaseTimings
 from dfsha.control_node.domain.membership import MembershipThresholds
 from dfsha.control_node.repositories.sql import SqlUnitOfWork
+from dfsha.control_node.services.leadership import LeadershipService
 from dfsha.control_node.services.membership_monitor import MembershipMonitor
 from dfsha.control_node.services.read_routing import (
     WRITE_LSN_HEADER,
@@ -71,6 +73,9 @@ def create_app(settings: ControlNodeSettings | None = None) -> FastAPI:
     thresholds = MembershipThresholds.from_millis(
         settings.suspect_after_ms, settings.dead_after_ms
     )
+    lease_timings = LeaseTimings.from_millis(
+        settings.lease_ttl_ms, settings.lease_renew_ms
+    )
 
     @asynccontextmanager
     async def lifespan(app: FastAPI):
@@ -88,10 +93,20 @@ def create_app(settings: ControlNodeSettings | None = None) -> FastAPI:
         )
         grpc_server.start()
 
+        # El liderazgo arranca ANTES que el evaluador: si fuera al reves, la primera
+        # pasada del evaluador encontraria `current_fencing()` a None y se saltaria sin
+        # motivo. No es un fallo, pero retrasa la primera evaluacion un intervalo entero.
+        liderazgo = app.state.leadership
+        liderazgo.start()
+
         monitor = MembershipMonitor(
             uow_factory=app.state.uow_factory,
             thresholds=thresholds,
             interval_seconds=settings.membership_interval_ms / 1000,
+            # Aqui es donde el evaluador de la Etapa 2 pasa a exigir liderazgo. Lo que
+            # se le pasa es la vista LOCAL de la epoca, que puede estar obsoleta; quien
+            # la verifica de verdad es la transaccion, dentro de evaluate_membership.
+            fencing_provider=liderazgo.current_fencing,
         )
         monitor.start()
 
@@ -109,10 +124,15 @@ def create_app(settings: ControlNodeSettings | None = None) -> FastAPI:
             suspect_after_ms=settings.suspect_after_ms,
             dead_after_ms=settings.dead_after_ms,
             replication_factor=settings.replication_factor,
+            instance_id=liderazgo.instance_id,
+            lease_ttl_ms=settings.lease_ttl_ms,
         )
         yield
 
+        # El evaluador para primero: si parara despues, podria arrancar una pasada con
+        # una epoca que esta instancia acaba de soltar.
         monitor.stop()
+        liderazgo.stop()
         # `grace` da margen a los streams de heartbeat abiertos para cerrarse solos en
         # vez de cortarlos a mitad y llenar los logs de los DataNodes de errores.
         grpc_server.stop(grace=2.0).wait(timeout=5.0)
@@ -139,6 +159,12 @@ def create_app(settings: ControlNodeSettings | None = None) -> FastAPI:
     )
     app.state.read_router = ReadRouter(
         app.state.uow_factory, app.state.query_uow_factory
+    )
+    # Se construye aqui, fuera del lifespan, para que `instance_id` exista desde que se
+    # crea la app: el endpoint /cluster/leadership lo necesita para decir quien atendio
+    # la peticion, y las pruebas lo consultan sin levantar el lifespan.
+    app.state.leadership = LeadershipService(
+        uow_factory=app.state.uow_factory, timings=lease_timings
     )
 
     @app.middleware("http")

@@ -7,7 +7,7 @@ devolver un DTO, la logica esta en el sitio equivocado.
 
 from __future__ import annotations
 
-from fastapi import APIRouter, Depends, Response, status
+from fastapi import APIRouter, Depends, Request, Response, status
 
 from dfsha.common.dto import (
     BlockReadPlan,
@@ -19,6 +19,7 @@ from dfsha.common.dto import (
     CreateFileRequest,
     CreateFileResponse,
     GcConfirmRequest,
+    LeadershipResponse,
     LoginRequest,
     LsEntry,
     LsResponse,
@@ -35,12 +36,14 @@ from dfsha.common.dto import (
 from dfsha.control_node.commands import auth as auth_commands
 from dfsha.control_node.commands import files as file_commands
 from dfsha.control_node.commands import internal as internal_commands
+from dfsha.control_node.commands import leadership as leadership_commands
 from dfsha.control_node.commands import namespace as namespace_commands
 from dfsha.control_node.queries import cluster as cluster_queries
 from dfsha.control_node.queries import files as file_queries
 from dfsha.control_node.queries import gc as gc_queries
 from dfsha.control_node.queries import namespace as namespace_queries
 
+from dfsha.control_node.domain.entities import utcnow
 from dfsha.control_node.domain.membership import MembershipThresholds
 
 from .deps import (
@@ -129,6 +132,29 @@ def cluster_status(uow: QueryUow, user: CurrentUser, settings: Settings) -> Clus
         replication_factor=settings.replication_factor,
         suspect_after_ms=settings.suspect_after_ms,
         dead_after_ms=settings.dead_after_ms,
+    )
+
+
+@cluster_router.get("/leadership")
+def leadership(request: Request, uow: Uow, user: CurrentUser) -> LeadershipResponse:
+    """Quien sostiene el lease, con que epoca y cuanto le queda.
+
+    Va contra el PRIMARIO: el lease es el estado mas cambiante del sistema y servirlo
+    desde una replica con retraso diria que el lider es quien ya dejo de serlo, que es
+    justo lo contrario de para lo que se consulta.
+    """
+    servicio = request.app.state.leadership
+    ahora = utcnow()
+    lease = leadership_commands.read_lease(uow, ahora)
+
+    return LeadershipResponse(
+        leader_id=lease.leader_id,
+        epoch=lease.epoch,
+        is_self=lease.leader_id == servicio.instance_id,
+        instance_id=servicio.instance_id,
+        expires_in_seconds=round(lease.remaining_seconds(ahora), 3),
+        acquired_at=lease.acquired_at,
+        renewed_at=lease.renewed_at,
     )
 
 

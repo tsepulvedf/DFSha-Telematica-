@@ -210,6 +210,23 @@ def create_schema(engine: Engine) -> None:
     """Crea las tablas que falten. Solo para SQLite: ver `prepare_schema`."""
     _rechazar_esquema_viejo(engine)
     Base.metadata.create_all(engine)
+    _sembrar_liderazgo(engine)
+
+
+def _sembrar_liderazgo(engine: Engine) -> None:
+    """Inserta la fila unica del lease si no esta.
+
+    En PostgreSQL la siembra la migracion 0002, y eso elimina una carrera: `SELECT ...
+    FOR UPDATE` no puede bloquear una fila que todavia no existe, asi que tres
+    instancias arrancando a la vez competirian por insertarla. Aqui se replica esa
+    siembra para el esquema de SQLite, que se crea con `create_all`.
+    """
+    from .models import LEADERSHIP_ROW_ID, LeadershipRow
+
+    with Session(engine) as sesion:
+        if sesion.get(LeadershipRow, LEADERSHIP_ROW_ID) is None:
+            sesion.add(LeadershipRow(id=LEADERSHIP_ROW_ID, leader_id=None, epoch=0))
+            sesion.commit()
 
 
 #: Columnas que la Etapa 2 anadio a tablas ya existentes en la Etapa 1.

@@ -15,6 +15,7 @@ from dfsha.common.dto import (
     ClusterStatusResponse,
     CommitResponse,
     CreateFileResponse,
+    LeadershipResponse,
     LsResponse,
     OpenFileResponse,
     StatResponse,
@@ -107,6 +108,11 @@ class ControlApi:
     def cluster_status(self) -> ClusterStatusResponse:
         return ClusterStatusResponse.model_validate(
             self._request("GET", f"{API}/cluster/status").json()
+        )
+
+    def leadership(self) -> LeadershipResponse:
+        return LeadershipResponse.model_validate(
+            self._request("GET", f"{API}/cluster/leadership").json()
         )
 
     # --- Namespace ---------------------------------------------------------

@@ -7,6 +7,25 @@ on:
 jobs:
   pytest:
     runs-on: ubuntu-latest
+
+    # PostgreSQL de verdad, no un simulacro. La exclusion mutua del lease depende de
+    # SELECT ... FOR UPDATE, que SQLite no implementa: sin este servicio, las pruebas
+    # que la cubren se saltan y el CI daria verde sin haber comprobado nada.
+    services:
+      postgres:
+        image: "postgres:16"
+        env:
+          POSTGRES_USER: dfsha
+          POSTGRES_PASSWORD: ci-only-not-a-real-secret
+          POSTGRES_DB: dfsha
+        ports:
+          - "5432:5432"
+        options: >-
+          --health-cmd "pg_isready -U dfsha -d dfsha"
+          --health-interval 5s
+          --health-timeout 3s
+          --health-retries 20
+
     strategy:
       fail-fast: false
       matrix:
@@ -17,6 +36,9 @@ jobs:
       DFSHA_JWT_SECRET: ci-only-not-a-real-secret
       DFSHA_INTERNAL_SECRET: ci-only-not-a-real-secret
       DFSHA_BLOCK_SIZE: "1048576"
+      # Las pruebas de PostgreSQL se saltan si esta variable no esta. Aqui si esta, y
+      # por eso el CI es el unico sitio donde se comprueban en cada push.
+      DFSHA_TEST_PG_URL: "postgresql+psycopg://dfsha:ci-only-not-a-real-secret@localhost:5432/dfsha"
 
     steps:
       - uses: actions/checkout@v4

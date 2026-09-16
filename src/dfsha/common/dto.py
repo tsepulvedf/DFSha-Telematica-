@@ -41,6 +41,7 @@ __all__ = [
     "HealthResponse",
     "DataNodeStatus",
     "ClusterStatusResponse",
+    "LeadershipResponse",
     "ErrorResponse",
 ]
 
@@ -258,6 +259,26 @@ class ClusterStatusResponse(_Dto):
     replication_factor: int
     suspect_after_ms: int
     dead_after_ms: int
+
+
+class LeadershipResponse(_Dto):
+    """Quien sostiene el lease del ControlNode ahora mismo.
+
+    `epoch` es lo que hace util a este endpoint durante una demostracion: al matar al
+    lider, la epoca del siguiente tiene que ser exactamente una mas. Si se repitiera, el
+    token de aislamiento no serviria para nada.
+    """
+
+    leader_id: str | None
+    epoch: int
+    #: Si ESTA instancia (la que responde) es la que sostiene el lease. Con tres
+    #: ControlNodes tras un balanceador, es la unica forma de saber a quien te atendio.
+    is_self: bool
+    #: Identidad de la instancia que responde, lider o no.
+    instance_id: str
+    expires_in_seconds: float
+    acquired_at: datetime | None = None
+    renewed_at: datetime | None = None
 
 
 class ErrorResponse(_Dto):
