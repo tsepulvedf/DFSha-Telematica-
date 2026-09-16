@@ -258,8 +258,33 @@ def stat(path: str) -> None:
     if info.type == "file":
         tabla.add_row("tamano de bloque", _humano(info.block_size or 0))
         tabla.add_row("bloques", str(info.block_count))
+        if info.replication_state:
+            tabla.add_row("replicacion", _replicacion(info))
     tabla.add_row("creado", info.created_at.isoformat())
     console.print(tabla)
+
+
+def _replicacion(info) -> str:
+    """El estado de replicacion con el conteo real detras.
+
+    El conteo importa tanto como el estado: `UNDER_REPLICATED` a secas no distingue un
+    archivo al que le falta la tercera copia (tolera una caida mas) de uno que se quedo
+    con una sola (esta a un fallo de perderse). Cuando los bloques del archivo no estan
+    todos igual, se muestra el rango, para que una re-replicacion en curso se vea
+    avanzar en vez de parecer estancada.
+    """
+    colores = {
+        "FULLY_REPLICATED": "green",
+        "UNDER_REPLICATED": "yellow",
+        "UNAVAILABLE": "red",
+    }
+    color = colores.get(info.replication_state, "white")
+    minimo, maximo = info.min_replicas, info.max_replicas
+    copias = str(minimo) if minimo == maximo else f"{minimo}-{maximo}"
+    return (
+        f"[{color}]{info.replication_state}[/{color}] "
+        f"[dim]({copias} de {info.replication_factor} copias por bloque)[/dim]"
+    )
 
 
 # --- Cluster ---------------------------------------------------------------
@@ -285,7 +310,7 @@ def cluster() -> None:
 
     tabla = Table(
         title=(
-            f"DataNodes · R={estado.replication_factor} · "
+            f"DataNodes · R={estado.replication_factor} W={estado.write_quorum} · "
             f"SUSPECT a los {estado.suspect_after_ms / 1000:.0f}s, "
             f"DEAD a los {estado.dead_after_ms / 1000:.0f}s"
         ),
@@ -337,8 +362,31 @@ def cluster() -> None:
         f"[dim]{vivos}/{len(estado.nodes)} nodos vivos en {len(dominios)} "
         f"dominios de falla[/dim]"
     )
-
+    _mostrar_replicacion(estado)
     _mostrar_liderazgo(api)
+
+
+def _mostrar_replicacion(estado) -> None:
+    """Cuantos bloques del cluster entero van cortos de copias.
+
+    Los criticos se separan de los sub-replicados porque no cuestan lo mismo: un bloque
+    con dos copias de tres todavia tolera una caida; uno con una sola esta a un fallo de
+    desaparecer, y por eso va antes en la cola de re-replicacion.
+    """
+    if estado.under_replicated_blocks == 0:
+        console.print("[green]todos los bloques con sus copias completas[/green]")
+        return
+
+    linea = (
+        f"[yellow]{estado.under_replicated_blocks} bloques sub-replicados[/yellow] "
+        f"[dim](menos de {estado.replication_factor} copias)[/dim]"
+    )
+    if estado.critical_blocks:
+        linea += (
+            f" · [red]{estado.critical_blocks} con UNA sola copia[/red]"
+            f" [dim]— a un fallo de perderse[/dim]"
+        )
+    console.print(linea)
 
 
 def _mostrar_liderazgo(api: ControlApi) -> None:

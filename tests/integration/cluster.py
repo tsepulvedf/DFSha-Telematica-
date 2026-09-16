@@ -185,12 +185,20 @@ def start_cluster(
     data_nodes: int = 1,
     fault_domains: list[str] | None = None,
     capacities: list[int] | None = None,
+    replication_factor: int = 1,
+    write_quorum: int = 1,
     **control_overrides,
 ) -> Cluster:
     """Levanta el ControlNode y `data_nodes` DataNodes.
 
     `fault_domains` y `capacities` permiten construir los escenarios de la Etapa 2: dos
     zonas, o un nodo con menos capacidad que el resto.
+
+    `replication_factor` y `write_quorum` se fijan aqui en 1 y NO se dejan al default del
+    codigo, que desde la Etapa 3 es R=3 y W=2. El motivo es que las pruebas de las etapas
+    anteriores describen el comportamiento con una replica por bloque: dejarlas heredar
+    R=3 no las haria mejores, las haria medir otra cosa. Las pruebas de replicacion piden
+    R=3 explicitamente, que es como debe ser: quien necesita tres nodos, los levanta.
     """
     puerto_control = puerto_libre()
     puerto_grpc = puerto_libre()
@@ -204,6 +212,8 @@ def start_cluster(
         write_ttl_seconds=write_ttl_seconds,
         log_level="WARNING",
         grpc_port=puerto_grpc,
+        replication_factor=replication_factor,
+        write_quorum=write_quorum,
         **control_overrides,
     )
 

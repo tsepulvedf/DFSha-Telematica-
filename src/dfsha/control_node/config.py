@@ -70,10 +70,29 @@ class ControlNodeSettings(BaseSettings):
     lease_renew_ms: int = Field(default=2000, gt=0)
 
     # --- Colocacion --------------------------------------------------------
-    replication_factor: int = Field(default=1, gt=0)
+    #: Etapa 3: sube de 1 a 3. La politica de colocacion soporta R>1 y esta probada
+    #: para ello desde la Etapa 2; lo unico que cambia aqui es el default.
+    replication_factor: int = Field(default=3, gt=0)
+    #: Replicas confirmadas que exige el `commit`. Con W=2 y R=3, el archivo queda
+    #: legible con dos copias y la tercera se completa despues: un archivo con 2 de 3 no
+    #: esta roto, todavia tolera perder un nodo. Rechazar el commit por eso pondria la
+    #: durabilidad por encima de la disponibilidad, que es la eleccion contraria a la que
+    #: hacen estos sistemas.
+    write_quorum: int = Field(default=2, gt=0)
     placement_d: int = Field(default=3, gt=0)
     #: Margen de seguridad: un nodo necesita block_size + esto para ser candidato.
     min_free_bytes: int = Field(default=128 * 1024 * 1024, ge=0)
+
+    @model_validator(mode="after")
+    def _quorum_alcanzable(self) -> "ControlNodeSettings":
+        if self.write_quorum > self.replication_factor:
+            raise ValueError(
+                f"DFSHA_WRITE_QUORUM ({self.write_quorum}) no puede ser mayor que "
+                f"DFSHA_REPLICATION_FACTOR ({self.replication_factor}): ningun commit "
+                "podria alcanzar un quorum que la colocacion no llega a planificar, y "
+                "todas las subidas fallarian con 409 sin explicar por que"
+            )
+        return self
 
     @model_validator(mode="after")
     def _lease_coherente(self) -> "ControlNodeSettings":

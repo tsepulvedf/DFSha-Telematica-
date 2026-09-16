@@ -126,6 +126,14 @@ class StatResponse(_Dto):
     block_size: int | None = None
     block_count: int | None = None
     created_at: datetime
+    #: Estado de replicacion, derivado en el momento de la consulta:
+    #: FULLY_REPLICATED / UNDER_REPLICATED / UNAVAILABLE. `None` en directorios.
+    replication_state: str | None = None
+    #: Copias del bloque PEOR replicado. El minimo y no la media: la durabilidad de un
+    #: archivo la marca su bloque mas debil.
+    min_replicas: int | None = None
+    max_replicas: int | None = None
+    replication_factor: int | None = None
 
 
 class MkdirRequest(_Dto):
@@ -259,6 +267,13 @@ class ClusterStatusResponse(_Dto):
     replication_factor: int
     suspect_after_ms: int
     dead_after_ms: int
+    write_quorum: int = 1
+    #: Bloques de archivos vivos con menos de `replication_factor` copias almacenadas.
+    #: Es el numero que dice si la re-replicacion va al dia o va perdiendo terreno.
+    under_replicated_blocks: int = 0
+    #: De esos, los que se quedaron con UNA sola copia. Van primero en la cola de
+    #: re-replicacion y son los unicos que estan a un fallo de perderse.
+    critical_blocks: int = 0
 
 
 class LeadershipResponse(_Dto):

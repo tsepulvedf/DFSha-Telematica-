@@ -8,10 +8,12 @@ de caducidad, para que un cliente que se cae no deje el nombre bloqueado para si
 
 from __future__ import annotations
 
+import time
 from dataclasses import dataclass
 from datetime import timedelta
 
 from dfsha.common.errors import InvalidPathError, NotFoundError
+from dfsha.common.logging import get_logger
 from dfsha.control_node.domain.entities import (
     Block,
     BlockReplica,
@@ -144,20 +146,51 @@ def create_file(
 
 
 @command("files.commit")
-def commit_file(uow: SqlUnitOfWork, owner_id: str, file_id: str) -> CommittedFile:
+def commit_file(
+    uow: SqlUnitOfWork,
+    owner_id: str,
+    file_id: str,
+    write_quorum: int = 1,
+    replication_factor: int = 1,
+) -> CommittedFile:
     """Confirma la reserva y, si habia un archivo en esa ruta, lo retira.
 
     Las dos cosas ocurren en la misma transaccion. Si se hicieran en dos pasos, una caida
     entre ellos dejaria la ruta sin ningun archivo visible: el viejo ya retirado y el
     nuevo todavia sin confirmar.
+
+    **El quorum se decide aqui, y solo aqui.** El cliente ve un `X-DFSha-Replicas-Acked`
+    que le devuelve la cadena del pipeline, pero eso es informativo: la cuenta buena es
+    la de `block_replicas`, que cada DataNode actualiza por su cuenta al almacenar su
+    copia. Que esto no tenga carreras depende de una decision de la Etapa 2: el aviso
+    `/internal/v1/blocks/{id}/stored` es sincrono y va ANTES del 201 al cliente, asi que
+    cuando el cliente puede pedir el commit, el ControlNode ya sabe de esas copias.
+
+    Confirmar con W < R deja el archivo **sub-replicado, no roto**: con 2 de 3 todavia
+    tolera perder un nodo, y la copia que falta la completa la re-replicacion. Se registra
+    en el log para que no sea invisible.
     """
+    log = get_logger("control_node")
+    inicio = time.perf_counter()
+
     with uow:
         archivo = uow.files.get(file_id)
         if archivo is None or archivo.owner_id != owner_id:
             raise NotFoundError("no existe la reserva", file_id=file_id)
 
         ahora = utcnow()
-        ensure_can_commit(archivo, uow.blocks.pending_block_ids(file_id), ahora)
+        sin_quorum = uow.blocks.blocks_below_quorum(file_id, write_quorum)
+        if sin_quorum:
+            log.warning(
+                "replication.quorum_failed",
+                file_id=file_id,
+                quorum=write_quorum,
+                blocks_below_quorum=len(sin_quorum),
+                sample=sin_quorum[:5],
+                duration_ms=round((time.perf_counter() - inicio) * 1000, 3),
+                detail="el cliente debe reintentar la subida",
+            )
+        ensure_can_commit(archivo, sin_quorum, ahora, quorum=write_quorum)
 
         anterior = uow.files.get_live_by_name(archivo.directory_id, archivo.name)
         if anterior is not None and anterior.id != archivo.id:
@@ -168,6 +201,19 @@ def commit_file(uow: SqlUnitOfWork, owner_id: str, file_id: str) -> CommittedFil
 
         uow.files.mark_committed(file_id, ahora)
         uow.commit()
+
+        copias = uow.blocks.stored_replica_counts(file_id)
+        incompletos = [b for b, c in copias.items() if c < replication_factor]
+        log.info(
+            "replication.quorum_met",
+            file_id=file_id,
+            block_count=len(copias),
+            quorum=write_quorum,
+            replication_factor=replication_factor,
+            min_replicas=min(copias.values()) if copias else 0,
+            under_replicated_blocks=len(incompletos),
+            duration_ms=round((time.perf_counter() - inicio) * 1000, 3),
+        )
 
         ruta = absolute_path(uow.directories, archivo.directory_id).child(archivo.name)
         return CommittedFile(

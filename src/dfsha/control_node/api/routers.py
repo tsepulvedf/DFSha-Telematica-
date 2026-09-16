@@ -111,6 +111,7 @@ def cluster_status(uow: QueryUow, user: CurrentUser, settings: Settings) -> Clus
             settings.suspect_after_ms, settings.dead_after_ms
         ),
     )
+    salud = cluster_queries.replication_health(uow, settings.replication_factor)
     return ClusterStatusResponse(
         nodes=[
             DataNodeStatus(
@@ -130,8 +131,11 @@ def cluster_status(uow: QueryUow, user: CurrentUser, settings: Settings) -> Clus
             for n in nodos
         ],
         replication_factor=settings.replication_factor,
+        write_quorum=settings.write_quorum,
         suspect_after_ms=settings.suspect_after_ms,
         dead_after_ms=settings.dead_after_ms,
+        under_replicated_blocks=salud.under_replicated,
+        critical_blocks=salud.critical,
     )
 
 
@@ -173,8 +177,10 @@ def ls(path: str, uow: QueryUow, user: CurrentUser) -> LsResponse:
 
 
 @fs_router.get("/stat")
-def stat(path: str, uow: QueryUow, user: CurrentUser) -> StatResponse:
-    s = namespace_queries.stat(uow, user.user_id, path)
+def stat(path: str, uow: QueryUow, user: CurrentUser, settings: Settings) -> StatResponse:
+    s = namespace_queries.stat(
+        uow, user.user_id, path, replication_factor=settings.replication_factor
+    )
     return StatResponse(
         path=s.path,
         type=s.type,
@@ -182,6 +188,10 @@ def stat(path: str, uow: QueryUow, user: CurrentUser) -> StatResponse:
         block_size=s.block_size,
         block_count=s.block_count,
         created_at=s.created_at,
+        replication_state=s.replication_state,
+        min_replicas=s.min_replicas,
+        max_replicas=s.max_replicas,
+        replication_factor=s.replication_factor,
     )
 
 
@@ -248,8 +258,16 @@ def create_file(
 
 
 @files_router.post("/{file_id}/commit")
-def commit_file(file_id: str, uow: Uow, user: CurrentUser) -> CommitResponse:
-    confirmado = file_commands.commit_file(uow, user.user_id, file_id)
+def commit_file(
+    file_id: str, uow: Uow, user: CurrentUser, settings: Settings
+) -> CommitResponse:
+    confirmado = file_commands.commit_file(
+        uow,
+        user.user_id,
+        file_id,
+        write_quorum=settings.write_quorum,
+        replication_factor=settings.replication_factor,
+    )
     return CommitResponse(
         path=confirmado.path, size=confirmado.size, block_count=confirmado.block_count
     )

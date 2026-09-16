@@ -43,6 +43,13 @@ def build_settings(tmp_path: FsPath, **overrides) -> ControlNodeSettings:
         write_ttl_seconds=600,
         log_level="WARNING",
         grpc_port=puerto_libre(),
+        # Se fijan a mano y no se dejan al default. Desde la Etapa 3 el default es R=3 y
+        # W=2, pero la mayoria de estas pruebas levantan UN DataNode: con R=3 la
+        # colocacion fallaria antes de llegar a lo que cada prueba quiere comprobar.
+        # Las pruebas de replicacion piden R=3 explicitamente, que es como debe ser:
+        # quien necesita tres nodos, los levanta.
+        replication_factor=1,
+        write_quorum=1,
     )
     valores.update(overrides)
     return ControlNodeSettings(**valores)

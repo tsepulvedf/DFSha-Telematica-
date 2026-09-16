@@ -159,9 +159,14 @@ class TestIntegridad:
         assert respuesta.json()["code"] == "checksum_mismatch"
 
         # Y como no se almaceno, el commit no puede confirmar el archivo.
+        #
+        # Se afirma sobre el `code`, que es el contrato estable, y no sobre el texto del
+        # mensaje. La Etapa 3 cambio esa prosa ("faltan bloques" -> "no alcanzan el
+        # quorum de escritura") porque ahora un bloque puede tener copias y aun asi no
+        # bastar; el codigo no cambio, y es lo que un cliente programaria contra el.
         with pytest.raises(Exception) as excinfo:
             api.commit_file(plan.file_id)
-        assert "blocks_not_stored" in str(excinfo.value) or "faltan bloques" in str(excinfo.value)
+        assert getattr(excinfo.value, "code", "") == "blocks_not_stored"
 
     def test_falta_la_cabecera_de_checksum(self, cluster: Cluster, api: ControlApi) -> None:
         plan = api.create_file("/sin-checksum.bin", 10)

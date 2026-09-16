@@ -484,17 +484,77 @@ class SqlBlockRepository:
         return True
 
     def pending_block_ids(self, file_id: str) -> list[str]:
-        almacenados = (
-            select(BlockReplicaRow.block_id)
+        """Bloques sin NINGUNA replica almacenada. Equivale a `blocks_below_quorum(1)`."""
+        return self.blocks_below_quorum(file_id, quorum=1)
+
+    def blocks_below_quorum(self, file_id: str, quorum: int) -> list[str]:
+        """Bloques del archivo con menos de `quorum` replicas en estado STORED.
+
+        Esta consulta es la que decide si un `commit` pasa, y por eso cuenta replicas en
+        vez de mirar si hay alguna: con W=2 y R=3, un bloque con una sola copia no vale,
+        aunque exista. Y con dos si vale, aunque falte la tercera.
+
+        Un bloque sin ninguna fila de replica tambien sale aqui, porque su cuenta es 0.
+        """
+        almacenadas = (
+            select(
+                BlockReplicaRow.block_id.label("block_id"),
+                func.count().label("copias"),
+            )
             .where(BlockReplicaRow.state == ReplicaState.STORED.value)
-            .scalar_subquery()
+            .group_by(BlockReplicaRow.block_id)
+            .subquery()
         )
         rows = self._session.scalars(
             select(BlockRow.block_id)
-            .where(BlockRow.file_id == file_id, BlockRow.block_id.not_in(almacenados))
+            .outerjoin(almacenadas, almacenadas.c.block_id == BlockRow.block_id)
+            .where(
+                BlockRow.file_id == file_id,
+                func.coalesce(almacenadas.c.copias, 0) < quorum,
+            )
             .order_by(BlockRow.index)
         )
         return list(rows)
+
+    def stored_replica_counts(self, file_id: str) -> dict[str, int]:
+        """Cuantas copias STORED tiene cada bloque del archivo.
+
+        Alimenta el estado de replicacion que muestra `stat`. Se deriva contando filas,
+        nunca de una columna de estado guardada: una columna asi se queda vieja en cuanto
+        una re-replicacion termina y nadie se acuerda de actualizarla.
+        """
+        filas = self._session.execute(
+            select(BlockRow.block_id, func.count(BlockReplicaRow.block_id))
+            .outerjoin(
+                BlockReplicaRow,
+                (BlockReplicaRow.block_id == BlockRow.block_id)
+                & (BlockReplicaRow.state == ReplicaState.STORED.value),
+            )
+            .where(BlockRow.file_id == file_id)
+            .group_by(BlockRow.block_id)
+        )
+        return {block_id: copias for block_id, copias in filas}
+
+    def live_replica_counts(self) -> list[int]:
+        """Copias STORED de cada bloque de un archivo COMMITTED.
+
+        Solo archivos COMMITTED: los bloques de una reserva en curso todavia se estan
+        subiendo, y contarlos como sub-replicados haria que el numero del cluster
+        parpadeara con cada `put` en vuelo. Los de archivos DELETED son basura del GC, no
+        replicacion que falte.
+        """
+        filas = self._session.execute(
+            select(BlockRow.block_id, func.count(BlockReplicaRow.block_id))
+            .join(FileRow, FileRow.id == BlockRow.file_id)
+            .outerjoin(
+                BlockReplicaRow,
+                (BlockReplicaRow.block_id == BlockRow.block_id)
+                & (BlockReplicaRow.state == ReplicaState.STORED.value),
+            )
+            .where(FileRow.state == FileState.COMMITTED.value)
+            .group_by(BlockRow.block_id)
+        )
+        return [copias for _, copias in filas]
 
     def list_orphans(self, now: datetime) -> list[tuple[Block, list[BlockReplica]]]:
         huerfanos = self._session.scalars(
