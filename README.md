@@ -332,6 +332,16 @@ dfsha cluster
 Los críticos se cuentan aparte de los sub-replicados porque **no cuestan lo mismo**: uno
 con dos copias todavía tolera una caída; uno con una sola está a un fallo de desaparecer.
 
+> **Puede aparecer `FULLY_REPLICATED (3-4 de 3)`, y es normal.** Si un nodo muere, se
+> repone su copia y luego el nodo **vuelve** con su disco intacto, sus réplicas se
+> readmiten y el bloque queda con una copia de más. Es la otra cara de la propiedad que
+> hace que una reincorporación normal no cueste una re-replicación.
+>
+> Esa copia extra **no la recoge el GC**, que solo recoge bloques de archivos borrados y
+> reservas vencidas: el bloque pertenece a un archivo vivo. Cuesta disco, no corrección.
+> Quitarla automáticamente significaría que el ControlNode borra datos por su cuenta, que
+> es justo lo que el diseño no hace.
+
 ### Re-replicación: tres frenos
 
 Cuando un nodo muere de verdad, sus copias se rehacen solas. El mecanismo tiene más

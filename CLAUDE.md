@@ -524,6 +524,49 @@ tambien los de cliente, porque el mismo proceso sirve las dos cosas. `gen_certs.
 el pipeline falla en el handshake en vez de en el `connect`, que es un fallo distinto con
 el mismo efecto.
 
+### Sobre-replicacion tras una reincorporacion: estado esperable
+
+Observado en la validacion en Docker del Bloque B. `dfsha stat` mostro
+`FULLY_REPLICATED (3-4 de 3 copias por bloque)`. **No es una anomalia.** La secuencia:
+
+1. Un DataNode muere. El evaluador marca sus replicas `MISSING` — **no las borra**, que es
+   la decision 8 de la Etapa 2.
+2. Pasada la gracia, la re-replicacion pone una copia nueva en otro nodo. El bloque vuelve
+   a tener 3 copias vivas, mas la fila `MISSING` del caido.
+3. El nodo **vuelve** con su disco intacto y manda un report completo. `apply_block_report`
+   trata un report completo como la verdad sobre ese disco, asi que la fila `MISSING`
+   vuelve a `STORED`.
+4. El bloque se queda con **4 copias** y R=3.
+
+El estado de replicacion se deriva del bloque **peor** replicado, asi que el archivo sigue
+siendo `FULLY_REPLICATED`: tener de mas en un bloque no empeora a ninguno. El rango
+`3-4` se muestra a proposito — un numero plano escondería que los bloques no estan todos
+igual.
+
+**Que la fila `MISSING` sobreviva es lo que hace que una reincorporacion normal NO cueste
+una re-replicacion.** Esta sobre-replicacion es la otra cara de esa misma propiedad: la
+reincorporacion llego tarde, cuando la copia ya se habia repuesto.
+
+#### Y NO se limpia sola. Esto corrige la intuicion natural
+
+Parece que el GC lo recogera, y **no lo hace**: el GC recoge bloques de archivos `DELETED`
+y de reservas vencidas (`list_orphans`), y este bloque pertenece a un archivo `COMMITTED` y
+vivo. **La cuarta copia se queda.** Cuesta disco hasta que alguien decida quitarla; no
+cuesta correccion, y la durabilidad solo mejora.
+
+Tampoco es un huerfano ni una divergencia: `divergence.unknown_block` es para un bloque que
+el metadato **no asocia** a ese nodo, y aqui si lo asocia, porque la fila nunca se borro.
+
+Quitar la copia sobrante de forma automatica violaria la decision 8 de la Etapa 2 —el
+ControlNode no borra datos por una divergencia— y la violaria en el peor sitio posible:
+para deshacer una redundancia que el propio sistema acaba de conseguir. Si algun dia se
+recortan las copias sobrantes, tiene que ser un mecanismo nuevo y deliberado, con su
+propia decision escrita.
+
+Fijado en `tests/unit/test_sobrereplicacion.py`, que ademas blinda lo que **no** debe
+pasar: no se encola re-replicacion, no se cuenta como sub-replicado ni critico, no se
+registra divergencia, y el GC no lo lista.
+
 ### Enrutado CQRS: que consulta va a donde
 
 La separacion `commands/` / `queries/` existe desde la Etapa 1. Aqui se cobra.
