@@ -158,6 +158,65 @@ Y las que la Etapa 2 deja para la Etapa 3:
 - `select(block_size, replication_factor)` no cambia de firma: la Etapa 3 solo sube el
   default de `DFSHA_REPLICATION_FACTOR`, que hoy es 1.
 
+### Decisiones de la Etapa 3 — Bloque A
+
+1. **PostgreSQL para todo menos las pruebas unitarias.** SQLite bloquea la base entera
+   al escribir y con R=3 las escrituras de `block_replicas` se triplican; ademas un
+   fichero local no lo comparten dos ControlNodes en maquinas distintas. Sin base
+   compartida no hay alta disponibilidad. SQLite sobrevive donde sigue siendo mejor: en
+   las pruebas rapidas, en memoria, sin nada que conservar.
+2. **El esquema lo migra Alembic; el ControlNode solo comprueba.** Con tres instancias
+   arrancando a la vez contra la misma base, migrar desde cada una seria una carrera.
+   Migra el servicio `migrate`, de un solo uso; cada ControlNode verifica que la base
+   esta en la ultima revision y falla pronto con el comando exacto si no. La regla de
+   una linea: **PostgreSQL se migra, SQLite se crea con `create_all`**.
+3. **`test_migracion_deja_el_mismo_esquema_que_los_modelos` es lo que hace util a
+   Alembic.** Compara la base migrada contra `models.py` con `compare_metadata` y exige
+   cero diferencias. Sin ella, anadir una columna y olvidar la revision pasa todas las
+   pruebas (que usan `create_all`) y falla solo al arrancar contra PostgreSQL.
+4. **La promocion de la replica de PostgreSQL es manual** (`deploy/RUNBOOK-postgres.md`).
+   Un failover automatico correcto necesita un arbitro externo, proteccion contra doble
+   promocion y una forma de avisar a los clientes: es otro proyecto. No confundirlo con
+   el liderazgo del ControlNode, que si es automatico porque el ControlNode no tiene
+   estado propio.
+5. **`DFSHA_DB_REPLICA_URL` vacia es un modo soportado**, no una degradacion: sin ella
+   `read_engine is write_engine` y el sistema se comporta como en las etapas anteriores.
+   Es deliberado, y es lo que convierte el recorte numero 1 del alcance en borrar una
+   variable de entorno en vez de deshacer codigo.
+6. **El rol de replicacion de PostgreSQL es distinto del de la aplicacion.** Solo puede
+   replicar: filtrarlo no da acceso al metadato. Su clave va en un `.pgpass` con
+   permisos 0600, nunca en la linea de comandos, que cualquiera ve con `ps`.
+
+### Enrutado CQRS: que consulta va a donde
+
+La separacion `commands/` / `queries/` existe desde la Etapa 1. Aqui se cobra.
+
+| Operacion | Destino | Por que |
+|---|---|---|
+| `ls`, `stat`, `open`, `cluster/status` | **replica** | Consultas puras. Son el grueso del trafico de lectura |
+| Cualquiera de las anteriores con `X-DFSha-Read-LSN` por delante de la replica | **primario** | Read-your-writes: la replica todavia no tiene lo que este cliente escribio |
+| Todos los comandos (`mkdir`, `rm`, `mv`, `create`, `commit`, `abort`) | **primario** | Escriben |
+| `POST /internal/v1/blocks/{id}/stored` | **primario** | Escribe |
+| `GET /internal/v1/gc/orphan-blocks` | **primario** | Es una consulta, pero su respuesta dispara un **borrado en disco**. Una replica retrasada podria listar un bloque que ya no toca borrar. La regla: una consulta cuya respuesta dispara una escritura destructiva no se sirve desde la replica |
+| `auth/register`, `auth/login` | **primario** | `register` escribe; `login` lee credenciales recien creadas, que es el caso exacto de read-your-writes |
+
+**Read-your-writes, en concreto.** La replicacion es asincrona: un `mkdir /a` seguido de
+un `ls /` puede preguntarle a una replica que aun no reprodujo el `mkdir`. Eso no es un
+poco de retraso, es mentirle al cliente sobre su propia escritura. El mecanismo:
+
+1. Tras cada comando, un middleware del ControlNode devuelve `pg_current_wal_lsn()` en
+   `X-DFSha-Write-LSN`. Va en middleware y no en cada caso de uso porque tiene que
+   medirse **despues** del commit.
+2. El cliente lo guarda en `session.json` (cada invocacion de `dfsha` es un proceso
+   nuevo: en memoria no serviria) y lo reenvia como `X-DFSha-Read-LSN`.
+3. El ControlNode compara con `pg_last_wal_replay_lsn()` de la replica. Si va por detras,
+   la consulta se atiende desde el primario.
+
+El coste cae **solo sobre los clientes que acaban de escribir**: quien no manda LSN va
+derecho a la replica sin consulta adicional. Y todos los caminos de fallo caen del lado
+seguro: un LSN mal formado, una replica inalcanzable o un `DFSHA_DB_REPLICA_URL` que por
+error apunta a un primario acaban sirviendo desde el primario.
+
 ---
 
 ## 4. Stack

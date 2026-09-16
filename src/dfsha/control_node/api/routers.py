@@ -43,7 +43,14 @@ from dfsha.control_node.queries import namespace as namespace_queries
 
 from dfsha.control_node.domain.membership import MembershipThresholds
 
-from .deps import CurrentUser, Placement, Settings, Uow, require_internal_secret
+from .deps import (
+    CurrentUser,
+    Placement,
+    QueryUow,
+    Settings,
+    Uow,
+    require_internal_secret,
+)
 
 __all__ = [
     "auth_router",
@@ -89,7 +96,7 @@ def login(body: LoginRequest, uow: Uow, settings: Settings) -> TokenResponse:
 
 
 @cluster_router.get("/status")
-def cluster_status(uow: Uow, user: CurrentUser, settings: Settings) -> ClusterStatusResponse:
+def cluster_status(uow: QueryUow, user: CurrentUser, settings: Settings) -> ClusterStatusResponse:
     """Estado de todos los DataNodes.
 
     Pide token como el resto de `/api/v1`, pero no filtra por usuario: la topologia del
@@ -129,7 +136,7 @@ def cluster_status(uow: Uow, user: CurrentUser, settings: Settings) -> ClusterSt
 
 
 @fs_router.get("/ls")
-def ls(path: str, uow: Uow, user: CurrentUser) -> LsResponse:
+def ls(path: str, uow: QueryUow, user: CurrentUser) -> LsResponse:
     entradas = namespace_queries.ls(uow, user.user_id, path)
     return LsResponse(
         entries=[
@@ -140,7 +147,7 @@ def ls(path: str, uow: Uow, user: CurrentUser) -> LsResponse:
 
 
 @fs_router.get("/stat")
-def stat(path: str, uow: Uow, user: CurrentUser) -> StatResponse:
+def stat(path: str, uow: QueryUow, user: CurrentUser) -> StatResponse:
     s = namespace_queries.stat(uow, user.user_id, path)
     return StatResponse(
         path=s.path,
@@ -229,7 +236,7 @@ def abort_file(file_id: str, uow: Uow, user: CurrentUser) -> Response:
 
 
 @files_router.get("/open")
-def open_file(path: str, uow: Uow, user: CurrentUser) -> OpenFileResponse:
+def open_file(path: str, uow: QueryUow, user: CurrentUser) -> OpenFileResponse:
     plan = file_queries.open_file(uow, user.user_id, path)
     return OpenFileResponse(
         file_id=plan.file_id,
@@ -266,6 +273,14 @@ def block_stored(block_id: str, body: BlockStoredRequest, uow: Uow) -> Response:
 
 @internal_router.get("/gc/orphan-blocks")
 def orphan_blocks(uow: Uow) -> OrphanBlocksResponse:
+    """Es una consulta, pero va al PRIMARIO a proposito.
+
+    El GC no lee esta lista para mostrarla: la lee para **borrar bloques del disco**. Una
+    replica retrasada podria incluir un bloque cuyo archivo se acaba de recrear, y el
+    resultado no seria una pantalla desactualizada sino un borrado que no tocaba. La
+    regla de la Etapa 3 es que las consultas cuya respuesta dispara una escritura
+    destructiva no se sirven desde la replica.
+    """
     return OrphanBlocksResponse(
         blocks=[
             OrphanBlock(

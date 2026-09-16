@@ -11,7 +11,7 @@ from __future__ import annotations
 
 from contextlib import asynccontextmanager
 
-from fastapi import FastAPI
+from fastapi import FastAPI, Request
 
 from dfsha.common.logging import configure_logging, get_logger
 from dfsha.control_node.config import ControlNodeSettings, load_settings_or_exit
@@ -23,6 +23,11 @@ from dfsha.control_node.repositories.database import (
 from dfsha.control_node.domain.membership import MembershipThresholds
 from dfsha.control_node.repositories.sql import SqlUnitOfWork
 from dfsha.control_node.services.membership_monitor import MembershipMonitor
+from dfsha.control_node.services.read_routing import (
+    WRITE_LSN_HEADER,
+    ReadRouter,
+    current_write_lsn,
+)
 
 from .api.errors import install_error_handlers
 from .api.grpc import ControlPlaneServicer, build_grpc_server
@@ -52,6 +57,16 @@ def create_app(settings: ControlNodeSettings | None = None) -> FastAPI:
     engine = build_engine(settings.db_url)
     prepare_schema(engine)
     session_factory = build_session_factory(engine)
+
+    # Lado de lectura de CQRS. Sin replica configurada, `read_engine is engine` y el
+    # sistema se comporta exactamente como en las etapas anteriores. El esquema de la
+    # replica NO se prepara aqui: lo recibe del primario por replicacion, y tocarlo
+    # seria escribir en una base de solo lectura.
+    read_engine = engine
+    read_session_factory = session_factory
+    if settings.db_replica_url:
+        read_engine = build_engine(settings.db_replica_url, readonly=True)
+        read_session_factory = build_session_factory(read_engine)
 
     thresholds = MembershipThresholds.from_millis(
         settings.suspect_after_ms, settings.dead_after_ms
@@ -86,6 +101,7 @@ def create_app(settings: ControlNodeSettings | None = None) -> FastAPI:
         log.info(
             "control_node.start",
             db_url=settings.db_url.split("://", 1)[0],  # sin credenciales en el log
+            read_replica=bool(settings.db_replica_url),
             block_size=settings.block_size,
             write_ttl_seconds=settings.write_ttl_seconds,
             grpc_port=settings.grpc_port,
@@ -100,6 +116,8 @@ def create_app(settings: ControlNodeSettings | None = None) -> FastAPI:
         # `grace` da margen a los streams de heartbeat abiertos para cerrarse solos en
         # vez de cortarlos a mitad y llenar los logs de los DataNodes de errores.
         grpc_server.stop(grace=2.0).wait(timeout=5.0)
+        if read_engine is not engine:
+            read_engine.dispose()
         engine.dispose()
         log.info("control_node.stop")
 
@@ -112,7 +130,44 @@ def create_app(settings: ControlNodeSettings | None = None) -> FastAPI:
 
     app.state.settings = settings
     app.state.engine = engine
+    app.state.read_engine = read_engine
     app.state.uow_factory = lambda: SqlUnitOfWork(session_factory)
+    app.state.query_uow_factory = (
+        (lambda: SqlUnitOfWork(read_session_factory))
+        if settings.db_replica_url
+        else None
+    )
+    app.state.read_router = ReadRouter(
+        app.state.uow_factory, app.state.query_uow_factory
+    )
+
+    @app.middleware("http")
+    async def sellar_lsn_de_escritura(request: Request, call_next):
+        """Tras un comando, devuelve el LSN del primario en una cabecera.
+
+        El cliente lo guarda y lo reenvia en sus consultas, y eso es lo que le garantiza
+        leer sus propias escrituras aunque le atienda otro ControlNode contra la replica.
+        Va en un middleware y no en cada caso de uso porque tiene que medirse DESPUES del
+        commit: el LSN que importa es el que ya incluye la transaccion recien confirmada.
+
+        Con SQLite no hay LSN y no se anade cabecera; el mecanismo queda inerte.
+        """
+        respuesta = await call_next(request)
+
+        if request.method in ("GET", "HEAD", "OPTIONS") or respuesta.status_code >= 400:
+            return respuesta
+        if not settings.db_replica_url:
+            return respuesta
+
+        uow = app.state.uow_factory()
+        try:
+            with uow:
+                lsn = current_write_lsn(uow)
+            if lsn:
+                respuesta.headers[WRITE_LSN_HEADER] = lsn
+        except Exception as exc:  # pragma: no cover - no puede tumbar una respuesta ok
+            log.warning("write_lsn.unavailable", error=type(exc).__name__)
+        return respuesta
 
     install_error_handlers(app)
 

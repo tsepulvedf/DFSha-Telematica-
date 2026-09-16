@@ -22,29 +22,66 @@ from dfsha.common.dto import (
 )
 from dfsha.common.errors import DFShaError
 
-from .session import Session
+from .session import Session, SessionStore
 
-__all__ = ["ControlApi", "resolve_path"]
+__all__ = ["ControlApi", "resolve_path", "READ_LSN_HEADER", "WRITE_LSN_HEADER"]
 
 API = "/api/v1"
 
+#: Read-your-writes. El ControlNode devuelve el LSN del primario tras cada comando y el
+#: cliente lo reenvia en sus consultas; con eso, una replica retrasada no puede negarle
+#: al cliente una escritura que acaba de hacer. Ver services/read_routing.py.
+WRITE_LSN_HEADER = "X-DFSha-Write-LSN"
+READ_LSN_HEADER = "X-DFSha-Read-LSN"
+
 
 class ControlApi:
-    def __init__(self, session: Session, timeout: float = 60.0) -> None:
+    def __init__(
+        self,
+        session: Session,
+        timeout: float = 60.0,
+        store: SessionStore | None = None,
+    ) -> None:
         self.session = session
         self.base = session.control_url.rstrip("/")
         self._timeout = timeout
+        #: Si se pasa, el LSN de escritura se persiste en cuanto llega. Sin el, el
+        #: mecanismo sigue siendo correcto dentro de un mismo proceso.
+        self._store = store
 
     # --- Transporte --------------------------------------------------------
 
     def _request(self, method: str, url: str, autenticado: bool = True, **kwargs):
-        cabeceras = self.session.headers if autenticado else {}
+        cabeceras = dict(self.session.headers) if autenticado else {}
+        if self.session.last_write_lsn:
+            cabeceras[READ_LSN_HEADER] = self.session.last_write_lsn
+
         respuesta = httpx.request(
             method, f"{self.base}{url}", headers=cabeceras, timeout=self._timeout, **kwargs
         )
         if respuesta.status_code >= 400:
             raise _to_error(respuesta)
+
+        self._recordar_lsn(respuesta)
         return respuesta
+
+    def _recordar_lsn(self, respuesta: httpx.Response) -> None:
+        """Guarda el LSN que devolvio el ControlNode tras un comando.
+
+        Solo avanza: el ControlNode devuelve un LSN monotono, pero dos peticiones
+        concurrentes pueden llegar desordenadas al cliente, y quedarse con el menor
+        anularia la garantia para la escritura mas reciente.
+        """
+        nuevo = respuesta.headers.get(WRITE_LSN_HEADER)
+        if not nuevo or nuevo == self.session.last_write_lsn:
+            return
+        anterior = _lsn_a_entero(self.session.last_write_lsn)
+        if anterior is not None and (_lsn_a_entero(nuevo) or 0) < anterior:
+            return
+
+        self.session.last_write_lsn = nuevo
+        if self._store is not None:
+            self._store.save(self.session)
 
     # --- Autenticacion -----------------------------------------------------
 
@@ -141,6 +178,19 @@ def _to_error(respuesta: httpx.Response) -> DFShaError:
     error = DFShaError(mensaje, status=respuesta.status_code)
     error.code = codigo  # type: ignore[misc]
     return error
+
+
+def _lsn_a_entero(lsn: str | None) -> int | None:
+    """'16/B374D848' -> entero comparable. `None` si no es un LSN."""
+    if not lsn:
+        return None
+    alto, _, bajo = lsn.partition("/")
+    if not bajo:
+        return None
+    try:
+        return (int(alto, 16) << 32) + int(bajo, 16)
+    except ValueError:
+        return None
 
 
 def resolve_path(session: Session, path: str | None) -> str:

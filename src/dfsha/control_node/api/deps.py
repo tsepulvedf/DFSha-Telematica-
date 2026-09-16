@@ -21,17 +21,21 @@ from dfsha.control_node.services.placement import (
     BlockPlacementPolicy,
     LeastLoadedPlacement,
 )
+from dfsha.control_node.services.read_routing import ReadRouter
 
 __all__ = [
     "INTERNAL_SECRET_HEADER",
     "get_settings_dep",
     "get_uow_factory",
     "get_uow",
+    "get_read_router",
+    "get_query_uow",
     "get_placement",
     "current_user",
     "require_internal_secret",
     "Settings",
     "Uow",
+    "QueryUow",
     "UowFactory",
     "Placement",
     "CurrentUser",
@@ -57,6 +61,26 @@ def get_uow(
     exactamente lo que dura la operacion y no lo que dura la peticion HTTP.
     """
     return factory()
+
+
+def get_read_router(request: Request) -> ReadRouter:
+    return request.app.state.read_router
+
+
+def get_query_uow(
+    router: Annotated[ReadRouter, Depends(get_read_router)],
+    x_dfsha_read_lsn: Annotated[str | None, Header()] = None,
+) -> SqlUnitOfWork:
+    """Unidad de trabajo para el LADO DE CONSULTA.
+
+    Va a la replica salvo que el cliente traiga un LSN que la replica todavia no ha
+    reproducido, en cuyo caso se atiende desde el primario. Ver `services/read_routing`.
+
+    Que sea una dependencia distinta de `get_uow` y no un parametro de esta es lo que
+    hace imposible que un comando acabe por error contra la replica: el tipo del
+    parametro del endpoint dice a que lado pertenece.
+    """
+    return router.for_read(x_dfsha_read_lsn).uow
 
 
 def get_placement(
@@ -107,6 +131,7 @@ def require_internal_secret(
 
 Settings = Annotated[ControlNodeSettings, Depends(get_settings_dep)]
 Uow = Annotated[SqlUnitOfWork, Depends(get_uow)]
+QueryUow = Annotated[SqlUnitOfWork, Depends(get_query_uow)]
 UowFactory = Annotated[Callable[[], SqlUnitOfWork], Depends(get_uow_factory)]
 Placement = Annotated[BlockPlacementPolicy, Depends(get_placement)]
 CurrentUser = Annotated[TokenClaims, Depends(current_user)]

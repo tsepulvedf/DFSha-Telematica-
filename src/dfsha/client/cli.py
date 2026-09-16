@@ -57,8 +57,11 @@ def _session() -> Session:
 
 
 def _api() -> tuple[ControlApi, Session]:
-    sesion = _session()
-    return ControlApi(sesion), sesion
+    almacen = _store()
+    sesion = almacen.load(os.environ.get("DFSHA_CONTROL_URL", DEFAULT_CONTROL_URL))
+    # El almacen viaja con la API para que el LSN de la ultima escritura se persista en
+    # cuanto llega: cada invocacion de `dfsha` es un proceso nuevo.
+    return ControlApi(sesion, store=almacen), sesion
 
 
 def _fallar(error: DFShaError) -> None:

@@ -28,6 +28,13 @@ class Session:
     token: str | None = None
     username: str | None = None
     cwd: str = "/"
+    #: LSN del WAL de PostgreSQL de la ultima escritura de ESTE cliente.
+    #:
+    #: Se guarda en disco y no en memoria porque cada invocacion de `dfsha` es un
+    #: proceso nuevo: sin persistirlo, un `mkdir /a` seguido de un `ls /` en la linea
+    #: siguiente no tendria forma de saber que hay una escritura que la replica quiza
+    #: no ha reproducido, que es justo el caso que esto existe para cubrir.
+    last_write_lsn: str | None = None
     #: De donde salio (o saldria) esta sesion. Solo sirve para poder decirlo en los
     #: mensajes de error: saber que fichero se miro ahorra la mitad del diagnostico
     #: cuando la sesion no persiste, por ejemplo dentro de un contenedor.
@@ -73,6 +80,7 @@ class SessionStore:
             token=datos.get("token"),
             username=datos.get("username"),
             cwd=datos.get("cwd", "/"),
+            last_write_lsn=datos.get("last_write_lsn"),
             session_path=str(self.path),
         )
 
@@ -86,6 +94,7 @@ class SessionStore:
                         "token": session.token,
                         "username": session.username,
                         "cwd": session.cwd,
+                        "last_write_lsn": session.last_write_lsn,
                     },
                     indent=2,
                 ),
