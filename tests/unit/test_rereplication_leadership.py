@@ -92,7 +92,11 @@ def _cluster_con_hueco(uow_factory, ahora: datetime) -> str:
         nodos = []
         for indice in range(4):
             nodo = uow.data_nodes.register(
-                advertise_url=f"http://127.0.0.1:800{indice + 1}",
+                # Las dos direcciones son DISTINTAS a proposito: asi cualquier camino que
+                # use la equivocada se ve en la assercion, en vez de pasar porque las dos
+                # coinciden. Es el mismo error que en Docker, reproducido en una fixture.
+                advertise_url=f"http://localhost:800{indice + 1}",
+                peer_url=f"http://data-node-{indice + 1}:8001",
                 capacity_bytes=10 * 1024**3,
                 now=ahora - timedelta(hours=1),
                 fault_domain=f"zona-{indice}",
@@ -181,18 +185,19 @@ def test_el_lider_vigente_si_programa_y_despacha(uow_factory) -> None:
 
     asignaciones = dispatch(uow_factory(), fencing, POLITICA, UMBRALES, now=T0)
 
-    assert len(asignaciones) == 2, "faltaban dos copias para llegar a R=3"
-    for asignacion in asignaciones:
-        assert asignacion.block_id == block_id
+    # UNA copia por pasada, no las dos que faltan: la cola guarda una tarea viva por
+    # bloque, y dos despachos sobre la misma fila se pisarian. La segunda copia se
+    # programa cuando la primera termine. Ver `assign_targets`.
+    assert len(asignaciones) == 1
+    assert asignaciones[0].block_id == block_id
 
     # Y la eleccion quedo REGISTRADA en block_replicas, que es lo que permite que el
     # destino pueda confirmar su copia cuando la termine.
     with uow_factory() as uow:
         replicas = uow.blocks.list_replicas([block_id])[block_id]
         pendientes = [r for r in replicas if r.state is ReplicaState.PENDING]
-        assert len(pendientes) == 2
-        destinos = {a.target_node_id for a in asignaciones}
-        assert {r.data_node_id for r in pendientes} == destinos
+        assert len(pendientes) == 1
+        assert pendientes[0].data_node_id == asignaciones[0].target_node_id
 
 
 def test_el_hueco_no_asentado_no_se_programa(uow_factory) -> None:
@@ -212,3 +217,42 @@ def test_el_hueco_no_asentado_no_se_programa(uow_factory) -> None:
     )
 
     assert encolados == 0
+
+
+def test_la_orden_lleva_la_direccion_de_PAR_del_origen(uow_factory) -> None:
+    """Contrato del segundo sitio donde el direccionamiento estaba roto.
+
+    `source_base_url` se la manda el ControlNode al nodo DESTINO para que descargue el
+    bloque del ORIGEN: es trafico DataNode -> DataNode. Con la direccion de cliente, en
+    contenedores el destino se descargaria de si mismo, porque `localhost` dentro de un
+    contenedor es ese contenedor.
+
+    Va aqui y no en las de integracion porque alli el planificador real despacha la copia
+    y el DataNode la completa en milisegundos: para cuando la prueba mirara la cola, la
+    tarea ya estaria cerrada. Una assercion de contrato no debe depender de ganarle una
+    carrera al propio sistema.
+    """
+    from datetime import timedelta as _td
+
+    from dfsha.control_node.commands.rereplication import pending_orders
+
+    _cluster_con_hueco(uow_factory, T0)
+    lease = acquire_or_renew(uow_factory(), "A", TIMINGS, now=T0)
+    assert lease is not None
+    fencing = Fencing("A", lease.epoch)
+
+    scan_and_enqueue(uow_factory(), fencing, POLITICA, UMBRALES, now=T0)
+    asignaciones = dispatch(uow_factory(), fencing, POLITICA, UMBRALES, now=T0)
+    assert asignaciones
+
+    with uow_factory() as uow:
+        ordenes = pending_orders(uow, asignaciones[0].target_node_id, _td(0), now=T0)
+        uow.commit()
+
+    assert ordenes.replicate, "no se construyo ninguna orden para el destino"
+    for orden in ordenes.replicate:
+        assert orden.source_base_url.startswith("http://data-node-"), (
+            f"la orden lleva {orden.source_base_url}, que es la direccion de CLIENTE: "
+            "en contenedores el destino se descargaria de si mismo"
+        )
+        assert "localhost" not in orden.source_base_url

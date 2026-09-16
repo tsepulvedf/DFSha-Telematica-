@@ -29,6 +29,20 @@ class DataNodeSettings(BaseSettings):
     #: el ControlNode se limita a repetirsela, porque los bytes van directos. Una sola
     #: direccion por nodo, fijada por el despliegue; ver la decision en CLAUDE.md.
     datanode_advertise_url: str = "http://localhost:8001"
+    #: Con que direccion se anuncia a OTROS DATANODES. Vacia = la misma del cliente.
+    #:
+    #: Existe desde la Etapa 3 porque aparecio un hecho nuevo: hasta la Etapa 2 solo el
+    #: cliente hablaba con los DataNodes, y ahora los DataNodes hablan entre si (pipeline
+    #: de escritura y re-replicacion). Los dos grupos pueden estar en redes distintas: en
+    #: compose el cliente esta fuera (localhost:800N) y los vecinos dentro
+    #: (data-node-N:8001), y una sola direccion no puede ser correcta para los dos.
+    #:
+    #: Esto NO contradice la decision de la Etapa 2, que fue que el ControlNode no
+    #: infiriera la direccion segun el origen de la peticion. Aqui no hay inferencia: las
+    #: dos direcciones son estaticas y su destinatario se sabe por la ESTRUCTURA del
+    #: mensaje, no por quien llama.
+    datanode_peer_url: str = ""
+
     #: Cadena opaca que agrupa nodos que pueden caerse juntos. En local son etiquetas
     #: (local-1..local-4); en AWS, zonas de disponibilidad. El ControlNode solo compara
     #: igualdad, asi que el mismo codigo sirve para simular y para ser real.

@@ -188,9 +188,24 @@ class DataNode:
     #: UUID nuevo en cada arranque con disco vacio. Distinguir "volvio el mismo nodo" de
     #: "volvio con el disco perdido" es lo que decide si sus replicas se recuperan.
     boot_id: str = ""
+    #: Direccion alcanzable por OTROS DATANODES. Vacia = la misma que la del cliente.
+    #: Se lee siempre por `peer_base_url`, nunca directamente: leer el campo crudo es
+    #: como se cuela un `None` en una cadena de pipeline.
+    peer_url: str = ""
     last_heartbeat_at: datetime | None = None
     last_sequence: int = 0
     stats: NodeStats = field(default_factory=NodeStats)
+
+    @property
+    def peer_base_url(self) -> str:
+        """Con que direccion alcanzarle desde OTRO DataNode.
+
+        Unico punto de lectura, a proposito. Todo lo que sea trafico entre nodos —la
+        cadena del pipeline y el origen de una re-replicacion— tiene que pasar por aqui;
+        si en algun sitio aparece `advertise_url` en un camino nodo-a-nodo, es el error
+        que el `fix(addressing)` vino a arreglar.
+        """
+        return self.peer_url or self.advertise_url
 
     @property
     def is_alive(self) -> bool:

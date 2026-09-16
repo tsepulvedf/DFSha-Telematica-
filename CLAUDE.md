@@ -414,6 +414,116 @@ y por eso esa via **no confirma**: las filas del metadato se quitan en una pasad
 posterior, cuando conste que el bloque ya no esta en ningun disco. El ControlNode no borra
 metadato sobre una promesa.
 
+### Dos direcciones por nodo: la del cliente y la de sus pares
+
+Un fallo del Bloque B que solo se vio al validarlo en Docker, y que **estaba en dos
+sitios a la vez**: el pipeline de escritura y la re-replicacion. En contenedores no
+replicaba al subir *ni* se recuperaba de una caida.
+
+El sintoma: `dfsha put` fallaba con 409 «no alcanzan el quorum de escritura (W=2)», y
+`dfsha cluster` mostraba 50 bloques repartidos pero 50 replicas en total en vez de 150.
+Cada bloque quedaba con una copia. En los logs del DataNode:
+
+    "next_hop": "http://localhost:8002", "error": "ConnectError",
+    "error_detail": "[Errno 111] Connection refused"
+
+La causa: el plan llevaba las `advertise_url` (`localhost:800N`), que son validas **desde
+el host** y no desde dentro de un contenedor. DN1 reenviaba a `localhost:8002` y eso
+resolvia a **si mismo**. El trafico DataNode -> ControlNode si funcionaba, porque usa el
+nombre de servicio (`lb:8000`), y por eso el fallo parecia parcial.
+
+#### La decision
+
+El DataNode anuncia **dos** direcciones:
+
+- `DFSHA_DATANODE_ADVERTISE_URL` — alcanzable por el **cliente**. Sin cambios.
+- `DFSHA_DATANODE_PEER_URL` — alcanzable por **otros DataNodes**. Vacia = la misma que la
+  anterior, que es el despliegue donde cliente y nodos comparten red. No es un caso
+  degradado: es el caso simple.
+
+**Esto no contradice la decision de la Etapa 2, y la diferencia es fina pero es la que
+hay que defender.** Lo que la Etapa 2 rechazo fue que **el ControlNode infiriera** la
+direccion segun el **origen de la peticion**: eso metia en el plano de control una
+suposicion sobre la topologia de red del cliente, que rompe con NAT, tuneles o varias
+interfaces. Aqui **no hay ninguna inferencia**: las dos direcciones son **estaticas** y su
+**destinatario se sabe por la estructura del mensaje**, no por quien llama. El plan del
+cliente lleva siempre `advertise_url`; la cadena del pipeline lleva siempre `peer_url`. El
+ControlNode no elige: manda las dos y cada una va en su sitio.
+
+Y lo que lo fuerza es **un hecho nuevo**, no un cambio de opinion: en la Etapa 2 **solo el
+cliente hablaba con los DataNodes**; en la Etapa 3 **los DataNodes hablan entre si**. El
+conjunto de «quien tiene que alcanzar este nodo» crecio, y los dos grupos estan en redes
+distintas. Una sola direccion solo puede ser correcta para los dos si comparten red, que
+es justo lo que dejo de ser cierto.
+
+#### Donde va cada una
+
+| Camino | Direccion | Por que |
+|---|---|---|
+| Plan de escritura y de lectura (`replicas[].base_url`) | **cliente** | Los bytes van directos del cliente al DataNode |
+| Cadena del pipeline (`pipeline[]` del plan) | **par** | La recorre un DataNode reenviando a otro |
+| `source_base_url` de una orden de re-replicacion | **par** | El nodo destino descarga del origen |
+| `dfsha cluster`, mensajes de error | **cliente** | Es la que una persona puede probar con `curl` |
+| GC por REST (`/gc/orphan-blocks`) | **cliente** | Lo consume el script, que corre donde el cliente |
+| GC por el canal de control (`DeleteBlock`) | *ninguna* | La orden viaja por el stream del propio nodo |
+
+El **ControlNode no llama nunca a un DataNode**: todo su trafico va por el stream gRPC que
+abre el nodo. Por eso no hay direccionamiento ControlNode -> DataNode que equivocar, y por
+eso el inventario de arriba esta completo.
+
+`peer_base_url` en la entidad `DataNode` es el **unico** punto de lectura de la direccion
+de par. Si en algun camino nodo-a-nodo vuelve a aparecer `advertise_url`, es este mismo
+fallo otra vez.
+
+#### Por que las pruebas del Bloque B no lo atraparon
+
+Hay que decirlo sin rodeos: **pasaron con esto roto**. `start_cluster` levanta los cuatro
+DataNodes como hilos uvicorn **en el mismo proceso, sobre 127.0.0.1**, asi que la
+direccion que alcanza el cliente y la que alcanza un vecino son literalmente la misma. El
+reenvio funcionaba porque no habia forma de que no funcionara.
+
+`test_el_cliente_sube_los_bytes_una_sola_vez` comprobaba que el bloque acababa en tres
+discos. Eso era cierto, pero verificaba el **mecanismo** y no el **direccionamiento**: en
+esa topologia no se pueden distinguir. Daba una garantia mas debil de la que parecia dar.
+
+La cobertura se corrigio en `tests/integration/test_addressing.py`, en dos niveles:
+
+1. **Contrato**: que el plan separa las dos direcciones y que el cliente copia la cadena
+   **tal cual** en vez de deducirla de `replicas`. Es la assercion que habria fallado
+   desde el primer dia y no necesita red. La version para la re-replicacion vive en
+   `tests/unit/test_rereplication_leadership.py`, y va ahi por un motivo concreto: en un
+   cluster vivo el planificador despacha la copia y el DataNode la completa en
+   milisegundos, asi que la prueba perderia la carrera contra el propio sistema.
+2. **Escenario invertido** (`advertise_muerta=True`): un cluster donde la direccion de
+   cliente **no responde desde ningun sitio**. Es la inversion del caso de Docker y tiene
+   la misma propiedad util: cualquier camino nodo-a-nodo que use la direccion equivocada
+   falla. Permite reproducir en un solo proceso un fallo que solo se manifestaba con dos
+   redes. Misma tactica que `test_report_incremental_nunca_marca_missing` de la Etapa 2:
+   montar el escenario donde la implementacion incorrecta produce un sintoma visible.
+
+#### Un segundo fallo que destapo esa prueba
+
+Al escribir la comprobacion de contrato de la re-replicacion aparecio otro: **el dominio
+asignaba dos destinos para un bloque al que le faltaban dos copias, pero la cola solo
+guarda una tarea viva por bloque** (indice unico parcial). Los dos despachos caian sobre
+la misma fila y el segundo pisaba al primero: quedaba una copia programada en vez de dos,
+y una fila PENDING en `block_replicas` apuntando a un destino que nunca recibiria la
+orden.
+
+`assign_targets` respeta ahora el mismo invariante que el esquema (`max_per_block=1`): un
+bloque al que le faltan dos copias **recupera una por pasada**. Ademas de correcto es
+preferible, por el mismo motivo que los otros tres frenos: reparte la recuperacion en el
+tiempo en vez de concentrarla.
+
+#### Consecuencia para el Bloque C
+
+Los certificados tienen que cubrir **los nombres de par** (`data-node-N` en compose, las
+**IP privadas** en AWS), porque son los que el nodo que llama verifica contra el SAN. Y
+tambien los de cliente, porque el mismo proceso sirve las dos cosas. `gen_certs.py
+--hosts` esta para eso, y desde aqui los nombres de par **no son opcionales**: sin ellos
+el pipeline falla en el handshake en vez de en el `connect`, que es un fallo distinto con
+el mismo efecto.
+
 ### Enrutado CQRS: que consulta va a donde
 
 La separacion `commands/` / `queries/` existe desde la Etapa 1. Aqui se cobra.
@@ -502,8 +612,12 @@ rereplication_tasks(id, block_id, kind, state, source_node_id, target_node_id,
     bloque, que es lo que impide programar la misma copia dos veces cuando dos
     lideres se solapan durante un relevo
 
-data_nodes(id, base_url, capacity_bytes, used_bytes, state, registered_at)
-    state in {ALIVE, DEAD}
+data_nodes(id, advertise_url, peer_url, capacity_bytes, used_bytes, state,
+           registered_at, fault_domain, boot_id, stat_*)
+    state in {ALIVE, DEAD}   (SUSPECT se deriva, no se guarda)
+    advertise_url: alcanzable por el CLIENTE, UNIQUE
+    peer_url:      alcanzable por OTROS DATANODES; vacia = la misma. Sin UNIQUE,
+                   porque vacia en varios nodos a la vez es legitimo
 ```
 
 Dos desviaciones respecto al esquema y los contratos originales, ambas descubiertas al
@@ -723,6 +837,12 @@ el contenedor es solo una comodidad:
    **una sola direccion anunciada por nodo** (`DFSHA_DATANODE_ADVERTISE_URL`), elegida
    por la configuracion del despliegue. Quien quiera revertir esta decision en la
    Etapa 3 debe saber que el precio es ese, no un ajuste de una linea.
+
+   **Matiz de la Etapa 3, y conviene leerlo entero antes de creer que esto cambio.** El
+   DataNode anuncia ahora DOS direcciones, pero por un motivo distinto y sin volver a la
+   inferencia que aqui se rechazo: la segunda es para OTROS DATANODES, que en la Etapa 2
+   no hablaban entre si. El ControlNode sigue sin elegir segun el origen de la peticion.
+   Ver "Dos direcciones por nodo" mas abajo.
 
 2. La sesion no sobrevive entre invocaciones de `docker compose run --rm client`, pese
    al volumen montado en `/home/dfsha/.dfsha`, que es donde `DFSHA_HOME` apunta. Si

@@ -9,7 +9,7 @@ de caducidad, para que un cliente que se cae no deje el nombre bloqueado para si
 from __future__ import annotations
 
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import timedelta
 
 from dfsha.common.errors import InvalidPathError, NotFoundError
@@ -42,7 +42,13 @@ class PlannedBlock:
     block_id: str
     index: int
     size: int
-    replicas: list[tuple[str, str]]  # (data_node_id, base_url)
+    #: (data_node_id, base_url) con la direccion alcanzable por el CLIENTE.
+    replicas: list[tuple[str, str]]
+    #: Resto de la cadena del pipeline, con las direcciones alcanzables por OTROS
+    #: DATANODES. El cliente la copia tal cual a la cabecera y no construye nada: asi no
+    #: necesita saber nada de la topologia interna del cluster, que es lo mismo que decir
+    #: que no puede equivocarse al deducirla.
+    pipeline: list[str] = field(default_factory=list)
 
 
 @dataclass(frozen=True, slots=True)
@@ -130,7 +136,12 @@ def create_file(
                     block_id=block_id,
                     index=spec.index,
                     size=spec.size,
+                    # Al cliente, las direcciones que el puede alcanzar...
                     replicas=[(nodo.id, nodo.advertise_url) for nodo in destinos],
+                    # ...y para la cadena, las que se alcanzan entre nodos. Las dos son
+                    # estaticas: el ControlNode no elige cual mandar segun quien pregunte,
+                    # manda las dos y cada una va en su sitio del mensaje.
+                    pipeline=[nodo.peer_base_url for nodo in destinos[1:]],
                 )
             )
 

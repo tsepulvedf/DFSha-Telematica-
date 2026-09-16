@@ -28,11 +28,20 @@ service ControlPlane {
 }
 
 message RegisterRequest {
-  string advertise_url    = 1;  // alcanzable por el CLIENTE, no por el ControlNode
+  string advertise_url    = 1;  // alcanzable por el CLIENTE
   string fault_domain     = 2;  // cadena opaca; el ControlNode solo compara igualdad
   string boot_id          = 3;  // UUID nuevo en cada arranque con disco vacio
   uint64 capacity_bytes   = 4;
   string data_node_id     = 5;  // vacio en el primer registro
+
+  // Alcanzable por OTROS DATANODES. Etapa 3: desde que existe el pipeline y la
+  // re-replicacion, los DataNodes hablan entre si, y la direccion que vale para el
+  // cliente no tiene por que valer para un vecino. En compose el cliente esta fuera
+  // (localhost:800N) y los vecinos dentro (data-node-N:8001).
+  //
+  // Vacio = usar advertise_url, que es el despliegue donde cliente y nodos comparten
+  // red. No es un caso degradado: es el caso simple.
+  string peer_url         = 6;
 }
 
 message RegisterResponse {

@@ -128,6 +128,24 @@ class Cluster:
     def internal_headers(self) -> dict[str, str]:
         return {"X-DFSha-Internal-Secret": self.internal_secret}
 
+    def uow_factory(self):
+        """Acceso al metadato del ControlNode desde una prueba.
+
+        Solo para montar escenarios que por el camino normal costarian minutos de reloj
+        (por ejemplo, llegar a un bloque sub-replicado sin esperar a que muera un nodo).
+        Lo que se COMPRUEBA se sigue comprobando por la API.
+        """
+        from dfsha.control_node.repositories.database import (
+            build_engine,
+            build_session_factory,
+        )
+        from dfsha.control_node.repositories.sql import SqlUnitOfWork
+
+        assert self.settings is not None
+        engine = build_engine(self.settings.db_url)
+        factory = build_session_factory(engine)
+        return lambda: SqlUnitOfWork(factory)
+
     def node(self, name: str) -> DataNodeHandle:
         for nodo in self.nodes:
             if nodo.name == name:
@@ -187,12 +205,20 @@ def start_cluster(
     capacities: list[int] | None = None,
     replication_factor: int = 1,
     write_quorum: int = 1,
+    advertise_muerta: bool = False,
     **control_overrides,
 ) -> Cluster:
     """Levanta el ControlNode y `data_nodes` DataNodes.
 
     `fault_domains` y `capacities` permiten construir los escenarios de la Etapa 2: dos
     zonas, o un nodo con menos capacidad que el resto.
+
+    `advertise_muerta=True` da a cada nodo una direccion de cliente que **no responde**,
+    dejando la real solo como direccion de par. Es la inversion del escenario de Docker:
+    alli la de cliente funciona desde fuera y no desde dentro; aqui no funciona desde
+    ningun sitio. En los dos casos, cualquier camino nodo-a-nodo que use la direccion de
+    cliente falla, que es justo lo que hay que poder detectar. Ver
+    `test_addressing.py`.
 
     `replication_factor` y `write_quorum` se fijan aqui en 1 y NO se dejan al default del
     codigo, que desde la Etapa 3 es R=3 y W=2. El motivo es que las pruebas de las etapas
@@ -229,11 +255,15 @@ def start_cluster(
         puerto = puerto_libre()
         url = f"http://127.0.0.1:{puerto}"
         data_dir = tmp_path / f"datanode-{indice + 1}"
+        # Con `advertise_muerta`, la direccion de cliente apunta a un puerto que nadie
+        # escucha: si algun camino nodo-a-nodo la usara, se veria enseguida.
+        anunciada = f"http://127.0.0.1:{puerto_libre()}" if advertise_muerta else url
         settings = DataNodeSettings(
             data_dir=str(data_dir),
             control_url=control_url,
             control_grpc_url=f"127.0.0.1:{puerto_grpc}",
-            datanode_advertise_url=url,
+            datanode_advertise_url=anunciada,
+            datanode_peer_url=url if advertise_muerta else "",
             datanode_fault_domain=dominios[indice],
             internal_secret=SECRETO_INTERNO,
             datanode_capacity_bytes=capacidades[indice],

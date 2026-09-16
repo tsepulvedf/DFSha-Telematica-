@@ -71,6 +71,7 @@ def register_node(
     boot_id: str,
     capacity_bytes: int,
     data_node_id: str = "",
+    peer_url: str = "",
 ) -> RegistrationResult:
     """Da de alta un nodo, o lo readmite.
 
@@ -98,6 +99,7 @@ def register_node(
             fault_domain=fault_domain,
             boot_id=boot_id,
             data_node_id=(existente.id if existente else data_node_id) or None,
+            peer_url=peer_url,
         )
 
         perdidas = 0
@@ -112,6 +114,7 @@ def register_node(
         "node.registered",
         data_node_id=nodo.id,
         advertise_url=advertise_url,
+        peer_url=nodo.peer_base_url,
         fault_domain=fault_domain,
         boot_id=boot_id,
         capacity_bytes=capacity_bytes,

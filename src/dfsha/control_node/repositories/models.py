@@ -212,9 +212,15 @@ class DataNodeRow(Base):
     __tablename__ = "data_nodes"
 
     id: Mapped[str] = mapped_column(String(ID_LEN), primary_key=True)
-    #: Direccion alcanzable por el CLIENTE, no por el ControlNode. El ControlNode se
-    #: limita a repetirsela al cliente en el plan, porque los bytes van directos.
+    #: Direccion alcanzable por el CLIENTE. El ControlNode se limita a repetirsela en
+    #: el plan, porque los bytes van directos.
     advertise_url: Mapped[str] = mapped_column(String(512), unique=True, nullable=False)
+    #: Direccion alcanzable por OTROS DATANODES. Vacia = usar `advertise_url`.
+    #:
+    #: NO lleva `unique`, al contrario que `advertise_url`: dos nodos con la misma
+    #: direccion de par serian un error de despliegue, pero detectarlo con una
+    #: restriccion impediria el caso legitimo de dejarla vacia en varios nodos a la vez.
+    peer_url: Mapped[str] = mapped_column(String(512), nullable=False, default="")
     #: Cadena opaca: solo se compara igualdad. En local son etiquetas logicas
     #: (local-1..local-4); en AWS, zonas de disponibilidad reales.
     fault_domain: Mapped[str] = mapped_column(String(128), nullable=False, default="")

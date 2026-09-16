@@ -68,13 +68,25 @@ class ReplicaRef(_Dto):
 
 
 class BlockWritePlan(_Dto):
-    """Un bloque a subir. `replicas` es una lista desde ya, aunque en la Etapa 1 tenga un
-    solo elemento; la Etapa 3 solo la hace mas larga."""
+    """Un bloque a subir, con las dos direcciones que hacen falta.
+
+    `replicas` lleva las direcciones alcanzables por el CLIENTE; `pipeline`, las
+    alcanzables entre DATANODES para el resto de la cadena. Son listas distintas porque
+    son dos redes distintas: en compose el cliente esta fuera y los nodos dentro.
+
+    El cliente manda los bytes a `replicas[0].base_url` y copia `pipeline` **tal cual** a
+    la cabecera `X-DFSha-Pipeline`. No construye ni deduce direcciones de par, asi que no
+    puede equivocarse al hacerlo; el ControlNode tampoco elige cual mandar, manda las dos
+    y cada una va en su sitio del mensaje.
+    """
 
     block_id: str
     index: int
     size: int
     replicas: list[ReplicaRef]
+    #: Vacia con R=1, y tambien cuando no se configura direccion de par: entonces la
+    #: cadena usa las mismas direcciones y el despliegue es el simple, no uno degradado.
+    pipeline: list[str] = []
 
 
 class BlockReadPlan(_Dto):

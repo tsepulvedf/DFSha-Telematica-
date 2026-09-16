@@ -87,6 +87,7 @@ def create_app(
     heartbeat = HeartbeatClient(
         grpc_url=settings.control_grpc_url,
         advertise_url=settings.datanode_advertise_url,
+        peer_url=settings.datanode_peer_url,
         fault_domain=settings.datanode_fault_domain,
         boot_id=identity.boot_id,
         capacity_bytes=capacity,
@@ -129,6 +130,7 @@ def create_app(
             data_node_id=app.state.data_node_id,
             data_dir=str(storage.root),
             advertise_url=settings.datanode_advertise_url,
+            peer_url=settings.datanode_peer_url or settings.datanode_advertise_url,
             fault_domain=settings.datanode_fault_domain,
             boot_id=identity.boot_id,
             capacity_bytes=capacity,

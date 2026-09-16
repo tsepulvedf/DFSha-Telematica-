@@ -396,7 +396,11 @@ def pending_orders(
             ReplicationOrder(
                 task_id=tarea.id,
                 block_id=tarea.block_id,
-                source_base_url=origen.advertise_url,
+                # peer_base_url y NO advertise_url: esta URL se la manda el ControlNode
+                # al nodo DESTINO para que descargue el bloque del ORIGEN, o sea que es
+                # trafico entre DataNodes. Con la direccion de cliente, en contenedores
+                # el destino se descargaria de si mismo.
+                source_base_url=origen.peer_base_url,
                 source_node_id=origen.id,
                 size=bloque.size,
                 checksum_sha256=bloque.checksum_sha256 or "",

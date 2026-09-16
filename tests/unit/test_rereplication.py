@@ -65,15 +65,33 @@ def test_un_bloque_critico_se_reconoce() -> None:
 # --- Asignacion de destinos ------------------------------------------------
 
 
-def test_se_asigna_una_copia_por_cada_una_que_falta() -> None:
+def test_por_defecto_se_asigna_UNA_copia_por_bloque_y_pasada() -> None:
+    """La cola guarda una tarea viva por bloque, y el dominio respeta ese invariante.
+
+    Devolver dos asignaciones para el mismo bloque produciria dos despachos sobre la
+    MISMA fila y el segundo pisaria al primero: quedaria una copia programada en vez de
+    dos, y una fila PENDING apuntando a un destino que nunca recibe la orden. Lo destapo
+    `test_la_orden_lleva_la_direccion_de_PAR_del_origen`, que pedia la orden del primer
+    destino y no encontraba ninguna.
+
+    Un bloque al que le faltan dos copias recupera una por pasada.
+    """
     asignaciones = assign_targets(
         [hueco("b1", 1)], NODOS, in_flight_by_target={}, max_per_target=2
     )
 
+    assert len(asignaciones) == 1
+    assert asignaciones[0].target_node_id not in hueco("b1", 1).holders
+
+
+def test_con_max_per_block_mayor_se_asignan_todas_las_que_faltan() -> None:
+    """La funcion sabe repartir N; quien la llama pide 1 por el invariante de la cola."""
+    asignaciones = assign_targets(
+        [hueco("b1", 1)], NODOS, {}, max_per_target=2, max_per_block=3
+    )
+
     assert len(asignaciones) == 2  # de 1 copia a 3
-    assert {a.target_node_id for a in asignaciones} == {"n2", "n3"} or len(
-        {a.target_node_id for a in asignaciones}
-    ) == 2
+    assert len({a.target_node_id for a in asignaciones}) == 2
 
 
 def test_nunca_se_elige_un_nodo_que_ya_tiene_el_bloque() -> None:
@@ -89,7 +107,7 @@ def test_nunca_se_elige_un_nodo_que_ya_tiene_el_bloque() -> None:
 def test_se_prefiere_un_dominio_de_falla_sin_cubrir() -> None:
     g = hueco("b1", 1, holders=("n1",), dominios=("zona-a",))
 
-    asignaciones = assign_targets([g], NODOS, {}, max_per_target=2)
+    asignaciones = assign_targets([g], NODOS, {}, max_per_target=2, max_per_block=3)
 
     dominios = {NODOS[a.target_node_id] for a in asignaciones}
     assert "zona-a" not in dominios

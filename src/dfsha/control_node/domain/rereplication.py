@@ -97,11 +97,29 @@ def assign_targets(
     in_flight_by_target: dict[str, int],
     max_per_target: int,
     max_total: int | None = None,
+    max_per_block: int = 1,
 ) -> list[Assignment]:
     """Reparte la cola entre los nodos destino, respetando los topes.
 
     `candidates_by_domain` son los nodos ALIVE con sitio, como `{node_id: fault_domain}`.
     `in_flight_by_target` es lo que cada uno ya tiene en marcha.
+
+    ## `max_per_block=1`, y no es una limitacion arbitraria
+
+    La cola guarda **una tarea viva por bloque**: lo impone el indice unico parcial sobre
+    `(block_id)` en los estados PENDING e IN_FLIGHT, que es lo que impide que dos lideres
+    solapados programen la misma copia dos veces. Devolver aqui dos asignaciones para el
+    mismo bloque produce dos despachos sobre **la misma fila**, y el segundo pisa al
+    primero: queda una copia programada en vez de dos, y una fila PENDING en
+    `block_replicas` apuntando a un destino que nunca recibira la orden.
+
+    Asi que el dominio respeta el mismo invariante que el esquema. Un bloque al que le
+    faltan dos copias recupera una por pasada: la segunda se programa cuando la primera
+    ha terminado. Ademas de correcto es preferible, y por el mismo motivo que los otros
+    tres frenos: reparte la recuperacion en el tiempo en vez de concentrarla.
+
+    `max_per_block` mayor que 1 solo tiene sentido para probar la funcion en aislamiento;
+    quien la llama de verdad usa el default.
 
     Se prefiere un destino en un dominio de falla que el bloque no cubra todavia; si no
     queda ninguno, se relaja el dominio pero **nunca se elige un nodo que ya tenga el
@@ -126,7 +144,7 @@ def assign_targets(
         # mismos bytes, y el checksum se verifica en el destino de todas formas.
         origen = hueco.holders[0]
 
-        for _ in range(hueco.missing):
+        for _ in range(min(hueco.missing, max_per_block)):
             destino = _elegir_destino(hueco, asignaciones, candidates_by_domain, en_vuelo, max_per_target)
             if destino is None:
                 break

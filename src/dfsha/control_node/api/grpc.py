@@ -71,6 +71,7 @@ class ControlPlaneServicer(control_pb2_grpc.ControlPlaneServicer):
             resultado = commands.register_node(
                 self._uow(),
                 advertise_url=request.advertise_url,
+                peer_url=request.peer_url,
                 fault_domain=request.fault_domain,
                 boot_id=request.boot_id,
                 capacity_bytes=request.capacity_bytes,

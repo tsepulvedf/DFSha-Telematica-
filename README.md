@@ -258,6 +258,23 @@ La línea gruesa es el camino de los datos; la punteada, el plano de control. El
 ControlNode no es un cuello de botella de ancho de banda: cada DataNode que se añade suma
 capacidad de transferencia en lugar de saturar un nodo central.
 
+### Dos direcciones por DataNode
+
+Desde el Hito 3 un DataNode anuncia **dos** direcciones: una para el cliente y otra para
+sus pares. Hasta el Hito 2 solo el cliente hablaba con los DataNodes, así que una bastaba;
+ahora los DataNodes hablan **entre sí** (pipeline y re-replicación), y en `docker compose`
+el cliente está fuera (`localhost:800N`) y los vecinos dentro (`data-node-N:8001`).
+
+Con una sola dirección, DN1 reenviaba a `localhost:8002` y eso, dentro de un contenedor,
+resuelve **al propio contenedor**. El síntoma era un `put` fallando con 409 «no alcanzan
+el quórum» y 50 réplicas donde debería haber 150.
+
+Esto **no** reabre la decisión del Hito 2 de no anunciar dos direcciones. Lo que allí se
+rechazó fue que el ControlNode **infiriera** cuál usar según el origen de la petición, que
+es una suposición sobre la red del cliente. Aquí no hay inferencia: las dos direcciones
+son estáticas y su destinatario se sabe por la **estructura del mensaje** — el plan del
+cliente lleva siempre la de cliente, la cadena del pipeline lleva siempre la de par.
+
 ### Replicación R=3: el cliente sube una vez
 
 Con tres copias, la alternativa ingenua es que el cliente suba el mismo bloque tres veces.
@@ -778,6 +795,7 @@ Todo por variables de entorno; `.env.example` las lista todas.
 | `DFSHA_INTERNAL_SECRET` | — **obligatorio** | Protege `/internal/v1` |
 | `DFSHA_DATA_DIR` | `/var/lib/dfsha` | Dónde guarda bloques el DataNode |
 | `DFSHA_DATANODE_ADVERTISE_URL` | `http://localhost:8001` | URL con la que se anuncia el DataNode, **alcanzable por el cliente** |
+| `DFSHA_DATANODE_PEER_URL` | vacío | URL **alcanzable por otros DataNodes** (pipeline y re-replicación). Vacío = la misma que la anterior |
 | `DFSHA_DATANODE_FAULT_DOMAIN` | `local-1` | Dominio de falla: cadena opaca, solo se compara igualdad |
 | `DFSHA_CONTROL_GRPC_URL` | `lb:9000` | Dónde escucha el plano de control (el balanceador, no una instancia) |
 | `DFSHA_DATANODE_CAPACITY_BYTES` | libre en disco | Capacidad anunciada |

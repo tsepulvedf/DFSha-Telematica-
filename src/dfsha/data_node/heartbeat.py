@@ -89,9 +89,12 @@ class HeartbeatClient:
         data_node_id: str = "",
         retry_seconds: float = 2.0,
         orders=None,
+        peer_url: str = "",
     ) -> None:
         self._grpc_url = grpc_url
         self._advertise_url = advertise_url
+        #: Con que direccion se anuncia a sus PARES. Vacia = la misma del cliente.
+        self._peer_url = peer_url
         self._fault_domain = fault_domain
         self._boot_id = boot_id
         self._capacity_bytes = capacity_bytes
@@ -145,6 +148,7 @@ class HeartbeatClient:
                 respuesta = self._stub.Register(
                     control_pb2.RegisterRequest(
                         advertise_url=self._advertise_url,
+                        peer_url=self._peer_url,
                         fault_domain=self._fault_domain,
                         boot_id=self._boot_id,
                         capacity_bytes=self._capacity_bytes,

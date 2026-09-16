@@ -252,6 +252,7 @@ def create_file(
                 index=b.index,
                 size=b.size,
                 replicas=_replicas(b.replicas),
+                pipeline=b.pipeline,
             )
             for b in creado.blocks
         ],

@@ -68,10 +68,15 @@ def _slots_de_escritura(blocks: Sequence[BlockWritePlan]) -> list[_Slot]:
                 "el plan no trae ningun DataNode para el bloque", block_id=bloque.block_id
             )
         # La primera replica recibe los bytes del cliente; las demas viajan en la
-        # cabecera de pipeline y las va encadenando cada DataNode. El orden del plan se
-        # respeta tal cual: lo decidio la politica de colocacion del ControlNode, que es
-        # quien conoce la carga y los dominios de falla.
-        replica, *resto = bloque.replicas
+        # cabecera de pipeline. El orden del plan se respeta tal cual: lo decidio la
+        # politica de colocacion del ControlNode, que es quien conoce la carga y los
+        # dominios de falla.
+        #
+        # La cadena se copia de `bloque.pipeline`, NO se deduce de `replicas`. Y esa
+        # diferencia costo un fallo entero: `replicas` lleva las direcciones alcanzables
+        # por el CLIENTE, que en contenedores son `localhost:800N` y desde dentro de un
+        # DataNode resuelven al propio nodo. Ver "Dos direcciones por nodo" en CLAUDE.md.
+        replica = bloque.replicas[0]
         slots.append(
             _Slot(
                 block_id=bloque.block_id,
@@ -80,7 +85,7 @@ def _slots_de_escritura(blocks: Sequence[BlockWritePlan]) -> list[_Slot]:
                 offset=offset,
                 base_url=replica.base_url,
                 data_node_id=replica.data_node_id,
-                pipeline=tuple(r.base_url for r in resto),
+                pipeline=tuple(getattr(bloque, "pipeline", ()) or ()),
             )
         )
         offset += bloque.size

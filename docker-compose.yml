@@ -14,6 +14,7 @@
 #
 # Ojo con la asimetria, que es deliberada:
 #   DFSHA_DATANODE_ADVERTISE_URL -> localhost:800N   (lo consume el CLIENTE, desde fuera)
+#   DFSHA_DATANODE_PEER_URL      -> data-node-N:8001 (lo consumen OTROS DATANODES, dentro)
 #   DFSHA_CONTROL_GRPC_URL       -> lb:9000          (ControlNode<->DataNode, por dentro)
 #   DFSHA_CONTROL_URL            -> lb:8000          (idem, confirmacion de bloque)
 #
@@ -245,6 +246,10 @@ services:
     environment:
       <<: *datanode-env
       DFSHA_DATANODE_ADVERTISE_URL: "${DFSHA_ADVERTISE_1:-http://localhost:8001}"
+      # Direccion de PAR: la que usan los otros DataNodes para el pipeline y la
+      # re-replicacion. Sin ella, DN1 reenviaria a "localhost:800N" y eso, dentro
+      # de un contenedor, resuelve al propio contenedor.
+      DFSHA_DATANODE_PEER_URL: "${DFSHA_PEER_1:-http://data-node-1:8001}"
       DFSHA_DATANODE_FAULT_DOMAIN: "${DFSHA_FD_1:-local-1}"
     volumes:
       - "dfsha-blocks-1:/var/lib/dfsha"
@@ -257,6 +262,10 @@ services:
     environment:
       <<: *datanode-env
       DFSHA_DATANODE_ADVERTISE_URL: "${DFSHA_ADVERTISE_2:-http://localhost:8002}"
+      # Direccion de PAR: la que usan los otros DataNodes para el pipeline y la
+      # re-replicacion. Sin ella, DN1 reenviaria a "localhost:800N" y eso, dentro
+      # de un contenedor, resuelve al propio contenedor.
+      DFSHA_DATANODE_PEER_URL: "${DFSHA_PEER_2:-http://data-node-2:8001}"
       DFSHA_DATANODE_FAULT_DOMAIN: "${DFSHA_FD_2:-local-2}"
     volumes:
       - "dfsha-blocks-2:/var/lib/dfsha"
@@ -269,6 +278,10 @@ services:
     environment:
       <<: *datanode-env
       DFSHA_DATANODE_ADVERTISE_URL: "${DFSHA_ADVERTISE_3:-http://localhost:8003}"
+      # Direccion de PAR: la que usan los otros DataNodes para el pipeline y la
+      # re-replicacion. Sin ella, DN1 reenviaria a "localhost:800N" y eso, dentro
+      # de un contenedor, resuelve al propio contenedor.
+      DFSHA_DATANODE_PEER_URL: "${DFSHA_PEER_3:-http://data-node-3:8001}"
       DFSHA_DATANODE_FAULT_DOMAIN: "${DFSHA_FD_3:-local-3}"
     volumes:
       - "dfsha-blocks-3:/var/lib/dfsha"
@@ -281,6 +294,10 @@ services:
     environment:
       <<: *datanode-env
       DFSHA_DATANODE_ADVERTISE_URL: "${DFSHA_ADVERTISE_4:-http://localhost:8004}"
+      # Direccion de PAR: la que usan los otros DataNodes para el pipeline y la
+      # re-replicacion. Sin ella, DN1 reenviaria a "localhost:800N" y eso, dentro
+      # de un contenedor, resuelve al propio contenedor.
+      DFSHA_DATANODE_PEER_URL: "${DFSHA_PEER_4:-http://data-node-4:8001}"
       DFSHA_DATANODE_FAULT_DOMAIN: "${DFSHA_FD_4:-local-4}"
     volumes:
       - "dfsha-blocks-4:/var/lib/dfsha"

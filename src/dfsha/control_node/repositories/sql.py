@@ -126,6 +126,7 @@ def _to_data_node(row: DataNodeRow) -> DataNode:
     return DataNode(
         id=row.id,
         advertise_url=row.advertise_url,
+        peer_url=row.peer_url or "",
         capacity_bytes=row.capacity_bytes,
         used_bytes=row.used_bytes,
         state=DataNodeState(row.state),
@@ -733,6 +734,7 @@ class SqlDataNodeRepository:
         fault_domain: str = "",
         boot_id: str = "",
         data_node_id: str | None = None,
+        peer_url: str = "",
     ) -> DataNode:
         """Alta o re-alta de un nodo.
 
@@ -757,6 +759,7 @@ class SqlDataNodeRepository:
             row = DataNodeRow(
                 id=data_node_id or new_id(),
                 advertise_url=advertise_url,
+                peer_url=peer_url,
                 fault_domain=fault_domain,
                 boot_id=boot_id,
                 capacity_bytes=capacity_bytes,
@@ -773,6 +776,7 @@ class SqlDataNodeRepository:
             # redespliega con otra URL anunciada, se le cambia el dominio de falla, o
             # arranca con el disco vacio y otro boot_id.
             row.advertise_url = advertise_url
+            row.peer_url = peer_url
             row.fault_domain = fault_domain
             row.boot_id = boot_id
             row.capacity_bytes = capacity_bytes
