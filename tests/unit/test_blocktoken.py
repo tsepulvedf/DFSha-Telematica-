@@ -41,7 +41,18 @@ def control() -> TokenSigner:
 
 @pytest.fixture(scope="module")
 def ahora() -> dt.datetime:
-    return dt.datetime(2026, 9, 17, 12, 0, tzinfo=dt.timezone.utc)
+    """El reloj de las pruebas, anclado a la hora REAL y no a una fecha escrita a mano.
+
+    **Una fecha fija aqui hace la prueba dependiente de la hora del dia**, y costo una
+    tarde descubrirlo: los certificados de prueba se generan al arrancar la sesion con
+    `not_valid_before = ahora - 5 min`, asi que un `ahora` fijo a las 12:00 UTC estaba
+    DENTRO de la ventana por la manana y FUERA por la tarde. La prueba pasaba o fallaba
+    segun cuando se corriera, sin que nada del codigo hubiera cambiado.
+
+    Los viajes en el tiempo de las pruebas de expiracion se hacen con deltas sobre esto,
+    que siempre caen dentro de los dos anos de validez del certificado.
+    """
+    return dt.datetime.now(dt.timezone.utc)
 
 
 def _verificar(token, ca, *, block_id=BLOQUE, operation="read", now):
