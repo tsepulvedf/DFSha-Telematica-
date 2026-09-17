@@ -4,11 +4,13 @@ Cuatro escenarios de la Etapa 3, pensados para grabarse. Cada uno narra lo que h
 imprime los comandos que ejecuta y **comprueba el resultado**: si algo no sale como debe,
 termina en rojo y con código de salida distinto de cero.
 
+En el orden recomendado, que se explica más abajo:
+
 ```bash
 python scripts/demo/cifrado_en_reposo.py      # criterio 11
+python scripts/demo/permisos_y_token.py       # ACLs y token de bloque
 python scripts/demo/replicacion_y_caida.py    # R=3, W=2, re-replicación
 python scripts/demo/failover_del_lider.py     # relevo de liderazgo con época
-python scripts/demo/permisos_y_token.py       # ACLs y token de bloque
 ```
 
 ## Orden recomendado, y qué deja cada uno

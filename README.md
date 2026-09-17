@@ -1,6 +1,6 @@
 # DFSha — sistema de archivos distribuido por bloques
 
-**Hito 3 (en curso · Bloques A y B completos)** · SI3007 / ST0263 Sistemas Distribuidos
+**Hito 3 (en curso · Bloques A, B y C completos; falta TLS de cliente)** · SI3007 / ST0263 Sistemas Distribuidos
 
 DFSha parte archivos en bloques de tamaño fijo, los reparte entre DataNodes y guarda todo
 el metadato en un ControlNode. La arquitectura es de tipo HDFS, opción cliente/servidor:
@@ -30,9 +30,16 @@ subidas *en cadena* para que el cliente mande los bytes una sola vez. El `commit
 que falta se **restaura sola** pasada una espera de gracia. Un archivo sobrevive a perder
 dos de sus tres nodos.
 
-> **Estado.** Los Bloques A (PostgreSQL, CQRS con réplica de lectura, elección de
-> líder) y B (replicación R=3 con pipeline, quórum W=2 y re-replicación) están terminados
-> y probados. El Bloque C (mTLS, cifrado extremo a extremo, ACLs y RF3) está en curso.
+Y la **seguridad**: el plano interno pasa a **TLS mutuo** con una CA propia, los archivos
+se **cifran en el cliente** —el servidor guarda los bloques y no puede leerlos—, hay
+**ACLs con grupos** para compartir, y cada petición de bloque lleva una **autorización
+firmada** que el DataNode verifica por su cuenta. Más el **RF3**: `open`, lectura por
+rango, `append` y bloqueo de archivos con lease.
+
+> **Estado.** Los Bloques A (PostgreSQL, CQRS con réplica de lectura, elección de líder),
+> B (replicación R=3 con pipeline, quórum W=2 y re-replicación) y C (mTLS, cifrado extremo
+> a extremo, ACLs, token de bloque y RF3) están terminados y probados. Falta el TLS del
+> tráfico de **cliente**, que es lo último del hito.
 
 ---
 
@@ -61,14 +68,13 @@ cd DFSha-Telematica-
 ```bash
 cp .env.example .env
 sed -i "s|^DFSHA_JWT_SECRET=$|DFSHA_JWT_SECRET=$(python -c 'import secrets;print(secrets.token_urlsafe(48))')|" .env
-sed -i "s|^DFSHA_INTERNAL_SECRET=$|DFSHA_INTERNAL_SECRET=$(python -c 'import secrets;print(secrets.token_urlsafe(48))')|" .env
 sed -i "s|^DFSHA_PG_PASSWORD=$|DFSHA_PG_PASSWORD=$(python -c 'import secrets;print(secrets.token_urlsafe(24))')|" .env
 sed -i "s|^DFSHA_PG_REPLICATION_PASSWORD=$|DFSHA_PG_REPLICATION_PASSWORD=$(python -c 'import secrets;print(secrets.token_urlsafe(24))')|" .env
 
 # La URL de la base lleva dentro la contraseña que acabas de generar
 sed -i "s|^DFSHA_DB_URL=.*|# DFSHA_DB_URL lo fija docker-compose.yml; esta linea solo vale sin Docker|" .env
 
-grep -E '^DFSHA_(JWT_SECRET|INTERNAL_SECRET|PG_PASSWORD|PG_REPLICATION_PASSWORD)=.+' .env  # cuatro líneas
+grep -E '^DFSHA_(JWT_SECRET|PG_PASSWORD|PG_REPLICATION_PASSWORD)=.+' .env  # tres líneas
 ```
 
 **PowerShell:**
@@ -76,16 +82,14 @@ grep -E '^DFSHA_(JWT_SECRET|INTERNAL_SECRET|PG_PASSWORD|PG_REPLICATION_PASSWORD)
 ```powershell
 Copy-Item .env.example .env
 $jwt = python -c "import secrets;print(secrets.token_urlsafe(48))"
-$int = python -c "import secrets;print(secrets.token_urlsafe(48))"
 $pg  = python -c "import secrets;print(secrets.token_urlsafe(24))"
 $rep = python -c "import secrets;print(secrets.token_urlsafe(24))"
 (Get-Content .env) `
   -replace '^DFSHA_JWT_SECRET=$', "DFSHA_JWT_SECRET=$jwt" `
-  -replace '^DFSHA_INTERNAL_SECRET=$', "DFSHA_INTERNAL_SECRET=$int" `
   -replace '^DFSHA_PG_PASSWORD=$', "DFSHA_PG_PASSWORD=$pg" `
   -replace '^DFSHA_PG_REPLICATION_PASSWORD=$', "DFSHA_PG_REPLICATION_PASSWORD=$rep" | Set-Content .env
 
-Select-String -Path .env -Pattern '^DFSHA_(JWT_SECRET|INTERNAL_SECRET|PG_PASSWORD|PG_REPLICATION_PASSWORD)=.+'  # cuatro
+Select-String -Path .env -Pattern '^DFSHA_(JWT_SECRET|PG_PASSWORD|PG_REPLICATION_PASSWORD)=.+'  # tres
 ```
 
 Rellenan las líneas vacías en su sitio, sin duplicar claves. En macOS el `sed -i`
@@ -93,7 +97,26 @@ del sistema pide un argumento: usa `sed -i ''` en lugar de `sed -i`.
 
 `.env` está en `.gitignore`. No lo subas nunca.
 
-### 2. Levantar el clúster
+### 2. Generar la CA y los certificados — también obligatorio
+
+El plano interno usa **TLS mutuo**, y los servicios no arrancan sin su material:
+
+```bash
+python scripts/gen_certs.py
+```
+
+Deja en `certs/` la CA y un certificado por rol (`control`, `data`, `client`). **No se
+versiona nada de esto**: `.gitignore` cubre `*.crt`, `*.key` y `certs/`.
+
+El script **se niega a regenerar una CA existente** sin `--force`, y explica por qué:
+volver a firmarla invalida todos los certificados emitidos, y un clúster a medio rotar
+deja de hablar consigo mismo.
+
+> Esto **sustituye a `DFSHA_INTERNAL_SECRET`**, que ya no existe. Un secreto compartido
+> protege contra quien no lo conoce, pero no dice *quién* está al otro lado: cualquiera
+> que lo tenga es todos a la vez. Con mTLS cada rol presenta su propio certificado.
+
+### 3. Levantar el clúster
 
 ```bash
 docker compose up --build -d
@@ -110,7 +133,7 @@ Once servicios, en este orden de arranque:
 | `postgres-replica` | Réplica en streaming. Sirve el lado de consulta de CQRS |
 | `migrate` | Aplica las migraciones y termina. Los ControlNodes esperan a que acabe |
 | `control-node-1..3` | Tres instancias idénticas. Una sostiene el lease de líder |
-| `lb` | nginx. Publica 8000 (REST del cliente) y 9000 (gRPC de los DataNodes) |
+| `lb` | nginx. Publica 8000 (REST del cliente), 8443 (plano interno) y 9000 (gRPC) |
 | `data-node-1..4` | 8001–8004, cada uno con su volumen y su dominio de falla |
 
 **El ControlNode no migra la base**: lo hace `migrate`, una sola vez. Con tres instancias
@@ -189,8 +212,8 @@ up --build -d`.
 
 ### 5. Ver el ciclo de borrado y el GC
 
-Corre el GC **desde la raíz del repositorio**: lee `DFSHA_INTERNAL_SECRET` del entorno y,
-si no está, del `.env` que creaste en el paso 1. No hace falta exportar nada.
+Corre el GC **desde la raíz del repositorio**: encuentra los certificados en `certs/` por
+su cuenta. No hace falta exportar nada.
 
 ```bash
 dfsha rm /datos/pruebas/original.bin     # borrado lógico: los bloques siguen en disco
@@ -202,14 +225,16 @@ python scripts/gc.py                     # borrarlos de verdad
 curl http://localhost:8001/health        # used_bytes y block_count de vuelta a cero
 ```
 
-Si lo ejecutas desde otro directorio no encontrará el `.env`, y entonces sí hay que
-pasarle el secreto:
+Si lo ejecutas desde otro directorio no encontrará `certs/`, y entonces hay que decirle
+dónde está:
 
 ```bash
-export DFSHA_INTERNAL_SECRET=...              # bash: el mismo valor que en .env
-$env:DFSHA_INTERNAL_SECRET = "..."            # PowerShell
-python scripts/gc.py --internal-secret ...    # o directamente por argumento
+python scripts/gc.py   --tls-ca-cert certs/ca.crt --tls-cert certs/client.crt --tls-key certs/client.key
 ```
+
+Presenta el certificado de **cliente**, no el del ControlNode, y eso importa: el GC pide la
+lista de huérfanos y recibe con ella un **token de borrado por bloque**, firmado. No puede
+fabricarlos él, así que quien decide qué es un huérfano sigue siendo el ControlNode.
 
 ---
 
@@ -673,13 +698,34 @@ dfsha register <usuario>              dfsha ls [ruta]          dfsha put <local>
 dfsha login <usuario>                 dfsha cd <ruta>          dfsha get <remoto> <local>
 dfsha logout                          dfsha pwd                dfsha cluster
 dfsha mkdir [-p] <ruta>               dfsha rm <ruta>          dfsha mv <origen> <destino>
-dfsha rmdir [-r] <ruta>
+dfsha rmdir [-r] <ruta>               dfsha stat <ruta>
+```
+
+Compartir (Bloque C):
+
+```
+dfsha share <ruta> <usuario|grupo> <read|write|admin>     dfsha shared
+dfsha unshare <ruta> <usuario|grupo>                      dfsha acl <ruta>
+dfsha group create|add|remove|list
+```
+
+RF3:
+
+```
+dfsha lock [--shared] <ruta>          dfsha read <ruta> --offset N --length N
+dfsha unlock <ruta>                   dfsha append <remoto> <local>
+dfsha locks <ruta>
 ```
 
 - `cd` y `pwd` operan sobre un directorio de trabajo **del lado del cliente**, guardado
   junto al token en `~/.dfsha/session.json`. El ControlNode es stateless.
 - `put` y `get` aceptan `--parallel N` (por defecto 4) para transferir bloques a la vez.
 - `-v` emite los logs JSON de tiempos por stdout.
+- `login` **deriva la clave de cifrado aquí** y no la manda a ninguna parte. Con
+  `--ask-password` no la guarda en disco y la pide en cada `put` y `get`.
+- `read` escribe el tramo pedido por la salida estándar, así que se encadena con `head`,
+  `jq` o lo que sea. Descarga **solo los bloques que tocan el tramo**.
+- `lock` vuelve a ejecutarse para **renovar**: el bloqueo vence solo si el proceso muere.
 
 ### `dfsha cluster`: por qué `bloq.` y `repl.` son dos columnas
 
@@ -778,7 +824,6 @@ Corre el GC desde el host, que es donde sí funciona en ambos casos:
 
 ```bash
 export DFSHA_CONTROL_URL=http://localhost:8000
-export DFSHA_INTERNAL_SECRET=...   # el mismo valor que en .env
 python scripts/gc.py
 ```
 
@@ -802,7 +847,10 @@ Todo por variables de entorno; `.env.example` las lista todas.
 | `DFSHA_PG_REPLICATION_PASSWORD` | — **obligatorio** | Clave del rol de replicación, que solo puede replicar |
 | `DFSHA_JWT_SECRET` | — **obligatorio** | Firma de los tokens |
 | `DFSHA_JWT_TTL_SECONDS` | `3600` | Vida del token |
-| `DFSHA_INTERNAL_SECRET` | — **obligatorio** | Protege `/internal/v1` |
+| `DFSHA_TLS_CA_CERT` | — **obligatorio** | La CA contra la que todos se validan |
+| `DFSHA_TLS_CERT` / `DFSHA_TLS_KEY` | — **obligatorio** | El certificado de este rol y su clave |
+| `DFSHA_INTERNAL_PORT` | `8443` | Puerto del plano interno, separado del de cliente |
+| `DFSHA_FILE_LOCK_TTL_MS` | `120000` | Vida de un bloqueo de archivo (RF3) sin renovar |
 | `DFSHA_DATA_DIR` | `/var/lib/dfsha` | Dónde guarda bloques el DataNode |
 | `DFSHA_DATANODE_ADVERTISE_URL` | `http://localhost:8001` | URL con la que se anuncia el DataNode, **alcanzable por el cliente** |
 | `DFSHA_DATANODE_PEER_URL` | vacío | URL **alcanzable por otros DataNodes** (pipeline y re-replicación). Vacío = la misma que la anterior |
@@ -832,8 +880,14 @@ Todo por variables de entorno; `.env.example` las lista todas.
 Los secretos **no tienen valor por defecto en el código** y deben tener al menos 16
 caracteres. Un secreto por defecto en un repositorio público es un hallazgo de seguridad.
 
-`DFSHA_INTERNAL_SECRET` **desaparece en el Bloque C**, sustituido por mTLS con una CA
-propia. Mientras tanto sigue siendo lo que protege `/internal/v1`.
+`DFSHA_INTERNAL_SECRET` **ya no existe**: lo sustituyó el mTLS del Bloque C. Un `.env`
+viejo que todavía lo tenga no estorba —simplemente se ignora— pero le faltarán las tres
+variables de TLS, y entonces el servicio no arranca y lo dice.
+
+Los tres ficheros de TLS **no tienen valor por defecto**, igual que el secreto de JWT: un
+plano interno que arranca sin autenticación porque se olvidó una variable es peor que uno
+que no arranca. Y el DataNode además comprueba que los ficheros **existen**, para que el
+fallo sea «no existe `certs/data.crt`» y no un error de handshake diez segundos después.
 
 ---
 
@@ -941,28 +995,45 @@ rechazado, **y** que no dejó ni una escritura detrás.
 ```
 src/dfsha/
 ├── common/          DTOs compartidos, checksum, errores, logging
+│   ├── crypto.py    las tres capas de clave del cifrado extremo a extremo
+│   ├── blocktoken.py  autorización por bloque que el DataNode verifica solo
+│   ├── tls.py       único sitio donde se construye un contexto TLS de cliente
 │   └── proto/       control.proto (el codigo generado no se versiona)
 ├── control_node/
 │   ├── api/         routers: sólo traducción HTTP ↔ casos de uso
 │   ├── commands/    lado escritura (CQRS)
 │   ├── queries/     lado lectura (CQRS)
-│   ├── domain/      Path, File, Block, reglas, partición, pertenencia, divergencia
+│   ├── domain/      Path, File, Block, reglas, partición, pertenencia, acl, filelock
 │   ├── repositories/  modelos SQLAlchemy, interfaces, unidad de trabajo
-│   └── services/    auth, placement, resolver, monitor de pertenencia
+│   └── services/    auth, placement, resolver, pertenencia, access, shared
 ├── data_node/       storage.py (layout en disco), heartbeat.py (cliente gRPC) + api/
 └── client/          cli.py, session.py, chunker.py, transfer.py
-scripts/             gc.py, gen_testfile.py, gen_proto.py
+alembic/versions/    migraciones del metadato (0001–0007)
+scripts/             gc.py, gen_testfile.py, gen_proto.py, gen_certs.py,
+                     verificar_pruebas.py, demo/
+certs/               la CA y los certificados (NO se versiona)
 deploy/              material de despliegue en AWS
 tests/               unit/, integration/
 ```
 
 `CLAUDE.md` guarda las decisiones de diseño, la hoja de ruta por etapas y los contratos.
 
+### Dos herramientas que no son del sistema sino de cómo se verifica
+
+- **`scripts/demo/`** — cuatro guiones que reproducen los escenarios del hito y
+  **comprueban el resultado**. Cada uno lleva un *control positivo* junto a la
+  comprobación negativa, porque «no aparece el texto claro» y «un `grep` mal escrito» se
+  parecen demasiado. Ver [`scripts/demo/README.md`](scripts/demo/README.md).
+- **`scripts/verificar_pruebas.py`** — rompe a propósito cada protección de seguridad y
+  exige que las pruebas que dicen fijarla **caigan**. Encontró tres pruebas que pasaban
+  por un camino distinto del que su nombre anunciaba. Una prueba que nunca has visto
+  fallar no sabes si prueba algo.
+
 ---
 
 ## Despliegue en AWS
 
-Cinco instancias `t3.micro` —un ControlNode y cuatro DataNodes en dos zonas de
+Seis instancias `t3.micro` —PostgreSQL, un ControlNode y cuatro DataNodes en dos zonas de
 disponibilidad— con su grupo de seguridad propio. Los pasos exactos, las reglas de red y
 qué cambia en cada instancia están en **[`deploy/README.md`](deploy/README.md)**.
 
@@ -972,20 +1043,42 @@ qué cambia en cada instancia están en **[`deploy/README.md`](deploy/README.md)
 
 ## Alcance de esta etapa
 
-**Entra**: gRPC para el plano de control, heartbeat cada 3 s con métricas, block report
-incremental y completo, máquina de estados `ALIVE`/`SUSPECT`/`DEAD` con reincorporación,
-*power of d choices* con dominios de falla, detección de divergencia sin borrado
-automático, `/cluster/status`, compose de cuatro nodos y material de despliegue en AWS.
+**Entra**, y está terminado y probado:
 
-**No entra, y llega en la Etapa 3**: replicación efectiva (aquí **R=1**; la política
-soporta R>1 y está probada para ello, pero el default no cambia), pipeline de escritura
-entre DataNodes, quórum W, re-replicación automática, alta disponibilidad del ControlNode,
-mTLS, cifrado en reposo, y RF3 con leases.
+| Bloque | Qué |
+|---|---|
+| **A** | PostgreSQL con réplica de lectura, migraciones con Alembic, tres ControlNodes y elección de líder por lease con **época** |
+| **B** | Replicación **R=3** con pipeline encadenado, quórum **W=2** en el commit, re-replicación automática con tres frenos |
+| **C** | **mTLS** en el plano interno, **cifrado extremo a extremo**, **ACLs** con grupos, **token de bloque**, y **RF3** (`open`, lectura por rango, `append`, `lock` con lease) |
 
-Las costuras que la Etapa 3 hereda:
+**Falta para cerrar el hito**: TLS para el tráfico de **cliente**. Hoy el cliente habla
+con el ControlNode y con los DataNodes en HTTP plano; el plano interno ya va cifrado y
+autenticado por los dos lados.
 
-- El stream de `Heartbeat` es **bidireccional** y el ControlNode ya empuja mensajes no
-  solicitados. Las órdenes de re-replicación son un caso más en el `oneof`.
-- El estado `MISSING` de una réplica ya se detecta y se registra: es lo que disparará la
-  recuperación.
-- `select(block_size, replication_factor)` no cambia de firma: solo sube el default.
+Que esa pieza vaya al final es deliberado: era la primera de la lista de recortes acordada
+al empezar, junto con los grupos de las ACLs. El cifrado de los archivos **no depende de
+ella** —los bloques viajan ya cifrados desde el cliente, así que un observador de la red
+tampoco los lee—; lo que falta es proteger el **metadato** en tránsito y el token JWT.
+
+### Límites conocidos, escritos a propósito
+
+Ninguno es un olvido. Están razonados en `CLAUDE.md` y se defienden como decisiones:
+
+- **PBKDF2 en vez de Argon2id** para derivar la clave del usuario. Argon2id resiste mejor
+  el hardware especializado; PBKDF2 está en la biblioteca estándar y no añade dependencia.
+- **La clave maestra se guarda en la sesión.** El modelo es «el servidor nunca ve la
+  clave», no «la clave nunca toca el disco». `login --ask-password` no la guarda.
+- **No hay revocación de tokens de bloque.** Retirar un permiso corta la *emisión*; lo ya
+  emitido vale hasta caducar, y por eso la vida son 10 minutos. Consultar al ControlNode
+  en cada petición de bloque devolvería el plano de control al camino de los datos.
+- **Cambiar la contraseña no re-cifra nada.** Las envolturas existentes dejarían de
+  abrirse. El CLI lo dice al fallar en vez de dejar un archivo ilegible sin explicación.
+- **La promoción de la réplica de PostgreSQL es manual** (`deploy/RUNBOOK-postgres.md`).
+  Un failover de base de datos automático y correcto es otro proyecto; uno a medias es
+  peor que ninguno.
+- **La sobre-replicación tras una reincorporación no se limpia sola.** Un bloque puede
+  quedar con 4 copias y R=3. Cuesta disco, no corrección, y quitarla automáticamente
+  violaría la regla de que el ControlNode no borra datos por una divergencia.
+- **`append` reescribe el bloque de cola.** Añadir un byte puede reescribir hasta un
+  bloque entero (64 MB con el default). El coste está acotado por el tamaño de bloque, no
+  por el del archivo; la alternativa dejaba miles de bloques diminutos.

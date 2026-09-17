@@ -3,8 +3,11 @@
 # Un solo servicio a proposito: t3.micro es 1 GB de RAM, y dos DataNodes en la
 # misma maquina anularian el sentido de los dominios de falla.
 #
-# Los tres valores que cambian por instancia (URL anunciada, dominio de falla y
-# direccion del ControlNode) estan en el .env. Ver deploy/.env.datanode.example.
+# Los valores que cambian por instancia (URL anunciada, direccion de par, dominio de
+# falla y la IP privada del ControlNode) estan en el .env. Ver el paso 5 del README.
+#
+# ADVERTIR LA IP PRIVADA, NO LA PUBLICA. Y el certificado de este nodo tiene que llevar
+# esa IP en su SAN, o el pipeline falla en el handshake: `gen_certs.py --hosts`.
 #
 #   docker compose -f deploy/docker-compose.datanode.yml up --build -d
 #   docker compose -f deploy/docker-compose.datanode.yml logs -f
@@ -16,7 +19,7 @@ services:
     build:
       context: ".."
       dockerfile: "docker/data_node.Dockerfile"
-    image: "dfsha/data-node:0.2.0"
+    image: "dfsha/data-node:0.3.0"
     container_name: "dfsha-data-node"
     env_file:
       - "../.env"
@@ -27,12 +30,21 @@ services:
       - "8001:8001"
     environment:
       DFSHA_DATA_DIR: "/var/lib/dfsha"
+      # El plano interno del ControlNode, con mTLS. El puerto NO es el 8000: el
+      # certificado de cliente no se puede exigir en unas rutas y no en otras dentro
+      # del mismo puerto, asi que el plano interno tiene el suyo.
+      DFSHA_CONTROL_INTERNAL_URL: "https://${DFSHA_CONTROL_PRIVATE_IP}:8443"
+      DFSHA_TLS_CA_CERT: "/etc/dfsha/certs/ca.crt"
+      DFSHA_TLS_CERT: "/etc/dfsha/certs/data.crt"
+      DFSHA_TLS_KEY: "/etc/dfsha/certs/data.key"
     volumes:
       # El node.json con data_node_id y boot_id vive en este volumen, junto a los
       # bloques. Es deliberado: perder el volumen es perder el boot_id, y eso es
       # justo lo que le dice al ControlNode que las replicas de este nodo ya no
       # existen. Borrar el volumen equivale a reemplazar el disco.
       - "dfsha-blocks:/var/lib/dfsha"
+      # Solo los tres ficheros de este rol, en solo lectura. Ver el paso 4 del README.
+      - "/etc/dfsha/certs:/etc/dfsha/certs:ro"
     restart: "unless-stopped"
 
 volumes:

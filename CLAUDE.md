@@ -1799,7 +1799,6 @@ DFSHA_CONTROL_URL=http://localhost:8000
 DFSHA_DB_URL=sqlite:///./dfsha.db
 DFSHA_JWT_SECRET=
 DFSHA_JWT_TTL_SECONDS=3600
-DFSHA_INTERNAL_SECRET=
 DFSHA_DATA_DIR=/var/lib/dfsha
 DFSHA_DATANODE_CAPACITY_BYTES=
 DFSHA_WRITE_TTL_SECONDS=600      # vencimiento de reservas en WRITING
@@ -1818,6 +1817,19 @@ DFSHA_MEMBERSHIP_INTERVAL_MS=1000
 DFSHA_REPLICATION_FACTOR=1       # la Etapa 3 sube este default
 DFSHA_PLACEMENT_D=3
 DFSHA_MIN_FREE_BYTES=134217728
+
+# --- Etapa 3 ---
+DFSHA_DB_REPLICA_URL=            # vacia = todo al primario, y es un modo SOPORTADO
+DFSHA_LEASE_TTL_MS=6000
+DFSHA_LEASE_RENEW_MS=2000        # menor que el TTL, o el servicio no arranca
+DFSHA_WRITE_QUORUM=2
+DFSHA_REREPLICATION_GRACE_MS=300000
+DFSHA_FILE_LOCK_TTL_MS=120000    # RF3: vida de un bloqueo de archivo
+# mTLS: los tres SIN DEFAULT. Generalos con python scripts/gen_certs.py
+DFSHA_TLS_CA_CERT=certs/ca.crt
+DFSHA_TLS_CERT=certs/control.crt
+DFSHA_TLS_KEY=certs/control.key
+DFSHA_INTERNAL_PORT=8443
 ```
 
 `DFSHA_DATANODE_BASE_URL` de la Etapa 1 pasó a llamarse `DFSHA_DATANODE_ADVERTISE_URL`,
@@ -1865,9 +1877,14 @@ el contenedor es solo una comodidad:
    alguien lo retoma: el cliente ya dice por pantalla donde guardo la sesion y que
    fichero busco al no encontrarla, que es la mitad del diagnostico.
 
-`DFSHA_JWT_SECRET` y `DFSHA_INTERNAL_SECRET` **no tienen default en el código**. Si faltan,
-el servicio falla al arrancar con un mensaje claro. Un secreto por defecto en un repo
-público es un hallazgo de seguridad, y este proyecto se evalúa en seguridad.
+`DFSHA_JWT_SECRET` y los **tres ficheros de TLS** no tienen default en el código. Si
+faltan, el servicio falla al arrancar con un mensaje claro. Un secreto por defecto en un
+repo público es un hallazgo de seguridad, y este proyecto se evalúa en seguridad; un plano
+interno que arranca **sin autenticación** porque se olvidó una variable es peor todavía,
+porque no se nota.
+
+`DFSHA_INTERNAL_SECRET` **desapareció en el Bloque C**, sustituido por el mTLS. No queda
+en ningún sitio del código: un `.env` viejo que lo tenga simplemente lo ignora.
 
 ---
 

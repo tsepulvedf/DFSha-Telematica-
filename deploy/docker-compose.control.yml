@@ -1,10 +1,16 @@
 # ControlNode en su propia instancia t3.micro.
 #
-# Un solo servicio a proposito: t3.micro es 1 GB de RAM. El .env se lee de la raiz
-# del repositorio, no de deploy/, porque es donde lo deja el README.
+# Un solo servicio a proposito: t3.micro es 1 GB de RAM. El .env se lee de la raiz del
+# repositorio, no de deploy/, porque es donde lo deja el README.
 #
 #   docker compose -f deploy/docker-compose.control.yml up --build -d
 #   docker compose -f deploy/docker-compose.control.yml logs -f
+#
+# UNA SOLA INSTANCIA DE CONTROLNODE, y conviene decir por que: el codigo soporta tres
+# —es lo que hace el compose local— pero tres t3.micro mas no caben en el credito del
+# curso. El lease de liderazgo funciona igual con una: la toma, la renueva, y si muere
+# no hay quien la releve. La ALTA DISPONIBILIDAD se demuestra en local; aqui se
+# demuestra que el mismo codigo corre repartido en maquinas de verdad.
 
 name: "dfsha-control"
 
@@ -13,23 +19,29 @@ services:
     build:
       context: ".."
       dockerfile: "docker/control_node.Dockerfile"
-    image: "dfsha/control-node:0.2.0"
+    image: "dfsha/control-node:0.3.0"
     container_name: "dfsha-control-node"
     env_file:
       - "../.env"
     ports:
-      # 8000 REST: lo abre el grupo de seguridad al propio grupo (el DataNode
-      # confirma cada bloque) y a tu IP (para usar el cliente).
+      # 8000 REST: al propio grupo y a tu IP (para usar el cliente).
       - "8000:8000"
-      # 9000 gRPC: SOLO al propio grupo. El plano de control no tiene
-      # autenticacion mutua hasta la Etapa 3; hoy la frontera es la red.
+      # 8443 plano interno con mTLS: SOLO al propio grupo. Aqui va la confirmacion de
+      # cada bloque almacenado y los dos endpoints del GC.
+      - "8443:8443"
+      # 9000 gRPC con mTLS: SOLO al propio grupo.
       - "9000:9000"
     environment:
-      DFSHA_DB_URL: "sqlite:////var/lib/dfsha-meta/dfsha.db"
       DFSHA_GRPC_PORT: "9000"
+      DFSHA_INTERNAL_PORT: "8443"
+      # Los tres ficheros de TLS, montados desde el host. No tienen default en el
+      # codigo: sin ellos el servicio no arranca, y eso es deliberado.
+      DFSHA_TLS_CA_CERT: "/etc/dfsha/certs/ca.crt"
+      DFSHA_TLS_CERT: "/etc/dfsha/certs/control.crt"
+      DFSHA_TLS_KEY: "/etc/dfsha/certs/control.key"
     volumes:
-      - "dfsha-meta:/var/lib/dfsha-meta"
+      # Solo lectura, y SOLO los tres ficheros que le tocan. A diferencia del compose
+      # local, aqui NO se monta el directorio entero: ca.key no debe salir de la
+      # maquina que firma. Ver el paso 4 del README.
+      - "/etc/dfsha/certs:/etc/dfsha/certs:ro"
     restart: "unless-stopped"
-
-volumes:
-  dfsha-meta:

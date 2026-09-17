@@ -34,7 +34,6 @@ jobs:
     env:
       # Valores de prueba: los servicios no arrancan sin estos secretos.
       DFSHA_JWT_SECRET: ci-only-not-a-real-secret
-      DFSHA_INTERNAL_SECRET: ci-only-not-a-real-secret
       DFSHA_BLOCK_SIZE: "1048576"
       # Las pruebas de PostgreSQL se saltan si esta variable no esta. Aqui si esta, y
       # por eso el CI es el unico sitio donde se comprueban en cada push.
