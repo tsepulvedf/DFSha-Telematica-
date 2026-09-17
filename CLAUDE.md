@@ -236,24 +236,12 @@ pausa; entre una cosa y la otra pudo pasar cualquiera.
 **Una prueba que nunca has visto fallar no sabes si prueba algo**, y estas cuatro
 protecciones tienen todas la misma propiedad incomoda: quitarlas **no rompe nada visible**.
 Asi que se comprobo al reves, rompiendo cada una a proposito y exigiendo que las pruebas
-que dicen fijarla caigan. Lo automatiza `scripts/verificar_pruebas.py`.
+que dicen fijarla caigan. Diez mutaciones, las diez atrapadas — pero la primera pasada
+encontro **tres pruebas que pasaban por un camino distinto del que su nombre anuncia**,
+una de ellas la que se pidio en el punto de control del Bloque A.
 
-Diez mutaciones, las diez atrapadas. Pero la primera pasada **encontro dos pruebas que
-pasaban por el motivo equivocado**, que es exactamente lo que se buscaba:
-
-| Prueba | Decia fijar | Pasaba en realidad porque | Arreglo |
-|---|---|---|---|
-| `test_el_lider_congelado_es_rechazado_y_no_escribe_nada` | la comparacion de **epoca** | A y B son instancias distintas: le bastaba el `leader_id` | Docstring corregido; la epoca la fija la prueba hermana, donde el congelado es **el mismo** que recupero el lease |
-| `test_el_token_de_Beto_no_abre_el_bloque_de_Ana` | que el **`block_id`** va firmado | usaba un token de ESCRITURA donde el endpoint pide uno de LECTURA: rechazaba por la operacion | Se usa un token de lectura de verdad; ahora cae al quitar la comprobacion |
-
-Las dos daban confianza sin respaldarla. Es el mismo problema que el de la prueba del
-cliente congelado del RF3, que simulaba la congelacion **soltando** el lock —y soltar
-reinicia la epoca, mientras que caducar la sube—, asi que pasaba por el camino que no era.
-
-**Tres veces el mismo error en pruebas de seguridad de esta etapa.** El patron es claro y
-va al informe: una prueba que monta un escenario **parecido** al que dice cubrir puede
-pasar por una razon distinta de la que su nombre anuncia, y entonces es peor que no
-tenerla, porque nadie vuelve a mirarla.
+Esta todo en **«Verificacion por mutacion: como sabemos que las pruebas prueban algo»**,
+la seccion siguiente.
 
 ### Que lo fija, y por que importa que este fijado
 
@@ -283,6 +271,102 @@ larga en el momento justo.
 Por eso los modulos afectados llevan un bloque «Aviso para quien refactorice esto» con el
 codigo tentador escrito y tachado. Documentar la version incorrecta es mas util que
 documentar la correcta: la correcta ya esta ahi.
+
+---
+
+## Verificacion por mutacion: como sabemos que las pruebas prueban algo
+
+*Esta seccion se lee sola y va tal cual al informe. No hace falta haber leido el resto.*
+
+### El problema
+
+**Una prueba que nunca has visto fallar no sabes si prueba algo.**
+
+Normalmente eso no preocupa: una prueba se escribe porque algo fallaba, se la ve en rojo,
+se arregla el codigo, se la ve en verde. Ha fallado al menos una vez y por el motivo
+correcto.
+
+Las protecciones de seguridad de la Etapa 3 no funcionan asi. Se escribieron **antes** de
+que hubiera un fallo que arreglar, contra escenarios que hay que montar a proposito —un
+proceso congelado, un certificado de otro rol, un lock caducado—. Y comparten una
+propiedad incomoda: **quitarlas no rompe nada visible**. El sistema sigue funcionando, la
+suite sigue en verde salvo unas pocas pruebas, y el agujero solo se manifiesta con una
+pausa larga en el momento justo.
+
+Con ese perfil, una prueba puede estar en verde por el motivo equivocado durante meses sin
+que nadie lo note.
+
+### Que se hizo
+
+Romper cada proteccion **a proposito** y exigir que las pruebas que dicen fijarla caigan.
+Si no caen, la prueba no cubre lo que su nombre anuncia.
+
+Lo automatiza `scripts/verificar_pruebas.py`: aplica una mutacion, corre las pruebas
+correspondientes, y **restaura el fichero en un `finally`** pase lo que pase. Diez
+mutaciones sobre las cuatro protecciones del patron de la etapa.
+
+### El hallazgo: tres pruebas pasaban por el camino equivocado
+
+| Prueba | Decia fijar | Pasaba en realidad porque | Como se vio |
+|---|---|---|---|
+| `test_el_lider_congelado_es_rechazado_y_no_escribe_nada` | la comparacion de **epoca** del Bloque A | A y B son instancias distintas: le bastaba el `leader_id`, y la epoca no se ejercitaba | Al quitar la comparacion de epoca **seguia en verde** |
+| `test_el_token_de_Beto_no_abre_el_bloque_de_Ana` | que el **`block_id`** viaja firmado | usaba un token de ESCRITURA contra un endpoint que pide uno de LECTURA: rechazaba por la operacion, no por el bloque | Al quitar la comprobacion del `block_id` **seguia en verde** |
+| `test_el_cliente_congelado_no_escribe_encima` (RF3) | el vencimiento del **lease** | simulaba la congelacion **soltando** el lock, y soltar reinicia la epoca mientras que caducar la sube: dos caminos distintos | Al revisarla contra la prueba hermana |
+
+**La primera es la mas elocuente**, y conviene decirlo sin suavizarlo: es la prueba con el
+nombre mas rotundo del modulo de liderazgo, **se pidio explicitamente en el punto de
+control del Bloque A, y se dio por buena por las dos partes**. Describia el escenario
+correcto, afirmaba en su docstring que era «la razon de ser de la epoca», y la epoca no
+intervenia en su resultado.
+
+Ninguna de las tres era un agujero de cobertura: entre las pruebas hermanas el caso estaba
+cubierto. Lo que eran es **confianza sin respaldo**, y eso es peor que un hueco conocido,
+porque un hueco se mira y una prueba en verde no.
+
+### La formulacion, que es lo que vale para la sustentacion
+
+> **Una prueba que monta un escenario PARECIDO al que dice cubrir puede pasar por una
+> razon distinta de la que su nombre anuncia.**
+>
+> Leerla no lo detecta —la prueba es correcta, el escenario es correcto, el nombre
+> describe la intencion—. Lo detecta **romper lo que dice proteger y comprobar que cae**.
+
+Las tres se encontraron igual: **no leyendolas**. Se habian leido varias veces, y en la
+lectura no hay nada que chirrie. Lo que falta no esta en el texto de la prueba, esta en la
+relacion entre la prueba y el codigo, y eso solo se ve ejecutando las dos juntas en el
+estado roto.
+
+### Por que la herramienta avisa cuando no puede mutar
+
+Cada mutacion busca un fragmento **exacto** de codigo. Si el codigo cambia y el fragmento
+ya no existe, `verificar_pruebas.py` **lo reporta como `NO SE PUDO MUTAR`** en vez de
+saltarselo en silencio.
+
+Es una linea de codigo y es la diferencia entre una herramienta y un script que dentro de
+tres meses no encuentra nada sin que nadie sepa por que. Un verificador que falla en
+silencio tiene exactamente el defecto que existe para detectar: **aparenta estar haciendo
+su trabajo y no lo esta**.
+
+### Encaja con el otro patron de la etapa
+
+Los fallos serios de la Etapa 3 fueron todos **algo que aparenta estar puesto y no lo
+esta**: una direccion que parecia la correcta, un certificado que httpx descartaba, un
+tamano que cada mitad interpretaba a su manera, unos `details` que el cliente tiraba.
+
+Las pruebas que no prueban son **el mismo fallo aplicado a la verificacion**. Y la
+herramienta que lo detecta podria tenerlo tambien, por eso el aviso de arriba.
+
+### Coste y limite
+
+Diez mutaciones tardan unos minutos porque varias arrastran pruebas de integracion. **No
+esta en el CI**: se corre a mano al tocar una de las cuatro protecciones, que es cuando
+importa. Meterlo en cada push multiplicaria el tiempo de la suite por el numero de
+mutaciones a cambio de detectar algo que solo cambia cuando alguien edita esos ficheros.
+
+El limite honesto: esto verifica **las mutaciones que a alguien se le ocurrieron**. Una
+proteccion puede romperse de una forma que no esta en la lista, y entonces no se entera
+nadie. No es analisis exhaustivo; es una red contra el error concreto de dar por cubierto
+algo que no lo esta.
 
 ---
 
@@ -735,9 +819,14 @@ mensajes empobrecidos que **parecen completos**. «No alcanzan el quorum de escr
 como un mensaje terminado; que le falte la lista de bloques no se nota si no sabes que la
 hubo. Llevaba asi desde la Etapa 1.
 
-La leccion practica: **un fallo silencioso que degrada la calidad en vez de romper algo no
-lo encuentra nadie usando el sistema**. Solo aparece cuando algo exige el dato que falta
-—en este caso, una prueba que necesitaba `retry_after_seconds`—.
+La leccion practica, y va al informe con estas palabras: **un fallo silencioso que degrada
+la calidad en vez de romper algo no lo encuentra nadie usando el sistema. Solo aparece
+cuando algo exige el dato que falta** —en este caso, una prueba que necesitaba
+`retry_after_seconds`—.
+
+Es la misma familia que las **pruebas que no prueban** de la seccion «Verificacion por
+mutacion»: nada falla, todo parece estar en su sitio, y lo que falta solo se ve cuando algo
+lo exige.
 
 Los tres pasaban por caminos que en el entorno de prueba no se distinguen del correcto: el
 primero porque los nodos compartian espacio de red; el segundo porque todas las pruebas de
