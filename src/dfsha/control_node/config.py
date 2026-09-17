@@ -83,6 +83,13 @@ class ControlNodeSettings(BaseSettings):
     #: Cuanto vale un lease sin renovar. Si el lider se calla mas de esto, otra
     #: instancia puede tomarlo subiendo la epoca.
     lease_ttl_ms: int = Field(default=6000, gt=0)
+    #: Vida de un lock de archivo (RF3). Dos ordenes de magnitud mas que el lease de
+    #: liderazgo, y por un motivo: ahi el relevo tiene que ser rapido porque un cluster sin
+    #: lider no se repara; aqui lo que espera es una PERSONA que tiene el archivo abierto,
+    #: y arrebatarselo a los seis segundos porque tardo en teclear seria inutilizable.
+    #: El precio de que sea largo es que un cliente que muere deja el archivo bloqueado
+    #: ese tiempo.
+    file_lock_ttl_ms: int = Field(default=120_000, gt=0)
     #: Cada cuanto renueva el lider. Tiene que ser bastante menor que el TTL: entre los
     #: dos valores cabe el margen para una pausa, un pico de latencia de la base o un
     #: reintento, sin que el liderazgo cambie de manos por nada.

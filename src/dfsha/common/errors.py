@@ -183,6 +183,29 @@ class StaleEpochError(DFShaError):
     code = "stale_epoch"
 
 
+class FileLockedError(DFShaError):
+    """Otro cliente sostiene un lock incompatible sobre el archivo.
+
+    Lleva `holder` y `retry_after_seconds` para que el cliente pueda decidir si esperar:
+    «el archivo esta bloqueado» sin decir por quien ni hasta cuando es un mensaje con el
+    que no se puede hacer nada.
+    """
+
+    code = "file_locked"
+
+
+class StaleLockError(DFShaError):
+    """El lock con el que se pidio la operacion ya no es el vigente.
+
+    El equivalente del RF3 a `StaleEpochError`, y atrapa al mismo tipo de fallo: un
+    cliente que se congelo con el lock tomado, vio vencer su lease sin enterarse, y
+    despierta escribiendo encima de quien lo tomo despues. Se comprueba DENTRO de la
+    misma transaccion que la escritura, por el mismo motivo.
+    """
+
+    code = "stale_lock"
+
+
 class StorageError(DFShaError):
     """Fallo de E/S en el DataNode."""
 

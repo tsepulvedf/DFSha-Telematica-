@@ -44,7 +44,7 @@ def get_settings_dep(request: Request) -> ControlNodeSettings:
     return request.app.state.settings
 
 
-def get_token_signer(request: Request) -> "TokenSigner | None":
+def get_token_signer(request: Request) -> TokenSigner | None:
     """El firmante de tokens de bloque. `None` cuando no hay TLS configurado.
 
     Que sea opcional no es una puerta trasera: el DataNode solo exige token cuando el
@@ -132,5 +132,5 @@ Uow = Annotated[SqlUnitOfWork, Depends(get_uow)]
 QueryUow = Annotated[SqlUnitOfWork, Depends(get_query_uow)]
 UowFactory = Annotated[Callable[[], SqlUnitOfWork], Depends(get_uow_factory)]
 Placement = Annotated[BlockPlacementPolicy, Depends(get_placement)]
-Signer = Annotated["TokenSigner | None", Depends(get_token_signer)]
+Signer = Annotated[TokenSigner | None, Depends(get_token_signer)]
 CurrentUser = Annotated[TokenClaims, Depends(current_user)]

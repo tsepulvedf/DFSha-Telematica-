@@ -68,3 +68,80 @@ def plan_blocks(size: int, block_size: int) -> list[BlockSpec]:
         offset += current
         index += 1
     return specs
+
+
+@dataclass(frozen=True, slots=True)
+class BlockSlice:
+    """Un bloque que intersecta un rango pedido, y que trozo de el hace falta.
+
+    `skip` y `take` van en bytes CLAROS y son relativos al principio del bloque
+    descifrado. El cliente **descarga el bloque entero** y recorta despues.
+    """
+
+    index: int
+    #: Bytes a descartar del principio del bloque ya descifrado.
+    skip: int
+    #: Bytes a quedarse a partir de ahi.
+    take: int
+
+
+def plan_range(
+    sizes: list[int], offset: int, length: int, *, overhead: int = 0
+) -> list[BlockSlice]:
+    """Que bloques hacen falta para leer `length` bytes desde `offset`, y que trozo.
+
+    `sizes` son los tamanos ALMACENADOS por indice, tal y como estan en `blocks.size`;
+    `overhead` lo que el cifrado anade a cada uno. La resta se hace aqui para que el
+    llamante no tenga que acordarse: quien pide un rango razona en bytes claros, que es
+    lo que el usuario ve.
+
+    ## El bloque se descarga ENTERO aunque solo se quiera un byte
+
+    Es la consecuencia directa de cifrar con AES-GCM, y conviene tenerla escrita porque
+    parece una ineficiencia gratuita y no lo es: **un bloque cifrado no se puede descifrar
+    por partes**. La etiqueta de autenticacion cubre el bloque completo, asi que para
+    obtener cualquier byte con garantia de que no fue alterado hay que tener los demas.
+
+    Pedir un rango con `Range:` al DataNode daria los bytes cifrados de ese tramo, que no
+    se pueden descifrar ni verificar. La alternativa —cifrar en trozos mas pequenos, con
+    su propia etiqueta cada uno— es un diseno distinto: mas etiquetas, mas nonces que no
+    repetir, y el limite util lo pondria el tamano de trozo elegido.
+
+    Lo que SI ahorra el rango, y es el 90% del beneficio real: **no descargar los bloques
+    que no intersectan**. Leer 1 KB del final de un archivo de 1 GB con bloques de 64 MB
+    baja 64 MB en vez de 1 GB.
+
+    Y el ahorro aparece igual sin cifrado: entonces `overhead` es 0 y un cliente que
+    quiera puede pedir el tramo exacto al DataNode. Esta funcion no lo impide, solo dice
+    que bloques tocar.
+    """
+    if offset < 0:
+        raise ValueError("el desplazamiento no puede ser negativo")
+    if length < 0:
+        raise ValueError("la longitud no puede ser negativa")
+
+    claros = [s - overhead for s in sizes]
+    if any(c < 0 for c in claros):
+        raise ValueError("un bloque no puede medir menos que el sobrecoste del cifrado")
+
+    trozos: list[BlockSlice] = []
+    if length == 0:
+        return trozos
+
+    fin = offset + length
+    inicio_bloque = 0
+    for index, tamano in enumerate(claros):
+        fin_bloque = inicio_bloque + tamano
+        # Solapamiento de dos intervalos semiabiertos. Se compara con el fin y no con el
+        # indice calculado por division porque el ULTIMO bloque puede ser mas corto: una
+        # division supondria que todos miden igual y leeria de mas al final del archivo.
+        if fin_bloque > offset and inicio_bloque < fin:
+            skip = max(0, offset - inicio_bloque)
+            take = min(fin_bloque, fin) - (inicio_bloque + skip)
+            if take > 0:
+                trozos.append(BlockSlice(index=index, skip=skip, take=take))
+        inicio_bloque = fin_bloque
+        if inicio_bloque >= fin:
+            break
+
+    return trozos

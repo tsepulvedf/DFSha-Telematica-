@@ -22,6 +22,7 @@ from sqlalchemy import case, delete, func, select, update
 from sqlalchemy.orm import Session
 
 from dfsha.control_node.domain.acl import AclEntry, Permission, PrincipalType
+from dfsha.control_node.domain.filelock import FileLock, LockMode
 from dfsha.control_node.domain.leadership import Lease
 from dfsha.control_node.domain.entities import (
     Block,
@@ -37,6 +38,7 @@ from dfsha.control_node.domain.entities import (
 )
 
 from .models import (
+    FileLockRow,
     LEADERSHIP_ROW_ID,
     AclEntryRow,
     GroupMemberRow,
@@ -383,6 +385,16 @@ class SqlFileRepository:
             .values(wrapped_key=wrapped_key, key_algo=key_algo)
         )
 
+    def set_size(self, file_id: str, size: int) -> None:
+        """Nuevo tamano CLARO del archivo, tras un append.
+
+        `files.size` son bytes claros y `blocks.size` los almacenados: la suma de los
+        segundos NO es el primero en cuanto hay cifrado. Ver "Cifrado extremo a extremo".
+        """
+        self._session.execute(
+            update(FileRow).where(FileRow.id == file_id).values(size=size)
+        )
+
     def mark_committed(self, file_id: str, committed_at: datetime) -> None:
         self._session.execute(
             update(FileRow)
@@ -508,6 +520,22 @@ class SqlBlockRepository:
         ).rowcount
         return borradas > 0
 
+    def detach(self, block_id: str) -> None:
+        """Desliga un bloque de su archivo, dejandolo huerfano para el GC.
+
+        Lo usa el append al reescribir el bloque de cola: el bloque viejo NO se borra —los
+        bloques son inmutables y borrar bytes es cosa del GC— pero deja de formar parte
+        del archivo. Es la decision 1 de la seccion 1 aplicada a un bloque en vez de a un
+        archivo entero: copy-on-write.
+
+        Se hace poniendo el `file_id` a NULL, no borrando la fila: la fila lleva las
+        `block_replicas`, que son las que le dicen al GC en que discos hay que ir a
+        borrar. Borrarla aqui dejaria los bytes en disco sin que nadie supiera donde.
+        """
+        self._session.execute(
+            update(BlockRow).where(BlockRow.block_id == block_id).values(file_id=None)
+        )
+
     def get_many(self, block_ids: Sequence[str]) -> list[Block]:
         """Varios bloques por id, en una sola consulta.
 
@@ -594,6 +622,52 @@ class SqlBlockRepository:
         )
         return list(rows)
 
+    def ids_below_quorum(self, block_ids: Sequence[str], quorum: int) -> list[str]:
+        """Como `blocks_below_quorum` pero sobre una LISTA de bloques, no un archivo.
+
+        La necesita el commit del append: sus bloques nuevos todavia no pertenecen a
+        ningun archivo —nacen con `file_id` NULL y se enganchan al confirmar—, asi que
+        una consulta por `file_id` no los veria.
+        """
+        if not block_ids:
+            return []
+        almacenadas = (
+            select(
+                BlockReplicaRow.block_id.label("block_id"),
+                func.count().label("copias"),
+            )
+            .where(BlockReplicaRow.state == ReplicaState.STORED.value)
+            .group_by(BlockReplicaRow.block_id)
+            .subquery()
+        )
+        rows = self._session.scalars(
+            select(BlockRow.block_id)
+            .outerjoin(almacenadas, almacenadas.c.block_id == BlockRow.block_id)
+            .where(
+                BlockRow.block_id.in_(list(block_ids)),
+                func.coalesce(almacenadas.c.copias, 0) < quorum,
+            )
+            .order_by(BlockRow.index)
+        )
+        return list(rows)
+
+    def attach(self, block_ids: Sequence[str], file_id: str) -> None:
+        """Engancha bloques sueltos a su archivo. El paso final del append.
+
+        Los bloques del append nacen con `file_id` NULL y **su indice definitivo ya
+        puesto**. Engancharlos es una sola escritura, y va en la MISMA transaccion que
+        desligar el bloque de cola viejo: si fueran dos pasos, entre ellos habria un
+        instante con dos bloques en el mismo `(file_id, index)` —lo impide el UNIQUE— o
+        con el archivo sin su cola.
+        """
+        if not block_ids:
+            return
+        self._session.execute(
+            update(BlockRow)
+            .where(BlockRow.block_id.in_(list(block_ids)))
+            .values(file_id=file_id)
+        )
+
     def stored_replica_counts(self, file_id: str) -> dict[str, int]:
         """Cuantas copias STORED tiene cada bloque del archivo.
 
@@ -635,11 +709,15 @@ class SqlBlockRepository:
         return [copias for _, copias in filas]
 
     def list_orphans(self, now: datetime) -> list[tuple[Block, list[BlockReplica]]]:
+        # OUTER JOIN y no INNER: el tercer caso de huerfano es un bloque SIN archivo
+        # (`file_id IS NULL`), que un INNER JOIN descartaria. Lo produce el `append` al
+        # reescribir un bloque de cola a medias.
         huerfanos = self._session.scalars(
             select(BlockRow)
-            .join(FileRow, FileRow.id == BlockRow.file_id)
+            .outerjoin(FileRow, FileRow.id == BlockRow.file_id)
             .where(
-                (FileRow.state == FileState.DELETED.value)
+                BlockRow.file_id.is_(None)
+                | (FileRow.state == FileState.DELETED.value)
                 | (
                     (FileRow.state == FileState.WRITING.value)
                     & (FileRow.expires_at.is_not(None))
@@ -1378,6 +1456,112 @@ class SqlAclRepository:
         )
 
 
+class SqlFileLockRepository:
+    """Los locks del RF3. Mismo patron que el lease de liderazgo, por el mismo motivo.
+
+    `lock_rows()` no es un `list()` con otro nombre: toma cerrojo sobre las filas del
+    archivo. Leer los locks sin cerrojo y escribir despues deja una ventana por la que
+    dos clientes obtienen el mismo EXCLUSIVE, que es exactamente lo que el lock existe
+    para impedir.
+    """
+
+    def __init__(self, session: Session) -> None:
+        self._session = session
+
+    def lock_rows(self, file_id: str) -> list[FileLock]:
+        """Los locks de un archivo, con `SELECT ... FOR UPDATE` sobre sus filas.
+
+        Devuelve tambien los VENCIDOS: quien decide es `domain/filelock.can_acquire`, que
+        los ignora. Filtrarlos aqui repartiria la regla del vencimiento entre el
+        repositorio y el dominio, y bastaria tocar uno de los dos para que dejaran de
+        cuadrar.
+
+        **SQLite no implementa `FOR UPDATE`** y no se pide, igual que en el liderazgo:
+        escribe con cerrojo de base entera y el efecto se consigue igual.
+        """
+        consulta = select(FileLockRow).where(FileLockRow.file_id == file_id)
+        if self._session.bind is not None and self._session.bind.dialect.name != "sqlite":
+            consulta = consulta.with_for_update()
+        return [_to_file_lock(f) for f in self._session.execute(consulta).scalars()]
+
+    def peek(self, file_id: str) -> list[FileLock]:
+        """Los locks SIN cerrojo. Solo para mostrarlos (`stat`, `dfsha locks`).
+
+        Separada de `lock_rows()` por el mismo motivo que `peek` del liderazgo: una
+        consulta informativa no debe contender con las escrituras.
+        """
+        filas = self._session.execute(
+            select(FileLockRow).where(FileLockRow.file_id == file_id)
+        ).scalars()
+        return [_to_file_lock(f) for f in filas]
+
+    def upsert(self, lock: FileLock, holder_name: str = "") -> None:
+        """Concede o renueva. La unicidad (file_id, holder_id) la garantiza el esquema."""
+        fila = self._session.execute(
+            select(FileLockRow).where(
+                FileLockRow.file_id == lock.file_id,
+                FileLockRow.holder_id == lock.holder_id,
+            )
+        ).scalar_one_or_none()
+
+        if fila is None:
+            self._session.add(
+                FileLockRow(
+                    id=new_id(),
+                    file_id=lock.file_id,
+                    holder_id=lock.holder_id,
+                    holder_name=holder_name,
+                    mode=lock.mode.value,
+                    epoch=lock.epoch,
+                    acquired_at=lock.acquired_at,
+                    expires_at=lock.expires_at,
+                )
+            )
+            return
+
+        fila.mode = lock.mode.value
+        fila.epoch = lock.epoch
+        fila.acquired_at = lock.acquired_at
+        fila.expires_at = lock.expires_at
+        if holder_name:
+            fila.holder_name = holder_name
+
+    def release(self, file_id: str, holder_id: str) -> bool:
+        fila = self._session.execute(
+            select(FileLockRow).where(
+                FileLockRow.file_id == file_id, FileLockRow.holder_id == holder_id
+            )
+        ).scalar_one_or_none()
+        if fila is None:
+            return False
+        self._session.delete(fila)
+        return True
+
+    def max_epoch(self, file_id: str) -> int:
+        """La epoca mas alta que ha tenido este archivo, incluidos los locks vencidos.
+
+        Se mira el maximo y NO el del lock que se sustituye: la epoca de un archivo SOLO
+        SUBE, igual que la del liderazgo. Si se reiniciara al conceder un lock nuevo, un
+        cliente congelado con una epoca vieja podria volver a validarla, que es el fallo
+        entero que la epoca existe para cerrar.
+        """
+        valor = self._session.execute(
+            select(func.max(FileLockRow.epoch)).where(FileLockRow.file_id == file_id)
+        ).scalar()
+        return int(valor or 0)
+
+
+def _to_file_lock(fila: FileLockRow) -> FileLock:
+    return FileLock(
+        file_id=fila.file_id,
+        holder_id=fila.holder_id,
+        mode=LockMode(fila.mode),
+        epoch=fila.epoch,
+        acquired_at=fila.acquired_at,
+        expires_at=fila.expires_at,
+    )
+
+
 class SqlLeadershipRepository:
     """El lease de liderazgo. Una fila, y toda la concurrencia del Bloque A pasa por ella.
 
@@ -1531,6 +1715,7 @@ class SqlUnitOfWork:
         self.leadership = SqlLeadershipRepository(self._session)
         self.rereplication = SqlRereplicationRepository(self._session)
         self.acl = SqlAclRepository(self._session)
+        self.file_locks = SqlFileLockRepository(self._session)
 
     def __enter__(self) -> "SqlUnitOfWork":
         if self._session is None:

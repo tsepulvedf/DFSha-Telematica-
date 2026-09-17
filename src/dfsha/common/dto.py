@@ -237,6 +237,146 @@ class OpenFileResponse(_Dto):
     key_algo: str = ""
 
 
+# --- RF3: open / read / write / lock ---------------------------------------
+
+
+class LockRequest(_Dto):
+    path: str
+    #: "shared" o "exclusive".
+    mode: str = "exclusive"
+    #: Identificador de SESION. Vacio = el id del usuario. Va explicito porque el titular
+    #: de un lock es una sesion y no una persona: Ana desde dos maquinas tiene que poder
+    #: excluirse a si misma, o el lock no excluiria nada entre sus propios procesos.
+    holder: str = ""
+
+
+class OpenRequest(_Dto):
+    path: str
+    #: "read" o "write". Decide el permiso exigido y el modo del lock.
+    mode: str = "read"
+    #: Si ademas hay que bloquear. Abrir y bloquear ocurren en la MISMA transaccion: con
+    #: dos llamadas, entre una y otra otro cliente puede tomar el lock.
+    lock: bool = False
+    holder: str = ""
+
+
+class LocksResponse(_Dto):
+    path: str
+    holders: list["LockHolder"] = []
+
+
+class LockResponse(_Dto):
+    """El lock concedido. `holder` y `epoch` juntos son el token de aislamiento.
+
+    El cliente los reenvia en cada escritura y el ControlNode los verifica **dentro de la
+    transaccion** que escribe. No es un identificador opaco a proposito: que se vea la
+    epoca hace legible en los logs y en `dfsha locks` que cada concesion es un episodio
+    nuevo.
+    """
+
+    file_id: str
+    path: str
+    holder: str
+    epoch: int
+    mode: str
+    expires_at: datetime
+    lease_seconds: float
+
+
+class LockHolder(_Dto):
+    holder: str
+    mode: str
+    epoch: int
+    expires_at: datetime
+
+
+class OpenResponse(_Dto):
+    """El «handle» del RF3, que es **solo datos**.
+
+    El ControlNode no guarda handles abiertos: es stateless desde la Etapa 1, y guardarlos
+    obligaria a sesiones pegajosas en el balanceador. Lo que el cliente recibe es todo lo
+    que necesita para operar, y si se pierde, basta volver a abrir.
+    """
+
+    file_id: str
+    path: str
+    size: int
+    block_size: int
+    mode: str
+    wrapped_key: str = ""
+    key_algo: str = ""
+    #: Presente solo si se pidio bloqueo al abrir.
+    lock: LockResponse | None = None
+
+
+class ReadRangeResponse(_Dto):
+    """Los bloques que intersectan un rango, con que trozo de cada uno hace falta.
+
+    `skip` y `take` van en bytes CLAROS sobre el bloque ya descifrado: **el bloque se
+    descarga entero**. Un bloque cifrado con AES-GCM no se puede descifrar por partes,
+    porque la etiqueta cubre el bloque completo. Lo que el rango ahorra —y es casi todo el
+    ahorro real— es no bajar los bloques que no intersectan.
+    """
+
+    file_id: str
+    offset: int
+    length: int
+    #: Tamano claro del archivo, para que el cliente sepa si pidio mas alla del final.
+    size: int
+    blocks: list["RangeBlock"] = []
+
+
+class RangeBlock(_Dto):
+    block_id: str
+    index: int
+    size: int
+    checksum_sha256: str
+    replicas: list[ReplicaRef]
+    token: str = ""
+    #: Bytes a descartar del principio del bloque ya descifrado.
+    skip: int = 0
+    #: Bytes a quedarse a partir de ahi.
+    take: int = 0
+
+
+class AppendRequest(_Dto):
+    size: int = Field(gt=0)
+    cipher_overhead: int = Field(default=0, ge=0)
+    #: El par de aislamiento del lock. Vacio = el archivo no esta bloqueado.
+    lock_holder: str = ""
+    lock_epoch: int = 0
+
+
+class AppendCommitRequest(_Dto):
+    """Lo que el cliente devuelve tras subir los bloques del append.
+
+    Manda los `block_ids` y el tamano que reclama en vez de que el servidor los deduzca,
+    porque el servidor no sabe cuantos de los bloques planificados llego a subir de verdad:
+    lo unico que sabe es cuales tienen quorum, y eso es lo que comprueba.
+    """
+
+    block_ids: list[str] = []
+    new_size: int = Field(ge=0)
+    #: `block_id` del bloque de cola que se sustituye. Vacio si no habia cola que
+    #: reescribir. Se desliga en la misma transaccion en que se enganchan los nuevos.
+    replaces: str = ""
+    lock_holder: str = ""
+    lock_epoch: int = 0
+
+
+class AppendResponse(_Dto):
+    file_id: str
+    block_size: int
+    expires_at: datetime
+    #: El bloque de cola a reescribir, o null si el archivo acaba en bloque lleno.
+    #: El CLIENTE lo baja, lo descifra, le pega los datos nuevos y sube el resultado como
+    #: el primero de `blocks`. Lo hace el cliente porque con cifrado extremo a extremo el
+    #: servidor no podria: la clave no sale de ahi.
+    tail: BlockReadPlan | None = None
+    tail_plain_size: int = 0
+    blocks: list[BlockWritePlan] = []
+
+
 # --- Interno: DataNode y GC ------------------------------------------------
 
 

@@ -20,6 +20,7 @@ from dfsha.common.errors import (
     ChecksumMismatchError,
     DFShaError,
     DirectoryNotEmptyError,
+    FileLockedError,
     InvalidPathError,
     InvalidStateError,
     IsADirectoryError_,
@@ -27,6 +28,7 @@ from dfsha.common.errors import (
     NotADirectoryError_,
     NotFoundError,
     ReservationExpiredError,
+    StaleLockError,
     StorageError,
 )
 from dfsha.common.logging import get_logger
@@ -50,6 +52,11 @@ STATUS_BY_ERROR: dict[type[DFShaError], int] = {
     BlocksNotStoredError: status.HTTP_409_CONFLICT,
     InvalidStateError: status.HTTP_409_CONFLICT,
     BlockAlreadyExistsError: status.HTTP_409_CONFLICT,
+    # 409 y no 423 (Locked): 423 es de WebDAV y muchos clientes HTTP no lo tratan como
+    # reintentable. El cuerpo lleva `holder` y `retry_after_seconds`, que es la
+    # informacion con la que de verdad se decide si esperar.
+    FileLockedError: status.HTTP_409_CONFLICT,
+    StaleLockError: status.HTTP_409_CONFLICT,
     ReservationExpiredError: status.HTTP_410_GONE,
     # 422 literal: starlette renombro la constante entre versiones y el nombre
     # viejo emite un DeprecationWarning.

@@ -198,8 +198,12 @@ class BlockRow(Base):
     __tablename__ = "blocks"
 
     block_id: Mapped[str] = mapped_column(String(ID_LEN), primary_key=True)
-    file_id: Mapped[str] = mapped_column(
-        String(ID_LEN), ForeignKey("files.id"), nullable=False, index=True
+    #: NULL = bloque DESLIGADO: ya no pertenece a ningun archivo y el GC puede recogerlo.
+    #: Lo produce el `append` al reescribir un bloque de cola a medias (copy-on-write,
+    #: decision 1). La fila sobrevive porque sus `block_replicas` son lo unico que sabe en
+    #: que discos estan sus bytes; borrarla los dejaria perdidos.
+    file_id: Mapped[str | None] = mapped_column(
+        String(ID_LEN), ForeignKey("files.id"), nullable=True, index=True
     )
     index: Mapped[int] = mapped_column(Integer, nullable=False)
     size: Mapped[int] = mapped_column(BigInteger, nullable=False)
@@ -297,6 +301,46 @@ class LeadershipRow(Base):
     acquired_at: Mapped[datetime | None] = mapped_column(UtcDateTime, nullable=True)
     renewed_at: Mapped[datetime | None] = mapped_column(UtcDateTime, nullable=True)
     expires_at: Mapped[datetime | None] = mapped_column(UtcDateTime, nullable=True)
+
+
+class FileLockRow(Base):
+    """Un lock sobre un archivo, vivo o vencido.
+
+    **Los vencidos se quedan en la tabla y no molestan.** El vencimiento se evalua al
+    consultar (`domain/filelock.can_acquire` los ignora), que es la regla de las
+    comprobaciones perezosas de la seccion 1. Borrarlos exigiria un barrido en background,
+    que es justo lo que ese diseno evita.
+
+    `holder_id` es una SESION, no un usuario: Ana desde dos maquinas son dos titulares, y
+    tiene que ser asi o el lock no excluiria nada entre sus propios procesos. Por eso no
+    hay clave foranea a `users`.
+    """
+
+    __tablename__ = "file_locks"
+
+    id: Mapped[str] = mapped_column(String(ID_LEN), primary_key=True)
+    file_id: Mapped[str] = mapped_column(
+        String(ID_LEN), ForeignKey("files.id", ondelete="CASCADE"), nullable=False
+    )
+    holder_id: Mapped[str] = mapped_column(String(ID_LEN), nullable=False)
+    #: Para poder decir «lo tiene ana» en el conflicto. No se usa para decidir.
+    holder_name: Mapped[str] = mapped_column(String(64), nullable=False, default="")
+    mode: Mapped[str] = mapped_column(String(16), nullable=False)
+    #: Token de aislamiento, igual que el del liderazgo. SOLO SUBE. Es lo que impide que
+    #: un cliente congelado despierte pasado el vencimiento y escriba encima del
+    #: siguiente. Ver domain/filelock.py.
+    epoch: Mapped[int] = mapped_column(BigInteger, nullable=False, default=0)
+    acquired_at: Mapped[datetime] = mapped_column(UtcDateTime, nullable=False)
+    expires_at: Mapped[datetime] = mapped_column(UtcDateTime, nullable=False)
+
+    __table_args__ = (
+        # Pedir dos veces el mismo lock es RENOVAR, no crear otra fila. Sin esto, un
+        # cliente que reintenta tras un timeout de red se dejaria filas sueltas que
+        # cuentan como titulares distintos, y su EXCLUSIVE entraria en conflicto consigo
+        # mismo.
+        UniqueConstraint("file_id", "holder_id", name="uq_file_locks_file_holder"),
+        Index("ix_file_locks_file", "file_id"),
+    )
 
 
 class RereplicationTaskRow(Base):

@@ -12,7 +12,14 @@ import time
 from dataclasses import dataclass, field
 from datetime import timedelta
 
-from dfsha.common.errors import InvalidPathError, NotFoundError
+from datetime import datetime
+
+from dfsha.common.errors import (
+    BlocksNotStoredError,
+    InvalidPathError,
+    InvalidStateError,
+    NotFoundError,
+)
 from dfsha.common.logging import get_logger
 from dfsha.control_node.domain.entities import (
     Block,
@@ -33,6 +40,10 @@ from dfsha.control_node.repositories.sql import SqlUnitOfWork, new_id
 from dfsha.control_node.services.placement import BlockPlacementPolicy
 from dfsha.control_node.domain.acl import Permission
 from dfsha.control_node.services.access import directory_for
+from dfsha.control_node.services.permissions import require
+from dfsha.control_node.domain.filelock import LockFencing
+from dfsha.control_node.commands.filelock import require_lock
+from dfsha.control_node.queries.files import ReadBlock
 from dfsha.control_node.services.resolver import absolute_path
 from dfsha.control_node.tracing import command
 
@@ -277,3 +288,262 @@ def abort_file(uow: SqlUnitOfWork, owner_id: str, file_id: str) -> None:
         if archivo.state is FileState.WRITING:
             uow.files.mark_deleted(file_id, utcnow())
             uow.commit()
+
+
+@dataclass(frozen=True, slots=True)
+class AppendPlan:
+    """Lo que hace falta para anadir datos al final de un archivo.
+
+    ## Por que anadir a un archivo WORM no es trivial
+
+    Los bloques son inmutables (decision 1 de la seccion 1). Si el ultimo bloque de un
+    archivo esta **a medias** —lo normal, salvo que el tamano sea multiplo exacto— anadir
+    datos tiene que llenarlo, y llenarlo es reescribirlo. Las dos salidas posibles:
+
+    (a) **Empezar siempre un bloque nuevo.** Barato de escribir y caro para siempre: un
+        archivo al que se anade mil veces acaba con mil bloques diminutos, cada uno con su
+        colocacion, sus R=3 filas de replica y su sitio en la cola de re-replicacion. Mil
+        bloques de 12 bytes son 3000 filas para 12 KB de datos.
+
+    (b) **Reescribir el bloque de cola** como copy-on-write: nace con OTRO `block_id`,
+        ocupa el mismo indice, y el viejo se desliga y queda para el GC.
+
+    Se eligio **(b)**, y el precio hay que decirlo entero: **anadir un byte puede reescribir
+    hasta un bloque completo** —64 MB con el default—. Es amplificacion de escritura
+    acotada por el tamano de bloque, no por el del archivo. A cambio se conserva el
+    invariante «todos los bloques llenos salvo el ultimo», que es lo que mantiene la
+    colocacion, la contabilidad de tamanos y las lecturas por rango razonando sobre bloques
+    homogeneos.
+
+    ## Y la cola la reescribe el CLIENTE, no el servidor
+
+    No es una comodidad: con cifrado extremo a extremo **el servidor no podria hacerlo
+    aunque quisiera**. Para concatenar los bytes nuevos al bloque de cola hay que
+    descifrarlo, y la clave no sale del cliente. La consecuencia es que el append encaja
+    solo en la decision 4 —los bytes no pasan por el ControlNode— sin que haya habido que
+    forzar nada.
+
+    El cliente recibe `tail` (el bloque parcial, como plan de LECTURA), se lo baja, lo
+    descifra, le pega los datos nuevos, y sube el resultado como el primer bloque de
+    `blocks`.
+    """
+
+    file_id: str
+    block_size: int
+    #: El bloque de cola a reescribir, o `None` si el archivo acaba en bloque lleno (o
+    #: esta vacio). Es un plan de LECTURA porque el cliente tiene que bajarselo.
+    tail: ReadBlock | None
+    #: Bytes CLAROS que ese bloque de cola tiene hoy. El cliente los conserva y escribe
+    #: detras. Va aparte de `tail.size` porque ese es el tamano ALMACENADO.
+    tail_plain_size: int
+    #: `block_id` del bloque de cola viejo, a desligar en el commit. Vacio si no hay cola.
+    replaces: str
+    blocks: list[PlannedBlock]
+    expires_at: object
+
+
+def append_to_file(
+    uow: SqlUnitOfWork,
+    placement,
+    owner_id: str,
+    file_id: str,
+    added_size: int,
+    *,
+    write_ttl_seconds: int,
+    replication_factor: int = 1,
+    cipher_overhead: int = 0,
+    fencing: LockFencing | None = None,
+    now: datetime | None = None,
+) -> AppendPlan:
+    """Planifica anadir `added_size` bytes claros al final de un archivo COMMITTED.
+
+    **`require_lock` se llama DENTRO de este `with uow:`**, no antes. Es la regla del
+    Bloque A trasladada al RF3: comprobar el lock en una transaccion y planificar en otra
+    deja una ventana por la que se cuela el cliente congelado. Ver `commands/filelock.py`.
+    """
+    if added_size <= 0:
+        raise InvalidStateError("no hay nada que anadir", added=added_size)
+
+    ahora = now or utcnow()
+
+    with uow:
+        archivo = uow.files.get(file_id)
+        if archivo is None or archivo.state is not FileState.COMMITTED:
+            raise NotFoundError("no hay un archivo confirmado con ese id", file_id=file_id)
+
+        # Anadir es escribir: WRITE sobre el directorio que lo contiene. Se resuelve por
+        # el mismo camino que todo lo demas, con el minimo en la firma.
+        directorio = uow.directories.get(archivo.directory_id)
+        if directorio is None:
+            raise NotFoundError("el directorio del archivo no existe", file_id=file_id)
+        require(uow, owner_id, directorio, Permission.WRITE)
+
+        # EL LOCK, dentro de la misma transaccion que lo que se va a escribir.
+        require_lock(uow, file_id, fencing, now=ahora)
+
+        bloques = uow.blocks.list_for_file(file_id)
+        efectivo = archivo.block_size
+
+        # ¿Acaba en bloque a medias? Se mira el tamano CLARO, que es el que el usuario ve.
+        cola = bloques[-1] if bloques else None
+        cola_clara = (cola.size - cipher_overhead) if cola is not None else 0
+        reescribe_cola = cola is not None and cola_clara < efectivo
+
+        nuevo_tamano = archivo.size + added_size
+
+        # Lo que hay que escribir: los bytes de la cola que se conservan mas los nuevos.
+        por_escribir = (cola_clara if reescribe_cola else 0) + added_size
+        indice_inicial = (cola.index if reescribe_cola else len(bloques))
+
+        bloques_nuevos: list[Block] = []
+        replicas: list[BlockReplica] = []
+        planificados: list[PlannedBlock] = []
+
+        for spec in plan_blocks(por_escribir, efectivo):
+            block_id = new_id()
+            indice = indice_inicial + spec.index
+            almacenado = spec.size + cipher_overhead
+            destinos = placement.select(almacenado, replication_factor)
+            # file_id=None: el bloque nace SUELTO. Se engancha en el commit del append,
+            # cuando sus bytes ya estan en disco. Si se enganchara aqui, entre la
+            # planificacion y la subida el archivo tendria bloques que nadie ha escrito y
+            # cualquier lectura fallaria.
+            bloques_nuevos.append(
+                Block(block_id=block_id, file_id=None, index=indice, size=almacenado)
+            )
+            replicas.extend(
+                BlockReplica(
+                    block_id=block_id,
+                    data_node_id=nodo.id,
+                    state=ReplicaState.PENDING,
+                    created_at=ahora,
+                )
+                for nodo in destinos
+            )
+            planificados.append(
+                PlannedBlock(
+                    block_id=block_id,
+                    index=indice,
+                    size=almacenado,
+                    replicas=[(n.id, n.advertise_url) for n in destinos],
+                    pipeline=[n.peer_base_url for n in destinos[1:]],
+                )
+            )
+
+        uow.blocks.add_plan(bloques_nuevos, replicas)
+        uow.commit()
+
+        lectura_cola = None
+        if reescribe_cola:
+            copias = uow.blocks.list_replicas([cola.block_id]).get(cola.block_id, [])
+            almacenadas = [r for r in copias if r.state is ReplicaState.STORED]
+            if not almacenadas:
+                raise NotFoundError(
+                    "no se puede anadir: el bloque de cola no tiene ninguna copia legible",
+                    file_id=file_id,
+                    block_id=cola.block_id,
+                )
+            lectura_cola = ReadBlock(
+                block_id=cola.block_id,
+                index=cola.index,
+                size=cola.size,
+                checksum_sha256=cola.checksum_sha256 or "",
+                replicas=[
+                    (r.data_node_id, nodo.advertise_url)
+                    for r in almacenadas
+                    if (nodo := uow.data_nodes.get(r.data_node_id)) is not None
+                ],
+            )
+
+    get_logger("control_node").info(
+        "file.append_planned",
+        file_id=file_id,
+        added_bytes=added_size,
+        new_size=nuevo_tamano,
+        rewrites_tail=reescribe_cola,
+        rewritten_bytes=cola_clara if reescribe_cola else 0,
+        new_blocks=len(planificados),
+    )
+
+    return AppendPlan(
+        file_id=file_id,
+        block_size=efectivo,
+        tail=lectura_cola,
+        tail_plain_size=cola_clara if reescribe_cola else 0,
+        replaces=cola.block_id if reescribe_cola else "",
+        blocks=planificados,
+        expires_at=ahora + timedelta(seconds=write_ttl_seconds),
+    )
+
+
+def commit_append(
+    uow: SqlUnitOfWork,
+    owner_id: str,
+    file_id: str,
+    *,
+    block_ids: list[str],
+    new_size: int,
+    replaces: str = "",
+    write_quorum: int = 1,
+    fencing: LockFencing | None = None,
+    now: datetime | None = None,
+) -> CommittedFile:
+    """Confirma un append. **Todo el cambio de metadato ocurre aqui, de una vez.**
+
+    Hasta esta llamada el archivo no ha cambiado: sigue con su tamano viejo, su bloque de
+    cola viejo, y los bloques nuevos existen sueltos sin pertenecerle. Un lector que pase
+    por en medio ve el archivo de antes, entero y legible. Eso es lo que distingue este
+    diseno de uno que fuera actualizando el metadato sobre la marcha, que dejaria ventanas
+    en las que el archivo dice medir mas de lo que se puede leer.
+
+    Las tres escrituras —desligar la cola vieja, enganchar los bloques nuevos, actualizar
+    el tamano— van en **una sola transaccion**, por el mismo motivo que el copy-on-write
+    del `commit` normal: una caida en medio dejaria el archivo describiendose a si mismo
+    de forma incoherente.
+
+    El orden importa: **primero desligar y luego enganchar**. Al reves, el bloque nuevo y
+    el viejo compartirian `(file_id, index)` un instante y saltaria `uq_blocks_file_index`.
+    """
+    ahora = now or utcnow()
+
+    with uow:
+        archivo = uow.files.get(file_id)
+        if archivo is None or archivo.state is not FileState.COMMITTED:
+            raise NotFoundError("no hay un archivo confirmado con ese id", file_id=file_id)
+
+        directorio = uow.directories.get(archivo.directory_id)
+        if directorio is None:
+            raise NotFoundError("el directorio del archivo no existe", file_id=file_id)
+        require(uow, owner_id, directorio, Permission.WRITE)
+
+        # El lock se vuelve a exigir AQUI, no solo al planificar. Entre el plan y el
+        # commit el cliente subio bytes, lo que puede tardar minutos con bloques de 64 MB:
+        # tiempo de sobra para que su lease venciera y otro tomara el archivo.
+        require_lock(uow, file_id, fencing, now=ahora)
+
+        sin_quorum = uow.blocks.ids_below_quorum(block_ids, write_quorum)
+        if sin_quorum:
+            raise BlocksNotStoredError(
+                "no alcanzan el quorum de escritura",
+                file_id=file_id,
+                quorum=write_quorum,
+                blocks=sin_quorum[:5],
+            )
+
+        if replaces:
+            uow.blocks.detach(replaces)
+        uow.blocks.attach(block_ids, file_id)
+        uow.files.set_size(file_id, new_size)
+        uow.commit()
+
+        bloques = uow.blocks.list_for_file(file_id)
+
+    get_logger("control_node").info(
+        "file.appended",
+        file_id=file_id,
+        new_size=new_size,
+        new_blocks=len(block_ids),
+        rewrote_tail=bool(replaces),
+        block_count=len(bloques),
+    )
+    return CommittedFile(path=archivo.name, size=new_size, block_count=len(bloques))

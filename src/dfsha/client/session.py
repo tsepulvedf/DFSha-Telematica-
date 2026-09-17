@@ -11,7 +11,8 @@ from __future__ import annotations
 import json
 import os
 import stat
-from dataclasses import dataclass
+import uuid
+from dataclasses import dataclass, field
 from pathlib import Path
 
 from dfsha.common.errors import AuthenticationError
@@ -48,6 +49,17 @@ class Session:
     #: Quien no quiera esto tiene `dfsha login --ask-password`, que no la guarda y la
     #: pide en cada operacion.
     master_key: str | None = None
+    #: Identificador de ESTA sesion, para el RF3. El titular de un lock es una sesion y no
+    #: una persona: Ana desde dos maquinas tiene que poder excluirse a si misma, o el lock
+    #: no excluiria nada entre sus propios procesos. Se genera la primera vez y se
+    #: conserva, porque cada invocacion de `dfsha` es un proceso nuevo y uno aleatorio por
+    #: proceso haria que `dfsha lock` y el `dfsha append` siguiente fueran dos titulares
+    #: distintos.
+    holder_id: str = field(default_factory=lambda: uuid.uuid4().hex)
+    #: Epoca del lock vigente por `file_id`. Es la mitad del par de aislamiento; la otra
+    #: es `holder_id`. Se reenvia en cada escritura y el ControlNode la verifica DENTRO de
+    #: la transaccion que escribe.
+    locks: dict[str, int] = field(default_factory=dict)
     #: Sal con la que se derivo la clave maestra. Hace falta para volver a derivarla con
     #: `--ask-password`: con otra sal saldria otra clave y no abriria nada.
     kdf_salt: str = ""
@@ -98,6 +110,8 @@ class SessionStore:
             cwd=datos.get("cwd", "/"),
             last_write_lsn=datos.get("last_write_lsn"),
             master_key=datos.get("master_key"),
+            holder_id=datos.get("holder_id") or uuid.uuid4().hex,
+            locks=dict(datos.get("locks") or {}),
             kdf_salt=datos.get("kdf_salt", ""),
             session_path=str(self.path),
         )
@@ -114,6 +128,8 @@ class SessionStore:
                         "cwd": session.cwd,
                         "last_write_lsn": session.last_write_lsn,
                         "master_key": session.master_key,
+                        "holder_id": session.holder_id,
+                        "locks": session.locks,
                         "kdf_salt": session.kdf_salt,
                     },
                     indent=2,

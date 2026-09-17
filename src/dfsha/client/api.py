@@ -12,6 +12,11 @@ from pathlib import Path
 import httpx
 
 from dfsha.common.dto import (
+    AppendResponse,
+    LockResponse,
+    LocksResponse,
+    OpenResponse,
+    ReadRangeResponse,
     ClusterStatusResponse,
     CommitResponse,
     CreateFileResponse,
@@ -234,21 +239,117 @@ class ControlApi:
         )
 
 
+    # --- RF3: open / read / write / lock -----------------------------------
+
+    def open_handle(
+        self, path: str, mode: str = "read", lock: bool = False, holder: str = ""
+    ) -> OpenResponse:
+        """Abre un archivo y, si `lock`, lo bloquea en la MISMA transaccion."""
+        return OpenResponse.model_validate(
+            self._request(
+                "POST",
+                f"{API}/fs/open",
+                json={"path": path, "mode": mode, "lock": lock, "holder": holder},
+            ).json()
+        )
+
+    def lock(self, path: str, mode: str = "exclusive", holder: str = "") -> LockResponse:
+        """Toma el lock, o lo renueva si ya era de este titular."""
+        return LockResponse.model_validate(
+            self._request(
+                "POST",
+                f"{API}/fs/lock",
+                json={"path": path, "mode": mode, "holder": holder},
+            ).json()
+        )
+
+    def unlock(self, path: str, holder: str = "") -> None:
+        self._request("POST", f"{API}/fs/unlock", json={"path": path, "holder": holder})
+
+    def locks(self, path: str) -> LocksResponse:
+        return LocksResponse.model_validate(
+            self._request("GET", f"{API}/fs/locks", params={"path": path}).json()
+        )
+
+    def read_range(
+        self, path: str, offset: int = 0, length: int | None = None
+    ) -> ReadRangeResponse:
+        params: dict = {"path": path, "offset": offset}
+        if length is not None:
+            params["length"] = length
+        return ReadRangeResponse.model_validate(
+            self._request("GET", f"{API}/files/read", params=params).json()
+        )
+
+    def commit_append(
+        self,
+        file_id: str,
+        block_ids: list[str],
+        new_size: int,
+        *,
+        replaces: str = "",
+        lock_holder: str = "",
+        lock_epoch: int = 0,
+    ) -> CommitResponse:
+        return CommitResponse.model_validate(
+            self._request(
+                "POST",
+                f"{API}/files/{file_id}/append/commit",
+                json={
+                    "block_ids": block_ids,
+                    "new_size": new_size,
+                    "replaces": replaces,
+                    "lock_holder": lock_holder,
+                    "lock_epoch": lock_epoch,
+                },
+            ).json()
+        )
+
+    def append(
+        self,
+        file_id: str,
+        size: int,
+        *,
+        cipher_overhead: int = 0,
+        lock_holder: str = "",
+        lock_epoch: int = 0,
+    ) -> AppendResponse:
+        return AppendResponse.model_validate(
+            self._request(
+                "POST",
+                f"{API}/files/{file_id}/append",
+                json={
+                    "size": size,
+                    "cipher_overhead": cipher_overhead,
+                    "lock_holder": lock_holder,
+                    "lock_epoch": lock_epoch,
+                },
+            ).json()
+        )
+
+
 def _to_error(respuesta: httpx.Response) -> DFShaError:
-    """Reconstruye el error del servidor conservando su `code`.
+    """Reconstruye el error del servidor conservando su `code` y sus `details`.
 
     El status HTTP se pierde en el camino porque el codigo de dominio es mas informativo:
     `reservation_expired` dice mas que un 410 suelto.
+
+    **Los `details` se conservan**, y no es un adorno: es donde viajan los datos con los
+    que el cliente puede hacer algo. Un `file_locked` trae `holder` y
+    `retry_after_seconds`, que es exactamente lo que hace falta para decidir si esperar;
+    descartarlos dejaba «esta bloqueado» a secas, que no permite decidir nada.
     """
+    detalles: dict = {}
     try:
         cuerpo = respuesta.json()
         mensaje = cuerpo.get("message", respuesta.text)
         codigo = cuerpo.get("code", "http_error")
+        detalles = cuerpo.get("details") or {}
     except ValueError:
         mensaje = respuesta.text or f"error HTTP {respuesta.status_code}"
         codigo = "http_error"
 
-    error = DFShaError(mensaje, status=respuesta.status_code)
+    error = DFShaError(mensaje, status=respuesta.status_code, **detalles)
     error.code = codigo  # type: ignore[misc]
     return error
 

@@ -28,6 +28,11 @@ from rich.progress import (
 )
 from rich.table import Table
 
+import hashlib
+
+import httpx
+
+from dfsha.common.blocktoken import BLOCK_TOKEN_HEADER
 from dfsha.common.errors import DFShaError
 from dfsha.common.logging import configure_logging, get_logger, timed
 
@@ -44,7 +49,7 @@ from dfsha.common.crypto import (
     wrap_file_key,
 )
 
-from .transfer import download_blocks, upload_blocks
+from .transfer import PIPELINE_HEADER, download_blocks, upload_blocks
 
 __all__ = ["app", "main"]
 
@@ -854,3 +859,261 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
+
+
+# --- RF3: lock / read por rango / append -----------------------------------
+#
+# El titular de un lock es una SESION, no una persona: Ana desde dos maquinas tiene que
+# poder excluirse a si misma. El identificador de sesion se guarda junto al token, y por
+# eso `dfsha lock` y `dfsha append` funcionan entre invocaciones distintas del CLI sin
+# que el usuario tenga que pasarlo a mano.
+
+
+@app.command()
+def lock(
+    path: str,
+    shared: bool = typer.Option(
+        False, "--shared", help="Compartido (varios lectores) en vez de exclusivo."
+    ),
+) -> None:
+    """Bloquea un archivo. Vuelve a ejecutarlo para RENOVAR el lease.
+
+    El bloqueo vence solo: si este proceso muere sin soltarlo, el archivo queda libre
+    pasado el plazo. Eso es lo que evita que un cliente caido deje un archivo bloqueado
+    para siempre, y el precio es que un cliente muy lento puede perderlo sin haberse
+    caido.
+    """
+    api, sesion = _api()
+    try:
+        concedido = api.lock(
+            resolve_path(sesion, path),
+            mode="shared" if shared else "exclusive",
+            holder=sesion.holder_id,
+        )
+    except DFShaError as error:
+        _fallar(error)
+
+    sesion.locks[concedido.file_id] = concedido.epoch
+    _store().save(sesion)
+    console.print(
+        f"bloqueado [bold]{path}[/bold] en modo {concedido.mode} "
+        f"(epoca {concedido.epoch}, {concedido.lease_seconds:.0f}s)"
+    )
+    console.print(
+        "[dim]renueva con el mismo comando antes de que venza; suelta con "
+        "'dfsha unlock'[/dim]"
+    )
+
+
+@app.command()
+def unlock(path: str) -> None:
+    """Suelta el bloqueo. Soltar lo que ya no se tiene tambien vale."""
+    api, sesion = _api()
+    try:
+        api.unlock(resolve_path(sesion, path), holder=sesion.holder_id)
+    except DFShaError as error:
+        _fallar(error)
+    console.print(f"desbloqueado [bold]{path}[/bold]")
+
+
+@app.command()
+def locks(path: str) -> None:
+    """Quien tiene bloqueado un archivo."""
+    api, sesion = _api()
+    try:
+        vista = api.locks(resolve_path(sesion, path))
+    except DFShaError as error:
+        _fallar(error)
+
+    if not vista.holders:
+        console.print(f"[dim]{path}: sin bloqueos[/dim]")
+        return
+
+    tabla = Table(title=f"bloqueos de {path}", box=None)
+    tabla.add_column("titular")
+    tabla.add_column("modo")
+    tabla.add_column("epoca", justify="right")
+    tabla.add_column("vence")
+    for h in vista.holders:
+        tabla.add_row(h.holder, h.mode, str(h.epoch), h.expires_at.isoformat(" ", "seconds"))
+    console.print(tabla)
+
+
+@app.command()
+def read(
+    path: str,
+    offset: int = typer.Option(0, "--offset", "-o", help="Byte donde empezar."),
+    length: int = typer.Option(None, "--length", "-n", help="Cuantos bytes leer."),
+) -> None:
+    """Lee un TRAMO de un archivo y lo escribe por la salida estandar.
+
+    Solo se descargan los bloques que tocan el tramo: leer 1 KB del final de un archivo de
+    1 GB baja un bloque, no el archivo entero.
+
+    **El bloque se baja entero aunque solo se quiera un byte de el.** Con cifrado no hay
+    alternativa: la etiqueta de AES-GCM cubre el bloque completo, asi que no se puede
+    descifrar ni verificar un tramo suelto.
+    """
+    api, sesion = _api()
+    ruta = resolve_path(sesion, path)
+    try:
+        rango = api.read_range(ruta, offset=offset, length=length)
+        plan = api.open_file(ruta)
+    except DFShaError as error:
+        _fallar(error)
+
+    cripto = None
+    if plan.wrapped_key:
+        maestra = _clave_maestra(sesion)
+        if maestra is None:
+            console.print("[red]error[/red] archivo cifrado y sesion sin clave")
+            raise typer.Exit(code=1)
+        cripto = FileCrypto(
+            file_id=plan.file_id,
+            file_key=unwrap_file_key(bytes.fromhex(plan.wrapped_key), maestra, plan.file_id),
+        )
+
+    salida = sys.stdout.buffer
+    for bloque in rango.blocks:
+        crudo = _bajar_bloque_suelto(bloque)
+        claro = cripto.decrypt(crudo, bloque.index) if cripto else crudo
+        salida.write(claro[bloque.skip : bloque.skip + bloque.take])
+    salida.flush()
+
+
+def _bajar_bloque_suelto(bloque) -> bytes:
+    """Un bloque de una replica, probandolas por orden. Mismo relevo que `download_blocks`.
+
+    Vive aparte porque la lectura por rango no escribe a un archivo destino: devuelve los
+    bytes para recortarlos en memoria. Reusar `download_blocks` obligaria a inventar un
+    fichero temporal para tirarlo despues.
+    """
+    fallos: list[str] = []
+    for replica in bloque.replicas:
+        try:
+            respuesta = httpx.get(
+                f"{replica.base_url.rstrip('/')}/api/v1/blocks/{bloque.block_id}",
+                headers=({BLOCK_TOKEN_HEADER: bloque.token} if bloque.token else {}),
+                timeout=120,
+            )
+            if respuesta.status_code == 200:
+                return respuesta.content
+            fallos.append(f"{replica.data_node_id[:8]}: HTTP {respuesta.status_code}")
+        except httpx.HTTPError as exc:
+            fallos.append(f"{replica.data_node_id[:8]}: {type(exc).__name__}")
+
+    console.print(f"[red]error[/red] no se pudo leer el bloque {bloque.block_id}")
+    for f in fallos:
+        console.print(f"  [dim]{f}[/dim]")
+    raise typer.Exit(code=1)
+
+
+@app.command()
+def append(remoto: str, local: str) -> None:
+    """Anade el contenido de un archivo local al FINAL de uno remoto. El `write` del RF3.
+
+    Los bloques son inmutables, asi que si el ultimo del archivo remoto esta a medias hay
+    que reescribirlo: se baja, se le pegan los bytes nuevos y se sube con otro `block_id`.
+    El viejo queda para el GC.
+
+    **La reescritura la hace este cliente, no el servidor**, y no por comodidad: con
+    cifrado extremo a extremo el servidor no podria, porque concatenar exige descifrar y
+    la clave no sale de aqui.
+    """
+    origen = Path(local)
+    if not origen.is_file():
+        console.print(f"[red]error[/red] no existe el archivo local {local}")
+        raise typer.Exit(code=1)
+
+    nuevos = origen.read_bytes()
+    if not nuevos:
+        console.print("[dim]el archivo local esta vacio: no hay nada que anadir[/dim]")
+        return
+
+    api, sesion = _api()
+    ruta = resolve_path(sesion, remoto)
+    try:
+        actual = api.open_file(ruta)
+    except DFShaError as error:
+        _fallar(error)
+
+    cripto = None
+    maestra = None
+    if actual.wrapped_key:
+        maestra = _clave_maestra(sesion)
+        if maestra is None:
+            console.print("[red]error[/red] archivo cifrado y sesion sin clave")
+            raise typer.Exit(code=1)
+        cripto = FileCrypto(
+            file_id=actual.file_id,
+            file_key=unwrap_file_key(
+                bytes.fromhex(actual.wrapped_key), maestra, actual.file_id
+            ),
+        )
+
+    epoca = sesion.locks.get(actual.file_id, 0)
+    try:
+        plan = api.append(
+            actual.file_id,
+            len(nuevos),
+            cipher_overhead=TAG_BYTES if cripto else 0,
+            lock_holder=sesion.holder_id if epoca else "",
+            lock_epoch=epoca,
+        )
+    except DFShaError as error:
+        _fallar(error)
+
+    # La cola, si la hay: bajarla, descifrarla y pegarle lo nuevo delante.
+    cabeza = b""
+    if plan.tail is not None:
+        crudo = _bajar_bloque_suelto(plan.tail)
+        cabeza = cripto.decrypt(crudo, plan.tail.index) if cripto else crudo
+
+    contenido = cabeza + nuevos
+    for bloque in plan.blocks:
+        inicio = (bloque.index - plan.blocks[0].index) * plan.block_size
+        claro = contenido[inicio : inicio + plan.block_size]
+        cuerpo = cripto.encrypt(claro, bloque.index) if cripto else claro
+        _subir_bloque_suelto(bloque, cuerpo)
+
+    try:
+        resultado = api.commit_append(
+            actual.file_id,
+            [b.block_id for b in plan.blocks],
+            actual.size + len(nuevos),
+            replaces=plan.tail.block_id if plan.tail else "",
+            lock_holder=sesion.holder_id if epoca else "",
+            lock_epoch=epoca,
+        )
+    except DFShaError as error:
+        _fallar(error)
+
+    console.print(
+        f"anadidos [bold]{len(nuevos)}[/bold] B a {remoto} "
+        f"({resultado.size} B en {resultado.block_count} bloques)"
+    )
+    if plan.tail is not None:
+        console.print(
+            f"[dim]se reescribio el bloque de cola ({plan.tail_plain_size} B): los "
+            "bloques son inmutables, asi que llenarlo es escribirlo de nuevo[/dim]"
+        )
+
+
+def _subir_bloque_suelto(bloque, cuerpo: bytes) -> None:
+    respuesta = httpx.put(
+        f"{bloque.replicas[0].base_url.rstrip('/')}/api/v1/blocks/{bloque.block_id}",
+        content=cuerpo,
+        headers={
+            "X-DFSha-Checksum": hashlib.sha256(cuerpo).hexdigest(),
+            "Content-Type": "application/octet-stream",
+            **({PIPELINE_HEADER: ",".join(bloque.pipeline)} if bloque.pipeline else {}),
+            **({BLOCK_TOKEN_HEADER: bloque.token} if bloque.token else {}),
+        },
+        timeout=300,
+    )
+    if respuesta.status_code != 201:
+        console.print(
+            f"[red]error[/red] el DataNode rechazo el bloque: HTTP "
+            f"{respuesta.status_code} {respuesta.text[:200]}"
+        )
+        raise typer.Exit(code=1)

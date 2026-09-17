@@ -10,6 +10,17 @@ from __future__ import annotations
 from fastapi import APIRouter, Request, Response, status
 
 from dfsha.common.dto import (
+    AppendCommitRequest,
+    AppendRequest,
+    AppendResponse,
+    LockHolder,
+    LockRequest,
+    LockResponse,
+    LocksResponse,
+    OpenRequest,
+    OpenResponse,
+    RangeBlock,
+    ReadRangeResponse,
     BlockReadPlan,
     ClusterStatusResponse,
     DataNodeStatus,
@@ -58,6 +69,13 @@ from dfsha.control_node.queries import gc as gc_queries
 from dfsha.control_node.queries import namespace as namespace_queries
 
 from dfsha.control_node.domain.entities import utcnow
+from dfsha.control_node.domain.path import Path
+from dfsha.common.crypto import TAG_BYTES
+from dfsha.control_node.commands import filelock as filelock_commands
+from dfsha.control_node.domain.acl import Permission
+from dfsha.control_node.domain.filelock import LockFencing, LockMode, LockTimings
+from dfsha.control_node.domain.partition import plan_range
+from dfsha.control_node.services.access import entry_for
 from dfsha.control_node.domain.membership import MembershipThresholds
 
 from .deps import CurrentUser, Placement, QueryUow, Settings, Signer, Uow
@@ -432,6 +450,278 @@ def open_file(
     )
 
 
+# --- RF3: open / read / write / lock ---------------------------------------
+#
+# El «handle» de `open` es SOLO DATOS. El ControlNode no guarda archivos abiertos: es
+# stateless desde la Etapa 1, y guardarlos obligaria a sesiones pegajosas en el
+# balanceador, que es justo lo que `docker/nginx/dfsha.conf` explica que no hace falta.
+# Si el cliente pierde el handle, vuelve a abrir.
+
+
+def _lock_dto(lock, path: str, ahora) -> LockResponse:
+    return LockResponse(
+        file_id=lock.file_id,
+        path=path,
+        holder=lock.holder_id,
+        epoch=lock.epoch,
+        mode=lock.mode.value,
+        expires_at=lock.expires_at,
+        lease_seconds=round(lock.remaining_seconds(ahora), 1),
+    )
+
+
+@fs_router.post("/open")
+def open_handle(
+    body: OpenRequest, uow: Uow, user: CurrentUser, settings: Settings
+) -> OpenResponse:
+    """Abre un archivo y, si se pide, lo bloquea EN LA MISMA transaccion.
+
+    Que abrir y bloquear sean atomicos importa: con dos llamadas, entre la primera y la
+    segunda otro cliente puede tomar el lock, y el primero creeria tener abierto en
+    exclusiva algo que ya no es suyo.
+
+    El modo de apertura decide el permiso exigido y el modo del lock:
+
+    - `read`  -> READ sobre el directorio, lock SHARED (varios lectores conviven)
+    - `write` -> WRITE sobre el directorio, lock EXCLUSIVE
+    """
+    ahora = utcnow()
+    modo = LockMode.SHARED if body.mode == "read" else LockMode.EXCLUSIVE
+    minimo = Permission.READ if body.mode == "read" else Permission.WRITE
+
+    with uow:
+        encontrado = entry_for(uow, user.user_id, Path.parse(body.path), minimo)
+        archivo = encontrado.file
+        if archivo is None or not archivo.is_visible():
+            raise NotFoundError("no existe el archivo", path=body.path)
+
+        lock = None
+        if body.lock:
+            lock = filelock_commands.acquire_lock(
+                uow,
+                archivo.id,
+                holder_id=body.holder or user.user_id,
+                holder_name=user.username,
+                mode=modo,
+                timings=LockTimings.from_millis(settings.file_lock_ttl_ms),
+                now=ahora,
+            )
+            uow.commit()
+
+        return OpenResponse(
+            file_id=archivo.id,
+            path=body.path,
+            size=archivo.size,
+            block_size=archivo.block_size,
+            mode=body.mode,
+            wrapped_key=archivo.wrapped_key,
+            key_algo=archivo.key_algo,
+            lock=_lock_dto(lock, body.path, ahora) if lock else None,
+        )
+
+
+@fs_router.post("/lock")
+def lock_file(
+    body: LockRequest, uow: Uow, user: CurrentUser, settings: Settings
+) -> LockResponse:
+    """Toma el lock, o lo RENUEVA si ya era de este titular.
+
+    Adquirir y renovar son la misma llamada a proposito: un cliente que reintenta tras un
+    timeout de red no puede saber si el primero llego, y hacer fallar ese reintento
+    correcto seria un error. Ver `domain/filelock.py`.
+    """
+    ahora = utcnow()
+    modo = LockMode(body.mode)
+    minimo = Permission.READ if modo is LockMode.SHARED else Permission.WRITE
+
+    with uow:
+        encontrado = entry_for(uow, user.user_id, Path.parse(body.path), minimo)
+        archivo = encontrado.file
+        if archivo is None or not archivo.is_visible():
+            raise NotFoundError("no existe el archivo", path=body.path)
+
+        lock = filelock_commands.acquire_lock(
+            uow,
+            archivo.id,
+            holder_id=body.holder or user.user_id,
+            holder_name=user.username,
+            mode=modo,
+            timings=LockTimings.from_millis(settings.file_lock_ttl_ms),
+            now=ahora,
+        )
+        uow.commit()
+        return _lock_dto(lock, body.path, ahora)
+
+
+@fs_router.post("/unlock", status_code=status.HTTP_204_NO_CONTENT)
+def unlock_file(body: LockRequest, uow: Uow, user: CurrentUser) -> Response:
+    """Suelta el lock. Idempotente: soltar lo que ya no se tiene tambien es 204.
+
+    Se exige READ y no WRITE: soltar un lock propio no modifica el archivo, y quien abrio
+    en modo lectura tiene que poder cerrar.
+    """
+    with uow:
+        encontrado = entry_for(uow, user.user_id, Path.parse(body.path), Permission.READ)
+        archivo = encontrado.file
+        if archivo is None:
+            raise NotFoundError("no existe el archivo", path=body.path)
+        filelock_commands.release_lock(
+            uow, archivo.id, holder_id=body.holder or user.user_id
+        )
+        uow.commit()
+    return Response(status_code=status.HTTP_204_NO_CONTENT)
+
+
+@fs_router.get("/locks")
+def list_locks(path: str, uow: QueryUow, user: CurrentUser) -> LocksResponse:
+    """Quien tiene bloqueado un archivo. Informativo: se lee SIN cerrojo.
+
+    Separado de la adquisicion por el mismo motivo que `peek` del liderazgo: una consulta
+    que alguien puede repetir cada segundo no debe contender con las escrituras.
+    """
+    ahora = utcnow()
+    with uow:
+        encontrado = entry_for(uow, user.user_id, Path.parse(path), Permission.READ)
+        archivo = encontrado.file
+        if archivo is None:
+            raise NotFoundError("no existe el archivo", path=path)
+        vivos = uow.file_locks.peek(archivo.id)
+
+    return LocksResponse(
+        path=path,
+        holders=[
+            LockHolder(
+                holder=l.holder_id,
+                mode=l.mode.value,
+                epoch=l.epoch,
+                expires_at=l.expires_at,
+            )
+            for l in vivos
+            if not l.is_expired(ahora)
+        ],
+    )
+
+
+@files_router.get("/read")
+def read_range(
+    path: str,
+    uow: QueryUow,
+    user: CurrentUser,
+    signer: Signer,
+    offset: int = 0,
+    length: int | None = None,
+) -> ReadRangeResponse:
+    """Lectura por rango: solo los bloques que intersectan `[offset, offset+length)`.
+
+    **El bloque se descarga entero aunque solo se quiera un byte de el.** Es consecuencia
+    directa del cifrado: la etiqueta de AES-GCM cubre el bloque completo, asi que no se
+    puede descifrar ni verificar un tramo suelto. Lo que el rango ahorra —y es casi todo
+    el ahorro real— es **no bajar los bloques que no intersectan**: leer 1 KB del final de
+    un archivo de 1 GB con bloques de 64 MB baja 64 MB en vez de 1 GB.
+    """
+    plan = file_queries.open_file(uow, user.user_id, path)
+    overhead = TAG_BYTES if plan.wrapped_key else 0
+
+    pedido = plan.size - offset if length is None else length
+    pedido = max(0, min(pedido, max(0, plan.size - offset)))
+
+    por_indice = {b.index: b for b in plan.blocks}
+    trozos = plan_range(
+        [b.size for b in sorted(plan.blocks, key=lambda b: b.index)],
+        offset,
+        pedido,
+        overhead=overhead,
+    )
+
+    return ReadRangeResponse(
+        file_id=plan.file_id,
+        offset=offset,
+        length=pedido,
+        size=plan.size,
+        blocks=[
+            RangeBlock(
+                block_id=por_indice[t.index].block_id,
+                index=t.index,
+                size=por_indice[t.index].size,
+                checksum_sha256=por_indice[t.index].checksum_sha256,
+                replicas=_replicas(por_indice[t.index].replicas),
+                token=_emitir(signer, por_indice[t.index].block_id, "read", user.user_id),
+                skip=t.skip,
+                take=t.take,
+            )
+            for t in trozos
+        ],
+    )
+
+
+@files_router.post("/{file_id}/append", status_code=status.HTTP_201_CREATED)
+def append_file(
+    file_id: str,
+    body: AppendRequest,
+    uow: Uow,
+    user: CurrentUser,
+    settings: Settings,
+    placement: Placement,
+    signer: Signer,
+) -> AppendResponse:
+    """Anade al final de un archivo ya confirmado. El `write` del RF3.
+
+    Los bloques son inmutables, asi que si el ultimo esta a medias hay que **reescribirlo**
+    con otro `block_id` en el mismo indice, y el viejo se desliga para el GC. Es
+    copy-on-write, la decision 1 aplicada a un bloque en vez de a un archivo entero.
+
+    **La cola la reescribe el CLIENTE**, y no por comodidad: con cifrado extremo a extremo
+    el servidor no podria: concatenar exige descifrar, y la clave no sale del cliente.
+    """
+    fencing = (
+        LockFencing(holder_id=body.lock_holder, epoch=body.lock_epoch)
+        if body.lock_holder
+        else None
+    )
+
+    plan = file_commands.append_to_file(
+        uow,
+        placement,
+        user.user_id,
+        file_id,
+        body.size,
+        write_ttl_seconds=settings.write_ttl_seconds,
+        replication_factor=settings.replication_factor,
+        cipher_overhead=body.cipher_overhead,
+        fencing=fencing,
+    )
+
+    return AppendResponse(
+        file_id=plan.file_id,
+        block_size=plan.block_size,
+        expires_at=plan.expires_at,
+        tail_plain_size=plan.tail_plain_size,
+        tail=(
+            BlockReadPlan(
+                block_id=plan.tail.block_id,
+                index=plan.tail.index,
+                size=plan.tail.size,
+                checksum_sha256=plan.tail.checksum_sha256,
+                replicas=_replicas(plan.tail.replicas),
+                token=_emitir(signer, plan.tail.block_id, "read", user.user_id),
+            )
+            if plan.tail
+            else None
+        ),
+        blocks=[
+            BlockWritePlan(
+                block_id=b.block_id,
+                index=b.index,
+                size=b.size,
+                replicas=_replicas(b.replicas),
+                pipeline=b.pipeline,
+                token=_emitir(signer, b.block_id, "write", user.user_id),
+            )
+            for b in plan.blocks
+        ],
+    )
+
+
 # --- Plano interno: DataNode y GC -----------------------------------------
 #
 # El registro del DataNode ya no esta aqui: se fue a gRPC (ControlPlane.Register) con el
@@ -500,3 +790,38 @@ def gc_dispatch(uow: Uow, settings: Settings) -> GcDispatchResponse:
 def gc_confirm(body: GcConfirmRequest, uow: Uow) -> Response:
     internal_commands.confirm_gc(uow, body.block_ids)
     return Response(status_code=status.HTTP_204_NO_CONTENT)
+
+
+@files_router.post("/{file_id}/append/commit")
+def commit_append_file(
+    file_id: str,
+    body: AppendCommitRequest,
+    uow: Uow,
+    user: CurrentUser,
+    settings: Settings,
+) -> CommitResponse:
+    """Confirma un append. Hasta aqui el archivo NO habia cambiado.
+
+    Va aparte de `/commit` porque son dos cosas distintas: aquel confirma una reserva
+    —un archivo que todavia no existe para nadie— y este modifica uno **ya visible**.
+    Mezclarlos obligaria a que `commit_file` aceptara archivos COMMITTED, que es justo el
+    estado que protege de una segunda confirmacion accidental.
+    """
+    fencing = (
+        LockFencing(holder_id=body.lock_holder, epoch=body.lock_epoch)
+        if body.lock_holder
+        else None
+    )
+    confirmado = file_commands.commit_append(
+        uow,
+        user.user_id,
+        file_id,
+        block_ids=body.block_ids,
+        new_size=body.new_size,
+        replaces=body.replaces,
+        write_quorum=settings.write_quorum,
+        fencing=fencing,
+    )
+    return CommitResponse(
+        path=confirmado.path, size=confirmado.size, block_count=confirmado.block_count
+    )

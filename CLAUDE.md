@@ -104,6 +104,7 @@ Diseñar contra esta hoja de ruta, no adelantarla.
   **Hecho en la Etapa 3, Bloque C**: mTLS en el plano interno, cifrado extremo a extremo
   y ACLs con grupos. 2FA no entra: no esta en el enunciado.
 - RF3 (`open`/`read`/`write`/`lock`), leases, lecturas por rango.
+  **Hecho en la Etapa 3, Bloque C.** Ver "RF3" mas abajo.
 - El GC se sigue corriendo a mano.
 
 ### Decisiones de la Etapa 2
@@ -1071,6 +1072,154 @@ Dos avisos:
 El servicio `migrate` **no lleva certificados**: solo ejecuta `alembic upgrade head`
 contra PostgreSQL y no habla con el plano interno.
 
+### RF3: `open`, `read` por rango, `write` como append, y `lock` con lease
+
+#### El lock: la epoca, por tercera vez
+
+El escenario del Bloque A, cambiando «lider» por «cliente» y sin cambiar nada mas:
+
+    t=0   Ana toma el lock de /informe.txt (epoca 3) y empieza a escribir
+    t=1   Ana se congela: su portatil suspende, se le va la red, el proceso se para
+    t=7   el lease vence sin que Ana se entere
+    t=8   Beto lo toma con epoca 4 y escribe su version
+    t=9   Ana despierta EN MEDIO de su escritura, creyendo que sigue teniendo el lock
+
+Si lo unico que Ana comprobo fue «tengo el lock» antes de empezar, en t=9 escribe encima
+de lo de Beto, y **los dos creen haber escrito con exclusion**. Un lock que falla asi es
+peor que no tener lock: da una garantia que no cumple.
+
+Misma solucion, palabra por palabra: **`LockFencing(holder_id, epoch)` viaja con la
+operacion y se verifica dentro de la misma transaccion que la escritura**, con cerrojo
+sobre las filas del archivo. En t=9 la fila dice 4, Ana trae 3, y el `append` se rechaza
+entero con `stale_lock`.
+
+Y por tercera vez la misma regla: **no existe ningun `tengo_el_lock()`**. `require_lock`
+se llama DENTRO del `with uow:` de quien escribe. Es el mismo patron que
+`require_leadership` y que el minimo de `directory_for`:
+
+| Donde | Que viaja | Quien lo verifica |
+|---|---|---|
+| Bloque A | `Fencing(leader_id, epoch)` | `require_leadership`, dentro del `uow` |
+| ACLs | el permiso **minimo** | `directory_for`, al resolver |
+| Token de bloque | `block_id` + operacion, firmados | `verify_token`, en el DataNode |
+| **RF3** | `LockFencing(holder_id, epoch)` | `require_lock`, dentro del `uow` |
+
+**El titular es una SESION, no un usuario.** Ana desde dos maquinas son dos titulares, y
+tiene que ser asi o el lock no excluiria nada entre sus propios procesos. Por eso
+`file_locks` no tiene clave foranea a `users` y el cliente guarda un `holder_id` en
+`session.json`: cada invocacion de `dfsha` es un proceso nuevo, y uno aleatorio por
+proceso haria que `dfsha lock` y el `dfsha append` siguiente fueran dos titulares
+distintos.
+
+**El fencing es un par y aqui se cobra.** Al soltar un lock su fila se borra, asi que
+`max_epoch` puede volver a 0 y la siguiente concesion empezar otra vez por 1. Eso parece
+romper el «la epoca solo sube», y no lo hace: `require_lock` busca el lock **por
+`holder_id`**, asi que Ana con epoca 1 no valida contra el lock de Beto con epoca 1. Es la
+misma razon por la que `Fencing` del Bloque A tampoco es un numero suelto.
+
+**El TTL es dos ordenes de magnitud mayor que el del liderazgo** (120 s frente a 6 s), y
+la diferencia es la que hay entre los dos problemas: ahi el relevo tiene que ser rapido
+porque un cluster sin lider no se repara solo; aqui lo que espera es una **persona** con
+el archivo abierto, y arrebatarselo a los seis segundos porque tardo en teclear seria
+inutilizable. El precio es que un cliente que muere deja el archivo bloqueado ese tiempo.
+
+**No hay ascenso de compartido a exclusivo**, y es deliberado: dos clientes con lock
+compartido pidiendo ascender a la vez se esperarian el uno al otro para siempre.
+Detectarlo obliga a un grafo de espera y a elegir victima, que es otro proyecto. Quien
+quiera escribir pide exclusivo desde el principio.
+
+**Adquirir y renovar son la misma llamada.** Un cliente que reintenta tras un timeout de
+red no puede saber si el primer intento llego; si «adquirir» fallara cuando ya lo tienes,
+ese reintento correcto seria un error.
+
+#### `read` por rango: el bloque se baja ENTERO
+
+`plan_range` devuelve solo los bloques que intersectan el tramo, con cuanto recortar de
+cada uno. Lo que **no** hace es pedir tramos parciales al DataNode, y el motivo no es
+pereza:
+
+**Un bloque cifrado no se puede descifrar por partes.** La etiqueta de AES-GCM cubre el
+bloque completo, asi que para obtener cualquier byte con garantia de que no fue alterado
+hay que tener los demas. Pedir un `Range:` al DataNode daria bytes cifrados que no se
+pueden ni descifrar ni verificar.
+
+Lo que el rango ahorra —y es casi todo el ahorro real— es **no bajar los bloques que no
+intersectan**: leer 1 KB del final de un archivo de 1 GB con bloques de 64 MB baja 64 MB
+en vez de 1 GB. El limite util de la granularidad lo pone el tamano de bloque, que es
+configurable.
+
+La alternativa seria cifrar en trozos mas pequenos con su propia etiqueta cada uno: mas
+etiquetas, mas nonces que no repetir, y un diseno distinto. No se hizo, y queda escrito
+como lo que es: una decision, no un olvido.
+
+#### `write` es append, y el WORM obliga a elegir donde se paga
+
+Los bloques son inmutables (decision 1). Si el ultimo bloque esta **a medias** —lo normal,
+salvo tamano multiplo exacto— anadir datos tiene que llenarlo, y llenarlo es reescribirlo.
+Las dos salidas, y ninguna es gratis:
+
+| | Coste | Por que se descarto o se eligio |
+|---|---|---|
+| **(a)** Empezar siempre bloque nuevo | Mil appends = mil bloques diminutos, cada uno con su colocacion, sus R=3 filas de replica y su sitio en la cola de re-replicacion | 1000 bloques de 12 B son 3000 filas para 12 KB de datos |
+| **(b)** Reescribir el bloque de cola | Anadir 1 byte reescribe hasta un bloque entero (64 MB con el default) | **Elegida.** Conserva «todos llenos salvo el ultimo» |
+
+Se eligio **(b)**, y el precio se dice entero: **amplificacion de escritura acotada por el
+tamano de bloque**, no por el del archivo. A cambio se conserva el invariante que mantiene
+la colocacion, la contabilidad de tamanos y las lecturas por rango razonando sobre bloques
+homogeneos. Es copy-on-write, la decision 1 aplicada a un bloque en vez de a un archivo.
+
+**La cola la reescribe el CLIENTE, y no por comodidad.** Con cifrado extremo a extremo el
+servidor **no podria aunque quisiera**: concatenar exige descifrar, y la clave no sale del
+cliente. El append encaja solo en la decision 4 —los bytes no pasan por el ControlNode—
+sin que haya habido que forzar nada. Lo comprueba
+`test_el_append_por_el_CLI_con_cifrado_conserva_el_contenido`, que hace el ciclo entero
+con el cliente real y cifrado activo.
+
+**El metadato no cambia hasta el commit, y esto es lo importante.** Los bloques nuevos
+nacen con `file_id` NULL —sueltos, sin pertenecer a nadie— y el archivo conserva su tamano
+y su cola viejos. Un lector que pase por en medio ve **el archivo de antes, entero y
+legible**. En `append/commit` ocurren las tres escrituras en una sola transaccion:
+desligar la cola vieja, enganchar los bloques nuevos, actualizar el tamano. El orden
+importa: primero desligar, porque al reves los dos bloques compartirian `(file_id, index)`
+un instante y saltaria `uq_blocks_file_index`.
+
+**El lock se exige DOS veces**, al planificar y al confirmar. No es redundante: entre las
+dos el cliente sube bytes, lo que con bloques de 64 MB puede tardar minutos —tiempo de
+sobra para que su lease venciera y otro tomara el archivo—.
+
+**Tercer caso de huerfano.** `blocks.file_id` pasa a ser NULLABLE y el GC gana su caso mas
+puro: **un bloque que no pertenece a ningun archivo**. La fila sobrevive al desligarse
+porque sus `block_replicas` son lo unico que sabe en que discos estan sus bytes; borrarla
+los dejaria en disco sin que nadie supiera donde, que es exactamente el huerfano que el GC
+existe para evitar. La consulta pasa de INNER JOIN a OUTER JOIN por eso.
+
+#### `open` devuelve un handle que es SOLO DATOS
+
+El ControlNode no guarda archivos abiertos. Es stateless desde la Etapa 1 —el token JWT
+lleva la identidad y el cwd vive en el cliente—, y guardar handles obligaria a sesiones
+pegajosas en el balanceador, que es justo lo que `nginx.conf` explica que no hace falta.
+Lo que el cliente recibe es todo lo que necesita para operar; si lo pierde, vuelve a
+abrir.
+
+**Abrir y bloquear ocurren en la misma transaccion.** Con dos llamadas, entre la primera y
+la segunda otro cliente puede tomar el lock, y el primero creeria tener abierto en
+exclusiva algo que ya no es suyo.
+
+El modo decide las dos cosas a la vez: `read` pide READ y toma lock compartido; `write`
+pide WRITE y toma exclusivo. **Un lock compartido no autoriza a escribir**: sin esa
+comprobacion, abrir en lectura y luego escribir se saltaria la exclusion entera, porque
+varios compartidos conviven.
+
+#### Los detalles del error viajan hasta el cliente
+
+Un `file_locked` trae `holder` y `retry_after_seconds`. «El archivo esta bloqueado» sin
+decir por quien ni hasta cuando es un mensaje con el que no se puede hacer nada; con el
+tiempo restante, el cliente puede decidir si esperar. El cliente descartaba los `details`
+del servidor y ahora los conserva: se vio al escribir la prueba que los comprobaba.
+
+Se responde **409 y no 423 (Locked)**: 423 es de WebDAV y muchos clientes HTTP no lo
+tratan como reintentable.
+
 ### Intermitente conocido: `test_los_bloques_son_inmutables`
 
 **Anotado para no investigarlo desde cero si reaparece.** No esta resuelto.
@@ -1169,7 +1318,19 @@ files(id, directory_id, name, owner_id, size, block_size,
     en el COMMIT, porque se envuelve con el file_id. Vacia = SIN CIFRAR, que es
     como se reconocen los archivos de las Etapas 1 y 2
 
-blocks(block_id UUID PK, file_id, index, size, checksum_sha256)
+file_locks(id, file_id, holder_id, holder_name, mode, epoch,
+           acquired_at, expires_at)
+    mode in {shared, exclusive}
+    UNIQUE(file_id, holder_id): pedir dos veces el mismo lock es RENOVAR
+    epoch es el token de aislamiento del RF3, igual que el del liderazgo
+    holder_id es una SESION, no un usuario: Ana desde dos maquinas son dos
+    titulares, o el lock no excluiria nada entre sus propios procesos
+    los VENCIDOS se quedan en la tabla: el vencimiento se evalua al consultar
+
+blocks(block_id UUID PK, file_id NULL, index, size, checksum_sha256)
+    file_id NULL = bloque DESLIGADO, que no pertenece a ningun archivo. Lo
+    produce el append al reescribir un bloque de cola a medias. Es el TERCER
+    caso de huerfano del GC, y el mas puro
     UNIQUE(file_id, index) -- ademas de un invariante, es lo que garantiza que
     el nonce derivado de (file_id, index) no se repita nunca
     size son los bytes ALMACENADOS: con cifrado, los claros mas los 16 de la
@@ -1516,6 +1677,11 @@ Etapa 3 (Bloque C):
 
 - `block.token_rejected` — `block_id`, `operation`, `reason`. El motivo concreto va SOLO
   aqui: hacia fuera todo rechazo es el mismo 403 con el mismo texto
+- `lock.acquired` / `lock.renewed` / `lock.released` — `file_id`, `holder`, `mode`, `epoch`
+- `lock.epoch_rejected` — el cliente congelado. Mismos campos que
+  `leadership.epoch_rejected`, porque es el mismo suceso en otro sitio del sistema
+- `file.append_planned` / `file.appended` — `added_bytes`, `rewrites_tail`,
+  `rewritten_bytes`. El ultimo es el que hace visible la amplificacion de escritura
 
 ---
 
@@ -1526,6 +1692,9 @@ Comandos: `login`, `register`, `ls`, `cd`, `pwd`, `mkdir`, `rmdir`, `rm`, `mv`, 
 
 Etapa 3: `share`, `unshare`, `shared` y los de grupos, y `login --ask-password`, que no
 guarda la clave maestra en disco y la pide en cada `put` y `get`.
+
+RF3: `lock`, `unlock`, `locks`, `read --offset --length` (lectura por rango, a la salida
+estandar) y `append <remoto> <local>`. Ver "RF3" mas arriba.
 
 `login` **deriva la clave maestra en el cliente** y no la envia a ninguna parte. `put`
 genera una clave por archivo, la envuelve y cifra los bloques antes de subirlos; `get`
