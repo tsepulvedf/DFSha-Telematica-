@@ -231,6 +231,30 @@ tambien la sube**. Si un permiso caducado propio se tratara como una renovacion,
 congelado volveria con su numero intacto y validaria el trabajo que empezo antes de la
 pausa; entre una cosa y la otra pudo pasar cualquiera.
 
+### Estas pruebas se han visto fallar
+
+**Una prueba que nunca has visto fallar no sabes si prueba algo**, y estas cuatro
+protecciones tienen todas la misma propiedad incomoda: quitarlas **no rompe nada visible**.
+Asi que se comprobo al reves, rompiendo cada una a proposito y exigiendo que las pruebas
+que dicen fijarla caigan. Lo automatiza `scripts/verificar_pruebas.py`.
+
+Diez mutaciones, las diez atrapadas. Pero la primera pasada **encontro dos pruebas que
+pasaban por el motivo equivocado**, que es exactamente lo que se buscaba:
+
+| Prueba | Decia fijar | Pasaba en realidad porque | Arreglo |
+|---|---|---|---|
+| `test_el_lider_congelado_es_rechazado_y_no_escribe_nada` | la comparacion de **epoca** | A y B son instancias distintas: le bastaba el `leader_id` | Docstring corregido; la epoca la fija la prueba hermana, donde el congelado es **el mismo** que recupero el lease |
+| `test_el_token_de_Beto_no_abre_el_bloque_de_Ana` | que el **`block_id`** va firmado | usaba un token de ESCRITURA donde el endpoint pide uno de LECTURA: rechazaba por la operacion | Se usa un token de lectura de verdad; ahora cae al quitar la comprobacion |
+
+Las dos daban confianza sin respaldarla. Es el mismo problema que el de la prueba del
+cliente congelado del RF3, que simulaba la congelacion **soltando** el lock —y soltar
+reinicia la epoca, mientras que caducar la sube—, asi que pasaba por el camino que no era.
+
+**Tres veces el mismo error en pruebas de seguridad de esta etapa.** El patron es claro y
+va al informe: una prueba que monta un escenario **parecido** al que dice cubrir puede
+pasar por una razon distinta de la que su nombre anuncia, y entonces es peor que no
+tenerla, porque nadie vuelve a mirarla.
+
 ### Que lo fija, y por que importa que este fijado
 
 Ninguna de estas protecciones se ve leyendo el codigo: lo que se ve es un parametro de mas
@@ -702,6 +726,18 @@ aparenta estar puesto y no lo esta**, y ninguno se detecto leyendo el codigo.
 | Direccionamiento (Bloque B) | El plan llevaba la direccion de cada replica | Llevaba la del **cliente** en un camino entre nodos | Validando en **Docker**, no en las pruebas |
 | `cert=` de httpx (Bloque C) | El cliente presentaba su certificado | httpx lo **descartaba** sin avisar | Midiendo tres combinaciones, no asumiendo |
 | `blocks.size` vs `files.size` (Bloque C) | El metadato describia el bloque almacenado | Describia el **claro**, y en disco habia 16 bytes mas | Una prueba de ida y vuelta, no de inspeccion |
+| `details` del error (desde la Etapa 1) | El cliente imprimia los datos del error | Los **descartaba**; la rama que los imprime no se ejecuto nunca | Una prueba que necesitaba uno de esos datos |
+
+**El cuarto es distinto de los otros tres, y esa diferencia es lo que va al informe.** Los
+tres primeros se manifestaban como un **fallo**: un 409, una conexion cerrada, una descarga
+imposible. Alguien acababa tropezando con ellos. El cuarto **no fallaba nunca**: producia
+mensajes empobrecidos que **parecen completos**. «No alcanzan el quorum de escritura» se lee
+como un mensaje terminado; que le falte la lista de bloques no se nota si no sabes que la
+hubo. Llevaba asi desde la Etapa 1.
+
+La leccion practica: **un fallo silencioso que degrada la calidad en vez de romper algo no
+lo encuentra nadie usando el sistema**. Solo aparece cuando algo exige el dato que falta
+—en este caso, una prueba que necesitaba `retry_after_seconds`—.
 
 Los tres pasaban por caminos que en el entorno de prueba no se distinguen del correcto: el
 primero porque los nodos compartian espacio de red; el segundo porque todas las pruebas de
@@ -1894,7 +1930,7 @@ src/dfsha/
     ├── cli.py, session.py, chunker.py, transfer.py
 alembic/{env.py,versions/}      # migraciones del metadato (Etapa 3)
 tests/{unit,integration}/
-scripts/{gen_testfile.py,gc.py,gen_certs.py,gen_proto.py}
+scripts/{gen_testfile.py,gc.py,gen_certs.py,gen_proto.py,verificar_pruebas.py}
 scripts/demo/                   # guiones de la demostracion del video
 docker/{control_node,data_node,client}.Dockerfile
 docker/nginx/{nginx.conf,dfsha.conf,dfsha-stream.conf}

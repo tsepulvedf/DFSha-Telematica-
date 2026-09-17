@@ -252,7 +252,20 @@ def _estado(uow_factory, data_node_id: str) -> str:
 
 
 def test_el_lider_congelado_es_rechazado_y_no_escribe_nada(uow_factory) -> None:
-    """El escenario completo, que es la razon de ser de la epoca.
+    """El escenario completo del lider congelado, de punta a punta.
+
+    **Lo que rechaza a A aqui es el `leader_id`, no la epoca**, y conviene decirlo porque
+    el nombre de la prueba invita a creer lo contrario: A y B son instancias distintas,
+    asi que el par `(leader_id, epoch)` ya discrepa en la primera mitad. Se comprobo
+    rompiendo la comparacion de epoca a proposito: esta prueba sigue en verde.
+
+    Lo que si cubre, y no es poco: el escenario completo, y sobre todo **que la
+    transaccion no dejo nada escrito**, que es la mitad que suele olvidarse.
+
+    El caso en que **solo la epoca** puede distinguir —A se congela, su lease vence, y es
+    el propio A quien lo recupera, asi que el `leader_id` vuelve a coincidir— esta en
+    `test_el_lider_congelado_que_recupera_el_lease_sigue_sin_validar_lo_viejo`, que es la
+    que de verdad fija la epoca. Las dos hacen falta.
 
         t=0    A toma el lease con epoca 1
         t=0    un DataNode deja de latir
@@ -260,9 +273,9 @@ def test_el_lider_congelado_es_rechazado_y_no_escribe_nada(uow_factory) -> None:
         t=+40  el lease de A vencio hace rato; B lo toma con epoca 2
         t=+40  A DESPIERTA en medio de su operacion, convencido de que manda
 
-    Sin epoca, en ese ultimo instante A escribe: marca el nodo muerto por segunda vez y,
-    en el Bloque B, programaria la re-replicacion de los mismos bloques que B ya
-    programo. Con epoca, la transaccion de A se aborta entera.
+    Sin ninguna proteccion, en ese ultimo instante A escribe: marca el nodo muerto por
+    segunda vez y, en el Bloque B, programaria la re-replicacion de los mismos bloques que
+    B ya programo. Con el par completo, la transaccion de A se aborta entera.
 
     Se comprueban las dos mitades, y la segunda es la que suele olvidarse: que fue
     rechazado, **y** que no dejo ni una escritura detras.
@@ -303,7 +316,14 @@ def test_el_lider_congelado_es_rechazado_y_no_escribe_nada(uow_factory) -> None:
 def test_el_lider_congelado_que_recupera_el_lease_sigue_sin_validar_lo_viejo(
     uow_factory,
 ) -> None:
-    """Variante mas incomoda: nadie tomo el lease mientras A estuvo congelado.
+    """
+    **Esta es la prueba que de verdad fija la epoca.** La anterior describe el mismo
+    escenario pero con dos instancias distintas, asi que le basta el `leader_id` para
+    rechazar; aqui el lider congelado es el MISMO que recupero el lease, el `leader_id`
+    vuelve a coincidir, y lo unico que distingue el trabajo viejo del nuevo es el numero.
+
+    Comprobado rompiendo la comparacion de epoca a proposito: esta cae.
+Variante mas incomoda: nadie tomo el lease mientras A estuvo congelado.
 
     A despierta, ve el lease libre y lo recupera. La tentacion seria dejarle seguir con
     lo que estaba haciendo, porque "nunca dejo de ser el lider". Pero entre su epoca

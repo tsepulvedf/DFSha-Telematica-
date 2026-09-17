@@ -160,20 +160,30 @@ def test_el_token_de_Beto_no_abre_el_bloque_de_Ana(ana, beto) -> None:
     """La version fina del ataque, y la que justifica que el `block_id` vaya FIRMADO
     dentro del token y no solo en la URL.
 
-    Beto tiene un token legitimo: es de su propio archivo. Si el DataNode se limitara a
-    comprobar «este token lo firmo el ControlNode», bastaria con presentarlo pidiendo otro
-    bloque.
+    Beto tiene un token legitimo **de lectura, de su propio archivo**. Si el DataNode se
+    limitara a comprobar «este token lo firmo el ControlNode», bastaria con presentarlo
+    pidiendo otro bloque.
+
+    **Que el token de Beto sea de LECTURA es esencial y costo descubrirlo.** La primera
+    version usaba el token de subida que devuelve `create_file`, que es de ESCRITURA: la
+    peticion se rechazaba por la operacion equivocada y no por el bloque equivocado, asi
+    que la prueba pasaba **sin ejercitar lo que decia ejercitar**. Se vio al romper a
+    proposito la comprobacion del `block_id` y comprobar que esta prueba seguia en verde.
     """
     ajeno = _subir_privado(ana, "/de-ana.bin")
-    propio = _subir_privado(beto, "/de-beto.bin")
+    _subir_privado(beto, "/de-beto.bin")
+
+    # Token de LECTURA de su propio archivo: el que un cliente usa para un `get`.
+    propio = beto.open_file("/de-beto.bin").blocks[0]
 
     respuesta = httpx.get(
         f"{ajeno.replicas[0].base_url}/api/v1/blocks/{ajeno.block_id}",
-        headers={BLOCK_TOKEN_HEADER: propio.token},  # valido, pero para OTRO bloque
+        headers={BLOCK_TOKEN_HEADER: propio.token},  # valido, de lectura, OTRO bloque
         timeout=30,
     )
 
     assert respuesta.status_code == 403
+    assert DATOS not in respuesta.content
 
 
 def test_un_token_de_lectura_no_sirve_para_borrar(ana) -> None:
