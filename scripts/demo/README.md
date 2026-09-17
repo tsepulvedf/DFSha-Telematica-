@@ -45,13 +45,24 @@ con **4 copias y R=3**. Es un estado esperable, está explicado en CLAUDE.md
 bloques de archivos borrados, y estos pertenecen a archivos vivos. No estorba para el
 resto de la demostración.
 
-### Después del 4: si el plano interno se comporta raro
+### Después del 4: nginx y las IP, con la medida correcta
 
-nginx resuelve los nombres de sus *upstreams* **al arrancar**. Si al reiniciar el
-ControlNode su IP cambia dentro de la red de compose, el balanceador puede quedarse
-apuntando a la anterior, y el síntoma sería que las subidas empiezan a fallar en el
-`commit` aunque los tres ControlNodes estén vivos. No siempre pasa —Docker suele conservar
-la IP tras un `stop`/`start`— pero si ocurre, la salida es:
+nginx resuelve los nombres de sus *upstreams* **al arrancar**, así que si al reiniciar el
+ControlNode le cambiara la IP dentro de la red de compose, el balanceador se quedaría
+apuntando a la anterior.
+
+**Pero el efecto es mucho menor de lo que parece**, y conviene decirlo con precisión
+porque la versión alarmista de esta nota lleva a diagnosticar mal:
+
+- Los tres *upstreams* llevan `max_fails=2 fail_timeout=5s` y `proxy_next_upstream`. Una
+  IP obsoleta **a la que no responde nadie** se detecta al conectar, nginx pasa a la
+  siguiente instancia y la saca de la rotación. **Se recupera solo.**
+- El caso que sí daría problemas es que esa IP la hubiera cogido **otro contenedor que sí
+  escucha**: entonces nginx conectaría con el servicio equivocado. Requiere una secuencia
+  concreta y es poco probable con `stop`/`start`, donde Docker suele devolver la misma IP.
+
+O sea: si tras el guion 4 ves fallos, **el balanceador no es el primer sospechoso**. Mira
+antes los logs del ControlNode que reiniciaste. Si aun así quieres descartarlo:
 
 ```bash
 docker compose restart lb

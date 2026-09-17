@@ -811,6 +811,7 @@ aparenta estar puesto y no lo esta**, y ninguno se detecto leyendo el codigo.
 | `cert=` de httpx (Bloque C) | El cliente presentaba su certificado | httpx lo **descartaba** sin avisar | Midiendo tres combinaciones, no asumiendo |
 | `blocks.size` vs `files.size` (Bloque C) | El metadato describia el bloque almacenado | Describia el **claro**, y en disco habia 16 bytes mas | Una prueba de ida y vuelta, no de inspeccion |
 | `details` del error (desde la Etapa 1) | El cliente imprimia los datos del error | Los **descartaba**; la rama que los imprime no se ejecuto nunca | Una prueba que necesitaba uno de esos datos |
+| El README del arranque rapido | Los comandos levantaban el cluster | Generaba un secreto que ya no se lee y **no mencionaba los certificados** | Actualizando la documentacion, no usandola |
 
 **El cuarto es distinto de los otros tres, y esa diferencia es lo que va al informe.** Los
 tres primeros se manifestaban como un **fallo**: un 409, una conexion cerrada, una descarga
@@ -827,6 +828,36 @@ cuando algo exige el dato que falta** —en este caso, una prueba que necesitaba
 Es la misma familia que las **pruebas que no prueban** de la seccion «Verificacion por
 mutacion»: nada falla, todo parece estar en su sitio, y lo que falta solo se ve cuando algo
 lo exige.
+
+#### El quinto caso esta en la DOCUMENTACION, y eso es lo que cierra el argumento
+
+El arranque rapido del README pedia generar `DFSHA_INTERNAL_SECRET` —que ninguna parte del
+codigo lee desde el Bloque C— y **no mencionaba `gen_certs.py`**, que es obligatorio. Quien
+siguiera esos comandos al pie de la letra obtenia un `.env` que no levanta nada, y con un
+error sobre variables que el propio README no nombra.
+
+Nadie lo detecto porque **a la documentacion no se le corren pruebas**, y quien ya tiene el
+`.env` hecho no vuelve a leer el arranque rapido. Se vio al actualizarla, no al usarla.
+
+Y esa es la razon de que los cinco casos vayan juntos al informe: **el rango va desde el
+codigo hasta las pruebas y la documentacion**.
+
+| Donde | Caso |
+|---|---|
+| **Codigo** | el direccionamiento, `cert=` de httpx, `blocks.size` |
+| **Cliente** | los `details` descartados desde la Etapa 1 |
+| **Pruebas** | tres que pasaban por un camino distinto del que su nombre anunciaba |
+| **Documentacion** | el arranque rapido con un secreto muerto y sin los certificados |
+
+Cinco casos en cuatro capas distintas no es un descuido puntual: es un **modo de fallo del
+proyecto**. Y tiene una causa comun que conviene nombrar: en todos, **algo dejo de ser
+verdad y lo que lo afirmaba no se entero**, porque nada los ataba. El codigo no comprueba
+que el README sea cierto, una prueba no comprueba que su nombre describa lo que hace, y un
+cliente no comprueba que el servidor le mando datos que el va a imprimir.
+
+Lo unico que ha funcionado contra esto es **hacer que algo exija el dato**: validar en
+Docker, medir en vez de asumir, romper la proteccion para ver caer la prueba, o reescribir
+la documentacion con el sistema delante.
 
 Los tres pasaban por caminos que en el entorno de prueba no se distinguen del correcto: el
 primero porque los nodos compartian espacio de red; el segundo porque todas las pruebas de
@@ -1274,6 +1305,34 @@ terminar TLS otra vez.
 mismo motivo que el gRPC: asi matar al lider durante la demostracion no deja a ningun
 DataNode sin camino. El SAN de `control.crt` incluye `lb`, que es el nombre por el que se
 le llama, ademas de los tres `control-node-N`.
+
+#### nginx resuelve los upstreams al arrancar, y se queda asi
+
+Es un hecho de nginx, no una configuracion nuestra: los nombres de `upstream` se resuelven
+al cargar la configuracion. Si a un ControlNode le cambiara la IP dentro de la red de
+compose, el balanceador seguiria apuntando a la vieja.
+
+**Se decidio NO arreglarlo.** Las tres razones, en orden de peso:
+
+1. **El despliegue en AWS no tiene nginx.** Ahi hay un solo ControlNode y los DataNodes lo
+   alcanzan por su **IP privada**, que es estable entre reinicios de la instancia —es
+   justamente por eso que se anuncia la privada y no la publica—. Asi que esto no es un
+   fallo de produccion: su alcance es el `docker compose` local.
+2. **El efecto ya esta acotado.** Los `upstream` llevan `max_fails=2 fail_timeout=5s` y
+   `proxy_next_upstream`: una IP obsoleta a la que no responde nadie se detecta al
+   conectar, nginx pasa a la siguiente y la saca de la rotacion. Se recupera solo. El unico
+   caso feo es que esa IP la hubiera tomado **otro contenedor que si escucha**, y entonces
+   nginx hablaria con el servicio equivocado.
+3. **El arreglo cuesta justo lo que el balanceador aporta.** La forma de que nginx
+   re-resuelva sin modulos de pago es `resolver 127.0.0.11` con la direccion en una
+   **variable** dentro de `proxy_pass`, y eso **se salta el bloque `upstream`**: adios a
+   `least_conn` y al reintento en otra instancia. En `:8000` eso es exactamente la razon de
+   que sea nivel 7. El parametro `resolve` del `server` es de nginx Plus, y un modulo de
+   upstream dinamico significa otra imagen base y una dependencia nueva.
+
+Cambiar un fallo raro y auto-recuperable por perder el balanceo en el camino principal es
+mal negocio. Queda documentado en `scripts/demo/README.md` con la salida —`docker compose
+restart lb`— y con el aviso de que **el balanceador no es el primer sospechoso**.
 
 #### Los certificados en compose
 
