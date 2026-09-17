@@ -597,23 +597,51 @@ aparece un `verify=<ruta>` junto a un `cert=` en algun sitio nuevo, es este fall
 
 #### El patron, que es lo que va al informe
 
-Los **dos** fallos serios de la Etapa 3 han sido el mismo tipo de cosa: **configuracion
-que aparenta estar puesta y no lo esta**, y ninguno se detecto leyendo el codigo.
+Los **tres** fallos serios de la Etapa 3 han sido el mismo tipo de cosa: **algo que
+aparenta estar puesto y no lo esta**, y ninguno se detecto leyendo el codigo.
 
 | Fallo | Que parecia | Que era | Como se detecto |
 |---|---|---|---|
 | Direccionamiento (Bloque B) | El plan llevaba la direccion de cada replica | Llevaba la del **cliente** en un camino entre nodos | Validando en **Docker**, no en las pruebas |
 | `cert=` de httpx (Bloque C) | El cliente presentaba su certificado | httpx lo **descartaba** sin avisar | Midiendo tres combinaciones, no asumiendo |
+| `blocks.size` vs `files.size` (Bloque C) | El metadato describia el bloque almacenado | Describia el **claro**, y en disco habia 16 bytes mas | Una prueba de ida y vuelta, no de inspeccion |
 
-Los dos pasaban por caminos que en el entorno de prueba no se distinguen del correcto: el
+Los tres pasaban por caminos que en el entorno de prueba no se distinguen del correcto: el
 primero porque los nodos compartian espacio de red; el segundo porque todas las pruebas de
 rechazo pasaban —el servidor cerraba la conexion, que es justo lo que se esperaba de un
-intruso— y solo fallaba el camino bueno.
+intruso— y solo fallaba el camino bueno; el tercero porque **cada mitad era coherente
+consigo misma** y solo discrepaban en el cruce.
 
-La leccion, y es material del informe: **una prueba que solo comprueba que lo malo se
-rechaza no comprueba que lo bueno funciona**, y en seguridad las dos mitades hacen falta.
-De ahi que `test_mtls.py` empiece por el caso bueno con un comentario que lo dice: si ese
-falla, los demas no prueban nada.
+#### Y la segunda mitad del patron: el sintoma apunta a otro sitio
+
+Esto es lo que mas cuesta en la practica, y es material del informe por derecho propio.
+**En los tres, el error de superficie despistaba sobre la causa**, y en una direccion
+concreta: el sistema tiene relevos y reintentos —replicas alternativas, otro DataNode,
+otra instancia del ControlNode—, y un relevo convierte «esto esta mal» en «esto no
+responde».
+
+| Fallo | Sintoma que se ve | Categoria a la que apunta | Categoria real |
+|---|---|---|---|
+| Direccionamiento | `409 no alcanzan el quorum de escritura (W=2)` | Capacidad o carga del cluster | Red: una URL valida solo desde el host |
+| `cert=` de httpx | «Server disconnected without sending a response» | Un fallo del **servidor** | Un fallo del **cliente**, que no presento su certificado |
+| `blocks.size` | «ninguna de las 1 replicas pudo servir el bloque» | **Disponibilidad**: no hay copias vivas | **Tamanos**: la unica copia estaba bien y se rechazaba |
+
+El tercero es el ejemplo mas limpio. El relevo de replicas del Bloque B —que es correcto y
+hace exactamente lo que debe— captura el `StorageError`, prueba la siguiente replica,
+agota la lista y reporta el fallo **agregado**. El mensaje que llega arriba cuenta cuantas
+replicas se probaron, no **por que** fallo cada una, asi que un fallo determinista que
+habria dado igual con cien copias se lee como un problema de tener pocas.
+
+La consecuencia practica, que es la que vale la pena escribir: **al diagnosticar, el
+primer error de la cadena vale mas que el ultimo**. El `block.replica_failed` de los logs
+llevaba el `error: "StorageError"` correcto desde el principio; lo que despistaba era el
+`TransferError` que lo resumia. Un relevo mejora la disponibilidad y **empeora el
+diagnostico**, y las dos cosas son ciertas a la vez.
+
+La otra leccion, la de seguridad: **una prueba que solo comprueba que lo malo se rechaza
+no comprueba que lo bueno funciona**, y las dos mitades hacen falta. De ahi que
+`test_mtls.py` empiece por el caso bueno con un comentario que lo dice: si ese falla, los
+demas no prueban nada.
 
 ### ACLs: cuatro reglas, una funcion, y ningun «denegar»
 
@@ -644,12 +672,45 @@ base de datos:
    2 —cada usuario en su propio arbol— sigan describiendo el mismo comportamiento sin
    tocar ni una.
 
-**El permiso minimo se pasa como argumento, no se comprueba despues.** `directory_for(uow,
-user_id, path, minimum)` resuelve y exige a la vez. Un `resolve()` que devolviera el
-permiso para que el llamante lo comparara seria el mismo patron que `soy_el_lider()`: una
-consulta que alguien acabara olvidandose de mirar. Por eso subir un archivo pide `WRITE`
-sobre el directorio destino, que es lo que separa a quien puede leer un directorio
-compartido de quien puede meter cosas en el.
+#### El permiso minimo se pasa como ARGUMENTO. Es el `soy_el_lider()` otra vez
+
+**Material del informe**, porque es el mismo razonamiento del Bloque A aplicado a un
+problema que no se le parece en nada, y que dos problemas distintos se resuelvan igual es
+lo que hace que el diseno sea coherente y no una coleccion de soluciones sueltas.
+
+La firma es `directory_for(uow, user_id, path, minimum)`: **resuelve y exige a la vez**.
+La alternativa que parece mas natural —y que es la que uno escribe primero— seria esta:
+
+```python
+# NO. Es el mismo agujero que soy_el_lider(), con otra ropa.
+permiso = resolve(usuario, ruta)
+if permiso < Permission.WRITE:
+    raise Forbidden()
+escribir()
+```
+
+Los dos defectos son **literalmente los mismos** que los del Bloque A:
+
+1. **Una consulta que devuelve un dato es una consulta que alguien puede no mirar.** Igual
+   que `soy_el_lider()` devuelve un booleano que un `return` temprano puede saltarse, un
+   `resolve()` que devuelve un permiso deja la comparacion en manos del llamante. El
+   camino nuevo que se anade dentro de seis meses la olvida, y no falla ninguna prueba:
+   simplemente deja pasar. **Con el minimo en la firma, el tipo obliga**; no hay forma de
+   llamar a `directory_for` sin decir para que.
+2. **Entre la comprobacion y el uso hay una ventana.** En el Bloque A la cerraba el
+   `SELECT ... FOR UPDATE` dentro de la misma transaccion; aqui la cierra que la
+   resolucion y la comprobacion ocurran en la misma llamada, dentro del mismo `uow`. En
+   los dos casos la respuesta es la misma: **la comprobacion y el efecto no pueden estar
+   en dos sitios distintos**.
+
+La regla general, que es como conviene enunciarlo en la sustentacion:
+
+> Una funcion que responde «¿puedo?» es peor que una que hace «hazlo si puedes».
+> La primera se puede ignorar; la segunda no.
+
+De ahi que subir un archivo pida `WRITE` sobre el directorio destino, que es lo que separa
+a quien puede leer un directorio compartido de quien puede meter cosas en el: ese `WRITE`
+no esta en un `if` del caso de uso, esta en la llamada que obtiene el directorio.
 
 `/compartido-conmigo` es un directorio **virtual**: no existe en `directories`, se compone
 al vuelo con las concesiones que apuntan a este usuario. No es una fila porque no tiene
@@ -701,11 +762,34 @@ Es lo que permite que un metadato migrado desde la Etapa 2 siga siendo utilizabl
 se vuelve a derivar al descifrar.
 
 Repetir un nonce con la misma clave en GCM no degrada la seguridad, la **elimina**: revela
-el XOR de los dos textos claros y permite falsificar mensajes. Un nonce aleatorio podria
-repetirse **sin que nada lo detecte**. Aqui la unicidad esta garantizada por construccion:
-`(file_id, index)` es unico por el `UNIQUE(file_id, index)` de `blocks`, y los bloques **no
-se reescriben nunca** (WORM, decision 1 de la seccion 1). La propiedad criptografica se
-apoya en una decision de diseno que ya estaba tomada en la Etapa 1.
+el XOR de los dos textos claros y permite falsificar mensajes. Un nonce aleatorio de 96
+bits podria repetirse **sin que nada lo detecte**, que es lo peor de los dos mundos: el
+fallo es catastrofico y silencioso.
+
+**Donde descansa la unicidad, que es lo que hay que destacar.** No sobre un invariante
+nuevo inventado para el cifrado, sino sobre dos decisiones que ya estaban tomadas y
+probadas **antes de que existiera el Bloque C**:
+
+| Lo que hace falta | Quien lo garantiza | Desde cuando |
+|---|---|---|
+| Que `(file_id, index)` no se repita | `UNIQUE(file_id, index)` en `blocks` | Esquema de la Etapa 1 |
+| Que un `(file_id, index)` no se cifre dos veces con contenidos distintos | **WORM**: un bloque cerrado no se reescribe nunca (decision 1 de la seccion 1) | Etapa 1 |
+
+Y esa es la parte que vale para el informe: **una propiedad criptografica apoyada en una
+decision de diseno previa es mas fuerte que una apoyada en disciplina de
+implementacion**. La diferencia es quien la puede romper y como se entera uno:
+
+- Si la unicidad dependiera de «acuerdate de no reutilizar un nonce», la rompe cualquier
+  camino nuevo, en silencio, y no falla ninguna prueba.
+- Apoyada donde esta, romperla exige **quitar una restriccion de la base de datos** o
+  **dejar de respetar el WORM**. Lo primero lo cazan la migracion y
+  `test_migracion_deja_el_mismo_esquema_que_los_modelos`; lo segundo es una decision de
+  arquitectura que nadie toma por accidente, y ademas romperia cosas mucho mas visibles
+  que el cifrado.
+
+Dicho de otro modo: el cifrado **no anadio** ninguna obligacion al resto del sistema. Se
+colgo de obligaciones que el sistema ya tenia por otros motivos, y por eso no hay ningun
+sitio donde alguien tenga que "acordarse" de nada.
 
 Pasa por HMAC en vez de concatenar los valores en claro para que quien mire el disco no
 pueda deducir la posicion de un bloque a partir de su nonce.
