@@ -1071,6 +1071,31 @@ Dos avisos:
 El servicio `migrate` **no lleva certificados**: solo ejecuta `alembic upgrade head`
 contra PostgreSQL y no habla con el plano interno.
 
+### Intermitente conocido: `test_los_bloques_son_inmutables`
+
+**Anotado para no investigarlo desde cero si reaparece.** No esta resuelto.
+
+- **Cuando**: 17 de septiembre de 2026, durante el Bloque C (token de bloque).
+- **Que**: `tests/integration/test_transfer.py::TestIntegridad::test_los_bloques_son_inmutables`
+  fallo **una** vez en una pasada completa de la suite. Sube un bloque dos veces y espera
+  201 y luego 409.
+- **Que se descarto ya**, y conviene no repetirlo:
+  - No se reproduce: dos pasadas completas posteriores en verde, la prueba aislada en
+    verde, y `tests/integration` entero en verde.
+  - **No es el TTL del token** (10 min): el plan se crea dentro de la propia prueba, asi
+    que el token nace fresco. La suite completa tarda ~7 min, que ademas es menos.
+  - **No es el orden de las pruebas**: no hay `pytest-randomly` ni `xdist` instalados, asi
+    que el orden es estable entre pasadas.
+  - Solo fallo en la pasada que incluia las unitarias antes que las de integracion.
+- **Que NO se hizo**: capturar el traceback. Se perdio la salida de aquella pasada, y esa
+  es la razon de que siga abierto.
+
+**Si vuelve a salir antes de cerrar la etapa, hay que parar y perseguirlo con el traceback
+delante.** Una prueba intermitente que verifica la **inmutabilidad de los bloques** —o sea
+el WORM, la decision 1 de la seccion 1, sobre la que ademas descansa la unicidad del nonce
+del cifrado— no puede quedar asi en la entrega. Lo primero que hay que mirar es si el 409
+llego como 403: seria el token, y entonces es un fallo de verdad y no un hipo.
+
 ### Enrutado CQRS: que consulta va a donde
 
 La separacion `commands/` / `queries/` existe desde la Etapa 1. Aqui se cobra.
