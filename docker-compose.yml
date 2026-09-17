@@ -46,7 +46,12 @@ x-controlnode-env: &controlnode-env
   DFSHA_DB_URL: "postgresql+psycopg://dfsha:${DFSHA_PG_PASSWORD:?falta DFSHA_PG_PASSWORD}@postgres-primary:5432/dfsha"
   DFSHA_DB_REPLICA_URL: "postgresql+psycopg://dfsha:${DFSHA_PG_PASSWORD:?falta DFSHA_PG_PASSWORD}@postgres-replica:5432/dfsha"
   DFSHA_JWT_SECRET: "${DFSHA_JWT_SECRET:?falta DFSHA_JWT_SECRET; copia .env.example a .env}"
-  DFSHA_INTERNAL_SECRET: "${DFSHA_INTERNAL_SECRET:?falta DFSHA_INTERNAL_SECRET; copia .env.example a .env}"
+  # mTLS del plano interno. SUSTITUYEN a DFSHA_INTERNAL_SECRET, que ya no existe.
+  # Generalos antes de levantar nada:  python scripts/gen_certs.py
+  DFSHA_TLS_CA_CERT: "/etc/dfsha/certs/ca.crt"
+  DFSHA_TLS_CERT: "/etc/dfsha/certs/control.crt"
+  DFSHA_TLS_KEY: "/etc/dfsha/certs/control.key"
+  DFSHA_INTERNAL_PORT: "8443"
   DFSHA_BLOCK_SIZE: "${DFSHA_BLOCK_SIZE:-67108864}"
   DFSHA_JWT_TTL_SECONDS: "${DFSHA_JWT_TTL_SECONDS:-3600}"
   DFSHA_WRITE_TTL_SECONDS: "${DFSHA_WRITE_TTL_SECONDS:-600}"
@@ -76,6 +81,11 @@ x-controlnode-base: &controlnode-base
     context: "."
     dockerfile: "docker/control_node.Dockerfile"
   image: "dfsha/control-node:0.3.0"
+  # Solo lectura, y solo lo que le toca: aqui esta tambien ca.key, que NO deberia salir
+  # de la maquina que firma. Montar el directorio entero es la comodidad de un despliegue
+  # de practica; en AWS cada instancia recibe unicamente sus tres ficheros.
+  volumes:
+    - "./certs:/etc/dfsha/certs:ro"
   depends_on:
     migrate:
       condition: "service_completed_successfully"
@@ -103,7 +113,14 @@ x-datanode-env: &datanode-env
   DFSHA_DATA_DIR: "/var/lib/dfsha"
   DFSHA_CONTROL_URL: "http://lb:8000"
   DFSHA_CONTROL_GRPC_URL: "lb:9000"
-  DFSHA_INTERNAL_SECRET: "${DFSHA_INTERNAL_SECRET:?falta DFSHA_INTERNAL_SECRET; copia .env.example a .env}"
+  # El plano interno va por el balanceador, igual que el gRPC: asi matar a una instancia
+  # no deja a ningun DataNode sin camino. nginx lo pasa en nivel 4 y el handshake es de
+  # punta a punta, asi que el certificado que se valida contra el SAN es el del
+  # ControlNode que atienda, y "lb" esta entre sus nombres.
+  DFSHA_CONTROL_INTERNAL_URL: "https://lb:8443"
+  DFSHA_TLS_CA_CERT: "/etc/dfsha/certs/ca.crt"
+  DFSHA_TLS_CERT: "/etc/dfsha/certs/data.crt"
+  DFSHA_TLS_KEY: "/etc/dfsha/certs/data.key"
   DFSHA_DATANODE_CAPACITY_BYTES: "${DFSHA_DATANODE_CAPACITY_BYTES:-10737418240}"
   DFSHA_LOG_LEVEL: "${DFSHA_LOG_LEVEL:-INFO}"
   # El depends_on de abajo espera a que el ControlNode este healthy, pero no cubre que
@@ -212,10 +229,15 @@ services:
     image: "nginx:1.27-alpine"
     container_name: "dfsha-lb"
     ports:
-      - "8000:8000"   # REST, lo consume el cliente
-      - "9000:9000"   # gRPC, los DataNodes laten contra aqui
+      - "8000:8000"   # REST del cliente: proxy HTTP, nivel 7
+      - "9000:9000"   # gRPC con mTLS: passthrough TCP, nivel 4
+      - "8443:8443"   # plano interno con mTLS: passthrough TCP, nivel 4
     volumes:
+      # nginx.conf propio porque el bloque `stream` solo existe al nivel mas alto del
+      # fichero: desde conf.d/ no se puede anadir, que la imagen incluye dentro de http.
+      - "./docker/nginx/nginx.conf:/etc/nginx/nginx.conf:ro"
       - "./docker/nginx/dfsha.conf:/etc/nginx/conf.d/default.conf:ro"
+      - "./docker/nginx/dfsha-stream.conf:/etc/nginx/stream.conf.d/dfsha.conf:ro"
     depends_on:
       control-node-1:
         condition: "service_healthy"
@@ -253,6 +275,7 @@ services:
       DFSHA_DATANODE_FAULT_DOMAIN: "${DFSHA_FD_1:-local-1}"
     volumes:
       - "dfsha-blocks-1:/var/lib/dfsha"
+      - "./certs:/etc/dfsha/certs:ro"
 
   data-node-2:
     <<: *datanode-base
@@ -269,6 +292,7 @@ services:
       DFSHA_DATANODE_FAULT_DOMAIN: "${DFSHA_FD_2:-local-2}"
     volumes:
       - "dfsha-blocks-2:/var/lib/dfsha"
+      - "./certs:/etc/dfsha/certs:ro"
 
   data-node-3:
     <<: *datanode-base
@@ -285,6 +309,7 @@ services:
       DFSHA_DATANODE_FAULT_DOMAIN: "${DFSHA_FD_3:-local-3}"
     volumes:
       - "dfsha-blocks-3:/var/lib/dfsha"
+      - "./certs:/etc/dfsha/certs:ro"
 
   data-node-4:
     <<: *datanode-base
@@ -301,6 +326,7 @@ services:
       DFSHA_DATANODE_FAULT_DOMAIN: "${DFSHA_FD_4:-local-4}"
     volumes:
       - "dfsha-blocks-4:/var/lib/dfsha"
+      - "./certs:/etc/dfsha/certs:ro"
 
   # No arranca con `up`: es para correr la CLI dentro de la red de compose.
   #   docker compose run --rm client ls /
@@ -316,9 +342,15 @@ services:
     image: "dfsha/client:0.3.0"
     environment:
       DFSHA_CONTROL_URL: "http://lb:8000"
-      DFSHA_INTERNAL_SECRET: "${DFSHA_INTERNAL_SECRET:-}"
+      # Los necesita el GC, que habla con el plano interno. La CLI normal no: el trafico
+      # de cliente sigue en REST plano hasta C2.
+      DFSHA_CONTROL_INTERNAL_URL: "https://lb:8443"
+      DFSHA_TLS_CA_CERT: "/etc/dfsha/certs/ca.crt"
+      DFSHA_TLS_CERT: "/etc/dfsha/certs/client.crt"
+      DFSHA_TLS_KEY: "/etc/dfsha/certs/client.key"
     volumes:
       - "dfsha-client-home:/home/dfsha/.dfsha"
+      - "./certs:/etc/dfsha/certs:ro"
     profiles:
       - "tools"
     depends_on:

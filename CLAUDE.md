@@ -849,6 +849,72 @@ tener la contrasena vieja y la nueva a la vez, es decir, hacerlo **durante** el 
 desde el cliente. No esta implementado, y el CLI lo dice al fallar en vez de dejar un
 archivo ilegible sin explicacion.
 
+### El balanceador: nivel 7 para el cliente, nivel 4 para todo lo que lleva mTLS
+
+Cableado del Bloque C en compose. Hay **un balanceador y tres puertos**, y no todos se
+proxean igual:
+
+| Puerto | Trafico | Nivel | Por que |
+|---|---|---|---|
+| `:8000` | REST del cliente | **7** (HTTP) | nginx lee la peticion, reparte por `least_conn` y puede reintentar en otra instancia |
+| `:8443` | Plano interno (mTLS) | **4** (TCP) | El handshake tiene que ser de punta a punta |
+| `:9000` | gRPC del plano de control (mTLS) | **4** (TCP) | Lo mismo |
+
+**Un proxy de nivel 7 termina TLS.** Abre la conexion del que llama, la lee, y abre *otra
+distinta* hacia el ControlNode. El certificado que el DataNode presenta **muere en
+nginx**, y al ControlNode le llega una conexion anonima. Eso no es una perdida de
+rendimiento: **destruye el proposito entero del mTLS**, que es que el ControlNode sepa
+quien esta al otro lado y no solo que conoce un secreto.
+
+Se podria reinyectar la identidad en una cabecera (`X-SSL-Client-CN` y similares), y por
+eso conviene decir explicitamente por que **no**: la garantia pasaria a ser «confia en lo
+que dice el balanceador», que es **exactamente el secreto compartido del que el Bloque C
+se deshizo**, solo que ahora con un salto mas y la falsa sensacion de estar usando
+certificados. Quien pudiera hablar con nginx podria afirmar ser cualquiera.
+
+Con `stream`, nginx reparte bytes sin mirarlos: ControlNode y DataNode se validan entre
+si contra la misma CA, y **el balanceador no tiene ni necesita certificado**. Es ademas la
+respuesta mas barata: menos trabajo para nginx, no una capa mas.
+
+**Lo que se pierde, para que nadie lo descubra por sorpresa.** El reparto pasa a ser **por
+conexion** y no por peticion, y nginx ya no puede reintentar a mitad de una peticion (solo
+antes de que viaje ningun byte de aplicacion, que es lo que hace `proxy_next_upstream`).
+Para estos dos puertos da igual, y para gRPC es **incluso mas apropiado**: el stream de
+`Heartbeat` es una conexion larga que se abre una vez y dura horas, asi que el balanceo por
+peticion nunca le aporto nada. El unico camino que se beneficia de verdad del nivel 7 es
+el REST del cliente, que son peticiones cortas e independientes, y ese se queda donde
+estaba.
+
+**Consecuencia practica: hace falta un `nginx.conf` propio.** El bloque `stream` solo
+existe al nivel mas alto del fichero, y lo que la imagen oficial incluye desde `conf.d/`
+va **dentro de `http`**. Por eso hay tres ficheros y no uno: `nginx.conf` (principal),
+`dfsha.conf` (el `http`, montado en `conf.d/`) y `dfsha-stream.conf` (montado en
+`stream.conf.d/`). Si alguna vez reaparece un `grpc_pass` en `dfsha.conf`, es el fallo de
+terminar TLS otra vez.
+
+**El plano interno tambien va por el balanceador**, no contra una instancia fija, y por el
+mismo motivo que el gRPC: asi matar al lider durante la demostracion no deja a ningun
+DataNode sin camino. El SAN de `control.crt` incluye `lb`, que es el nombre por el que se
+le llama, ademas de los tres `control-node-N`.
+
+#### Los certificados en compose
+
+`./certs` se monta **solo lectura** en los ControlNodes, los DataNodes y el cliente. Cada
+rol usa el suyo: `control.*`, `data.*` y `client.*`, todos firmados por la misma CA.
+
+Dos avisos:
+
+1. **`ca.key` esta en ese directorio y no deberia salir de la maquina que firma.** Montar
+   el directorio entero es la comodidad de un despliegue de practica; en AWS cada
+   instancia recibe **unicamente sus tres ficheros** y la clave de la CA se queda fuera.
+2. **Un `data.crt` compartido por los cuatro DataNodes** es tambien una simplificacion de
+   practica: revocar a uno obligaria a rotar el de los cuatro. Se eligio asi porque el SAN
+   ya cubre los cuatro nombres y el numero de nodos es fijo; con nodos que entran y salen,
+   cada uno necesitaria el suyo.
+
+El servicio `migrate` **no lleva certificados**: solo ejecuta `alembic upgrade head`
+contra PostgreSQL y no habla con el plano interno.
+
 ### Enrutado CQRS: que consulta va a donde
 
 La separacion `commands/` / `queries/` existe desde la Etapa 1. Aqui se cobra.
@@ -1347,6 +1413,8 @@ alembic/{env.py,versions/}      # migraciones del metadato (Etapa 3)
 tests/{unit,integration}/
 scripts/{gen_testfile.py,gc.py,gen_certs.py}
 docker/{control_node,data_node,client}.Dockerfile
-docker/{nginx/dfsha.conf,postgres/*.sh}
+docker/nginx/{nginx.conf,dfsha.conf,dfsha-stream.conf}
+docker/postgres/*.sh
+certs/                          # CA y certificados; NO se versiona
 deploy/RUNBOOK-postgres.md      # promocion manual de la replica
 ```
