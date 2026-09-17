@@ -166,6 +166,102 @@ Y las que la Etapa 2 deja para la Etapa 3:
 - `select(block_size, replication_factor)` no cambia de firma: la Etapa 3 solo sube el
   default de `DFSHA_REPLICATION_FACTOR`, que hoy es 1.
 
+## El patron de la Etapa 3: exigir en vez de preguntar
+
+*Esta seccion se lee sola y va tal cual al informe. No hace falta haber leido el resto.*
+
+Cuatro problemas distintos de la Etapa 3 —quien manda en el cluster, quien puede leer un
+archivo, quien puede pedir un bloque, quien puede escribir en un archivo abierto— acabaron
+teniendo **la misma forma y la misma solucion**. No estaba planeado: aparecio al resolver
+el primero y se reconocio en los otros tres.
+
+### La forma del problema
+
+En los cuatro hay dos momentos separados: uno en que **se decide** si algo esta permitido,
+y otro en que **se hace**. Entre los dos cabe un cambio de estado, y por ahi se cuela el
+fallo. El caso mas claro es el del liderazgo:
+
+    t=0   A comprueba que es el lider y empieza a trabajar
+    t=1   A se congela: pausa del recolector, particion de red, contenedor sin CPU
+    t=7   el permiso de A caduca sin que A se entere
+    t=8   B toma el relevo y empieza a trabajar
+    t=9   A despierta EN MEDIO de su operacion, convencido de que sigue autorizado
+
+A no hizo nada mal segun su propia informacion. El problema es que su informacion es de
+t=0 y esta actuando en t=9, y **nada le obliga a volver a mirar**.
+
+### La solucion, en una frase
+
+> **Una funcion que responde «¿puedo?» es peor que una que hace «hazlo si puedes».**
+> La primera se puede ignorar; la segunda no.
+
+En concreto, tres reglas:
+
+1. **La autorizacion viaja como PARAMETRO de la operacion**, no se consulta antes. Si hay
+   que pasarla por toda la pila hasta el fondo, mejor: esa incomodidad es la firma del
+   tipo impidiendo que alguien escriba sin ella.
+2. **Se verifica en el mismo sitio donde se hace el efecto** —la misma transaccion, el
+   mismo cerrojo de fila, la misma peticion—, no en un paso previo.
+3. **No existe ninguna funcion consultable** del tipo `soy_el_lider()`, `tengo_el_lock()` o
+   `que_permiso_tengo()`. Existir es el problema: el camino nuevo que alguien anada dentro
+   de seis meses se olvidara de llamarla, y **no fallara ninguna prueba**.
+
+### Los cuatro casos
+
+| Problema | Que viaja con la operacion | Quien lo exige, y donde | Que pasaria sin esto |
+|---|---|---|---|
+| **Liderazgo** (Bloque A) | `Fencing(leader_id, epoch)` | `require_leadership`, dentro de la transaccion que escribe, con `SELECT … FOR UPDATE` | Dos ControlNodes marcando nodos muertos y duplicando el trafico de recuperacion de un cluster que ya se esta recuperando |
+| **Permisos** (ACLs) | el permiso **minimo** exigido | `directory_for(uow, user, path, minimum)`, que resuelve y exige a la vez | Un `resolve()` devuelve el permiso, y el camino que alguien anada despues se olvida de compararlo |
+| **Acceso a bloques** | `block_id` y operacion, **firmados** por el ControlNode | `verify_token(token, block_id=…, operation=…)`, en el DataNode | Las ACLs se saltan pidiendole el bloque directamente al DataNode, que no conoce ni rutas ni usuarios |
+| **Bloqueo de archivos** (RF3) | `LockFencing(holder_id, epoch)` | `require_lock`, dentro de la transaccion que escribe | Dos clientes escriben el mismo archivo **creyendo ambos** tener exclusion |
+
+### Por que los cuatro llevan un par y no un numero
+
+Tres de los cuatro llevan un **par** `(quien, cuando)` en vez de un identificador suelto, y
+tiene motivo en cada mitad:
+
+- **El identificador solo no basta**: el mismo actor puede haber perdido y recuperado el
+  permiso entre medias, y lo que hizo antes no vale despues.
+- **El numero solo tampoco**: dice *cuando*, no *quien*. En el RF3 esto se cobra
+  literalmente, porque al soltar un lock su epoca puede reiniciarse y dos titulares
+  distintos llegar a tener el numero 1. Solo el par los distingue.
+
+Y en los tres casos con epoca, **la epoca solo sube y recuperar el propio permiso vencido
+tambien la sube**. Si un permiso caducado propio se tratara como una renovacion, el actor
+congelado volveria con su numero intacto y validaria el trabajo que empezo antes de la
+pausa; entre una cosa y la otra pudo pasar cualquiera.
+
+### Que lo fija, y por que importa que este fijado
+
+Ninguna de estas protecciones se ve leyendo el codigo: lo que se ve es un parametro de mas
+que parece que sobra. Por eso cada una tiene una prueba que reproduce el escenario del
+actor congelado, y cada una esta nombrada para que se lea sola:
+
+- `test_el_lider_congelado_es_rechazado_y_no_escribe_nada` — comprueba el rechazo **y**
+  que no quedaron escrituras a medias
+- `test_el_lider_congelado_que_recupera_el_lease_sigue_sin_validar_lo_viejo`
+- `test_un_datanode_no_puede_firmar_sus_propios_tokens`
+- `test_el_cliente_congelado_no_escribe_encima` — con vencimiento **real**, no simulado
+- `test_la_epoca_de_Ana_NO_vale_aunque_Beto_tenga_el_mismo_numero`
+
+La ultima se escribio contra un refactor concreto y se comprobo que lo atrapa: si alguien
+simplifica la busqueda del lock a comparar solo la epoca —que parece redundante y no lo
+es—, esa prueba falla.
+
+### El riesgo que esto deja abierto
+
+Todo el patron descansa en que la incomodidad **no se elimine**. Pasar una epoca por seis
+capas parece ruido, y el impulso de simplificarlo es razonable; lo que hay que saber es
+que esa simplificacion no rompe nada visible. El sistema sigue funcionando, las pruebas
+siguen en verde salvo las cinco de arriba, y el agujero solo se manifiesta con una pausa
+larga en el momento justo.
+
+Por eso los modulos afectados llevan un bloque «Aviso para quien refactorice esto» con el
+codigo tentador escrito y tachado. Documentar la version incorrecta es mas util que
+documentar la correcta: la correcta ya esta ahi.
+
+---
+
 ### Decisiones de la Etapa 3 — Bloque A
 
 1. **PostgreSQL para todo menos las pruebas unitarias.** SQLite bloquea la base entera
@@ -1094,15 +1190,9 @@ sobre las filas del archivo. En t=9 la fila dice 4, Ana trae 3, y el `append` se
 entero con `stale_lock`.
 
 Y por tercera vez la misma regla: **no existe ningun `tengo_el_lock()`**. `require_lock`
-se llama DENTRO del `with uow:` de quien escribe. Es el mismo patron que
-`require_leadership` y que el minimo de `directory_for`:
-
-| Donde | Que viaja | Quien lo verifica |
-|---|---|---|
-| Bloque A | `Fencing(leader_id, epoch)` | `require_leadership`, dentro del `uow` |
-| ACLs | el permiso **minimo** | `directory_for`, al resolver |
-| Token de bloque | `block_id` + operacion, firmados | `verify_token`, en el DataNode |
-| **RF3** | `LockFencing(holder_id, epoch)` | `require_lock`, dentro del `uow` |
+se llama DENTRO del `with uow:` de quien escribe, igual que `require_leadership` y que el
+minimo de `directory_for`. Los cuatro casos estan juntos y explicados en **«El patron de
+la Etapa 3: exigir en vez de preguntar»**, al principio de esta seccion.
 
 **El titular es una SESION, no un usuario.** Ana desde dos maquinas son dos titulares, y
 tiene que ser asi o el lock no excluiria nada entre sus propios procesos. Por eso
@@ -1219,6 +1309,34 @@ del servidor y ahora los conserva: se vio al escribir la prueba que los comproba
 
 Se responde **409 y no 423 (Locked)**: 423 es de WebDAV y muchos clientes HTTP no lo
 tratan como reintentable.
+
+### Los `details` del error: una rama que nunca se ejecuto
+
+`cli._fallar` lleva desde la Etapa 1 esta rama:
+
+```python
+if error.details:
+    console.print(f"[dim]{error.details}[/dim]")
+```
+
+**No se ejecuto nunca.** `_to_error` reconstruia el error del servidor con su `message` y
+su `code` y **tiraba los `details`**, asi que la condicion era siempre falsa. Se descubrio
+al escribir la prueba de un conflicto de lock del RF3, que necesitaba
+`retry_after_seconds`.
+
+Y no afectaba solo a ese error: el descarte era **general**. Los **106** sitios que lanzan
+errores de dominio en el ControlNode adjuntan datos —`missing` y `quorum` en un commit sin
+quorum, `expires_at` en una reserva vencida, `path` en casi todo— y ninguno llegaba al
+usuario.
+
+El efecto no era un fallo visible sino algo mas dificil de notar: **mensajes
+empobrecidos**. «No alcanzan el quorum de escritura» sin decir cuales bloques; «la reserva
+vencio» sin decir cuando. Nadie lo reporta porque el mensaje parece completo.
+
+Es una variante del patron de la Etapa 3: **algo que aparenta estar puesto y no lo esta**,
+esta vez del lado del cliente y sin fallo que lo delate. Lo fija
+`TestDetallesDelError` en `tests/integration/test_transfer.py`, que lo comprueba sobre dos
+errores que **no** son el del lock, para que no se vuelva a colar por un camino distinto.
 
 ### Intermitente conocido: `test_los_bloques_son_inmutables`
 

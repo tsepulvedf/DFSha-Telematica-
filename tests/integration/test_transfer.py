@@ -10,6 +10,7 @@ import httpx
 import pytest
 
 from dfsha.common.blocktoken import BLOCK_TOKEN_HEADER
+from dfsha.common.errors import DFShaError
 from dfsha.client.api import ControlApi
 from dfsha.client.session import Session
 from dfsha.client.transfer import download_blocks, upload_blocks
@@ -344,3 +345,45 @@ class TestReservaVencida:
             assert nuevo.file_id != plan.file_id
         finally:
             cluster.stop()
+
+
+class TestDetallesDelError:
+    """Los `details` del servidor tienen que llegar al cliente.
+
+    **Esto era codigo muerto y nadie lo noto.** `cli._fallar` lleva desde la Etapa 1 una
+    rama `if error.details: ...`, pero `_to_error` no los copiaba nunca, asi que esa rama
+    no se ejecuto una sola vez. Se descubrio al escribir la prueba de un conflicto de lock
+    del RF3, y el descarte no era de ese error: era **general**, para los 106 sitios que
+    lanzan errores con datos adjuntos.
+
+    El efecto no era un fallo visible sino algo peor de detectar: mensajes empobrecidos.
+    «no alcanzan el quorum» sin decir CUALES bloques, «la reserva vencio» sin decir cuando.
+    """
+
+    def test_un_error_de_dominio_conserva_sus_detalles(
+        self, cluster: Cluster, api: ControlApi
+    ) -> None:
+        """Se usa un tamano de bloque invalido porque su error adjunta el valor pedido,
+        que es justo el dato que hace accionable el mensaje."""
+        with pytest.raises(DFShaError) as fallo:
+            api.create_file("/bloque-raro.bin", 100, block_size=-1)
+
+        assert fallo.value.details, "los details del servidor se perdieron por el camino"
+
+    def test_el_quorum_fallido_dice_QUE_bloques_faltan(
+        self, cluster: Cluster, api: ControlApi
+    ) -> None:
+        """El caso que de verdad se sufre: un `put` que no confirma.
+
+        Sin los detalles, el mensaje es «no alcanzan el quorum de escritura» y no hay por
+        donde empezar. Con ellos viene la lista de bloques que no llegaron.
+        """
+        plan = api.create_file("/sin-subir.bin", 10)  # no se sube ningun bloque
+
+        with pytest.raises(DFShaError) as fallo:
+            api.commit_file(plan.file_id)
+
+        assert fallo.value.code == "blocks_not_stored"
+        detalles = fallo.value.details
+        assert detalles.get("missing"), "no se dice QUE bloques faltan"
+        assert detalles.get("quorum") == 1, "no se dice contra que quorum se comparo"

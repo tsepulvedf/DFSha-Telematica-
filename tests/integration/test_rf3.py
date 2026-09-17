@@ -10,6 +10,7 @@ igual es lo que hace que el diseno sea coherente.
 from __future__ import annotations
 
 import hashlib
+import time
 
 import httpx
 import pytest
@@ -24,6 +25,27 @@ from .cluster import MB, Cluster, start_cluster
 @pytest.fixture(scope="module")
 def cluster(tmp_path_factory):
     c = start_cluster(tmp_path_factory.mktemp("rf3"), block_size=MB, data_nodes=1)
+    try:
+        yield c
+    finally:
+        c.stop()
+
+
+@pytest.fixture(scope="module")
+def cluster_lease_corto(tmp_path_factory):
+    """Un cluster aparte con locks que vencen en 1 s.
+
+    Hace falta para que el vencimiento sea REAL y no simulado: el default son 120 s, y una
+    prueba que esperase eso no seria una prueba. Va en su propio cluster porque bajar el
+    TTL en el compartido haria que cualquier prueba lenta perdiera sus locks a mitad, y el
+    fallo aparecerian en otro sitio.
+    """
+    c = start_cluster(
+        tmp_path_factory.mktemp("rf3-corto"),
+        block_size=MB,
+        data_nodes=1,
+        file_lock_ttl_ms=1000,
+    )
     try:
         yield c
     finally:
@@ -355,12 +377,12 @@ def test_anadir_sobre_un_bloque_LLENO_no_reescribe_nada(ana) -> None:
 # --- EL caso: el cliente congelado -----------------------------------------
 
 
-def test_el_cliente_congelado_no_escribe_encima(ana, beto) -> None:
+def test_el_cliente_congelado_no_escribe_encima(cluster_lease_corto) -> None:
     """El escenario del Bloque A, con un cliente en vez de un ControlNode.
 
         t=0  Ana toma el lock (epoca N) y empieza a escribir
         t=1  Ana se congela: su portatil suspende, se le va la red
-        t=7  el lease vence sin que Ana se entere
+        t=7  el lease VENCE sin que Ana se entere
         t=8  Beto lo toma (epoca N+1) y escribe su version
         t=9  Ana despierta EN MEDIO, convencida de que sigue teniendo el lock
 
@@ -368,19 +390,28 @@ def test_el_cliente_congelado_no_escribe_encima(ana, beto) -> None:
     encima de lo de Beto y los dos creen haber escrito con exclusion. Lo que lo corta es
     que la epoca viaje con la operacion y se verifique dentro de la transaccion.
 
-    Aqui se simula la congelacion sin esperar al vencimiento: basta con que OTRO tome el
-    lock —lo que sube la epoca— para que la de Ana quede obsoleta.
+    **El vencimiento aqui es real**, no simulado soltando el lock: este cluster concede
+    locks de 1 s y la prueba espera a que caduquen. Es la diferencia entre comprobar que
+    el mecanismo funciona y comprobar que funciona en el caso por el que existe: Ana nunca
+    suelta nada, porque el supuesto es justamente que no puede.
     """
+    ana = _usuario(cluster_lease_corto, "ana-congelada")
+    beto = _usuario(cluster_lease_corto, "beto-congelado")
+
     ana.mkdir("/critico", parents=True)
     file_id = _subir(ana, "/critico/doc.txt", b"contenido\n")
     ana.share("/critico", beto.session.username, "write")
     ruta_beto = f"/compartido-conmigo/{ana.session.username}/critico/doc.txt"
 
     lock_de_ana = ana.lock("/critico/doc.txt", holder="sesion-de-ana")
-    ana.unlock("/critico/doc.txt", holder="sesion-de-ana")  # el lease vence
-    lock_de_beto = beto.lock(ruta_beto, holder="sesion-de-beto")
 
-    # Ana despierta y escribe con su epoca vieja.
+    # Ana se congela. No suelta: no puede.
+    time.sleep(1.2)
+
+    lock_de_beto = beto.lock(ruta_beto, holder="sesion-de-beto")
+    assert lock_de_beto.epoch > lock_de_ana.epoch, "la epoca tiene que subir"
+
+    # Ana despierta y escribe con su par antiguo.
     with pytest.raises(Exception) as fallo:
         ana.append(
             file_id, 10, lock_holder="sesion-de-ana", lock_epoch=lock_de_ana.epoch
@@ -390,6 +421,74 @@ def test_el_cliente_congelado_no_escribe_encima(ana, beto) -> None:
     # Y Beto, que si tiene el lock vigente, escribe sin problema.
     assert beto.append(
         file_id, 10, lock_holder="sesion-de-beto", lock_epoch=lock_de_beto.epoch
+    ).blocks
+
+
+def test_un_lock_vencido_deja_de_estorbar(cluster_lease_corto) -> None:
+    """La otra cara del lease, y la razon de que exista: si no venciera, el primer cliente
+    que se caiga sin soltar deja el archivo bloqueado hasta que intervenga alguien."""
+    ana = _usuario(cluster_lease_corto, "ana-vencido")
+    beto = _usuario(cluster_lease_corto, "beto-vencido")
+
+    ana.mkdir("/vence", parents=True)
+    _subir(ana, "/vence/doc.txt", b"x")
+    ana.share("/vence", beto.session.username, "write")
+    ruta_beto = f"/compartido-conmigo/{ana.session.username}/vence/doc.txt"
+
+    ana.lock("/vence/doc.txt", holder="sesion-de-ana")
+    with pytest.raises(Exception):
+        beto.lock(ruta_beto, holder="sesion-de-beto")  # todavia vivo
+
+    time.sleep(1.2)
+
+    assert beto.lock(ruta_beto, holder="sesion-de-beto").holder
+
+
+def test_la_epoca_de_Ana_NO_vale_aunque_Beto_tenga_el_mismo_numero(ana, beto) -> None:
+    """El caso que sostiene que la epoca pueda reiniciarse, y el mas facil de romper.
+
+    Soltar un lock BORRA su fila, asi que `max_epoch` vuelve a 0 y la siguiente concesion
+    empieza otra vez por 1. Eso parece contradecir el «la epoca solo sube» del Bloque A.
+    No lo contradice, y toda la razon por la que no lo hace cabe en una linea:
+
+        **`require_lock` busca el lock por `holder_id`, no por epoca.**
+
+    Aqui Ana y Beto acaban teniendo AMBOS la epoca 1 sobre el mismo archivo. Si la
+    comprobacion fuera «¿coincide la epoca?», la de Ana cuadraria con la de Beto y Ana
+    escribiria con un lock que ya no tiene. Lo que lo impide es que el fencing sea un PAR:
+    el titular tambien tiene que coincidir.
+
+    **Esta prueba existe para un refactor concreto.** A alguien le va a parecer que buscar
+    por titular y comparar la epoca es redundante —«si la epoca cuadra, ya esta»— y va a
+    simplificarlo a comparar solo el numero. Se comprobo que ese cambio hace fallar esta
+    prueba, que es lo que se le pide.
+
+    Lo que aporta frente a `test_el_cliente_congelado_no_escribe_encima`, que tambien lo
+    detectaria: **aqui la colision de epocas es el sujeto y esta aseverada**. Alli el
+    fallo apareceria sin explicar por que, y quien lo viera buscaria el problema en el
+    vencimiento del lease, que es de lo que esa prueba habla.
+    """
+    ana.mkdir("/misma-epoca", parents=True)
+    file_id = _subir(ana, "/misma-epoca/doc.txt", b"contenido\n")
+    ana.share("/misma-epoca", beto.session.username, "write")
+    ruta_beto = f"/compartido-conmigo/{ana.session.username}/misma-epoca/doc.txt"
+
+    de_ana = ana.lock("/misma-epoca/doc.txt", holder="sesion-de-ana")
+    ana.unlock("/misma-epoca/doc.txt", holder="sesion-de-ana")  # borra la fila
+    de_beto = beto.lock(ruta_beto, holder="sesion-de-beto")
+
+    # El escenario que hace util la prueba: el MISMO numero para los dos.
+    assert de_ana.epoch == de_beto.epoch == 1, (
+        "si dejan de coincidir, esta prueba ya no cubre lo que dice cubrir"
+    )
+
+    with pytest.raises(Exception) as fallo:
+        ana.append(file_id, 10, lock_holder="sesion-de-ana", lock_epoch=de_ana.epoch)
+
+    assert getattr(fallo.value, "code", "") == "stale_lock"
+    # Y Beto, con el mismo numero pero siendo el titular de verdad, si escribe.
+    assert beto.append(
+        file_id, 10, lock_holder="sesion-de-beto", lock_epoch=de_beto.epoch
     ).blocks
 
 
