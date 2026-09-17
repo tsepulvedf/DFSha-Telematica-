@@ -54,6 +54,7 @@ class ControlPlaneServicer(control_pb2_grpc.ControlPlaneServicer):
         heartbeat_interval_ms: int,
         full_report_every_n: int,
         order_resend_after: timedelta = timedelta(seconds=30),
+        signer=None,
     ) -> None:
         self._uow = uow_factory
         self._thresholds = thresholds
@@ -63,6 +64,9 @@ class ControlPlaneServicer(control_pb2_grpc.ControlPlaneServicer):
         #: 3 s y copiar un bloque tarda mucho mas que eso: sin este margen se le
         #: repetiria la misma orden veinte veces por minuto.
         self._order_resend_after = order_resend_after
+        #: Firma los tokens de lectura que el nodo destino presenta al origen. `None` sin
+        #: TLS, que es el mismo interruptor que apaga la verificacion en el DataNode.
+        self._signer = signer
         self._log = get_logger("control_node")
 
     # --- Register ----------------------------------------------------------
@@ -174,7 +178,7 @@ class ControlPlaneServicer(control_pb2_grpc.ControlPlaneServicer):
             uow = self._uow()
             with uow:
                 ordenes = rereplication.pending_orders(
-                    uow, data_node_id, self._order_resend_after
+                    uow, data_node_id, self._order_resend_after, signer=self._signer
                 )
                 if ordenes:
                     uow.commit()
@@ -205,6 +209,7 @@ class ControlPlaneServicer(control_pb2_grpc.ControlPlaneServicer):
                         source_node_id=copia.source_node_id,
                         size=copia.size,
                         checksum_sha256=copia.checksum_sha256,
+                        block_token=copia.block_token,
                     )
                 )
             )

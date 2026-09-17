@@ -16,6 +16,7 @@ from datetime import timedelta
 from fastapi import FastAPI, Request
 
 from dfsha.common.logging import configure_logging, get_logger
+from dfsha.common.blocktoken import TokenSigner
 from dfsha.common.tls import TlsMaterial
 from dfsha.control_node.config import ControlNodeSettings, load_settings_or_exit
 from dfsha.control_node.repositories.database import (
@@ -189,6 +190,7 @@ def create_app(settings: ControlNodeSettings | None = None) -> FastAPI:
             thresholds=thresholds,
             heartbeat_interval_ms=settings.heartbeat_interval_ms,
             full_report_every_n=settings.full_report_every_n,
+            signer=app.state.token_signer,
         )
         grpc_server = build_grpc_server(
             servicer,
@@ -302,6 +304,20 @@ def create_app(settings: ControlNodeSettings | None = None) -> FastAPI:
     # la peticion, y las pruebas lo consultan sin levantar el lifespan.
     app.state.leadership = LeadershipService(
         uow_factory=app.state.uow_factory, timings=lease_timings
+    )
+
+    # Firmante de tokens de bloque. Se carga UNA vez: hacerlo por peticion releeria dos
+    # ficheros y reconstruiria la clave RSA en cada bloque de cada `put`.
+    #
+    # `None` cuando no hay TLS configurado, que es el caso de las pruebas rapidas y de
+    # SQLite. Entonces el plan sale sin token y el DataNode, que tampoco tiene CA, no lo
+    # exige: las dos mitades se apagan juntas. Lo que NO puede pasar es que una este y la
+    # otra no, y por eso la condicion es la misma en los dos lados: hay material TLS o no
+    # lo hay.
+    app.state.token_signer = (
+        TokenSigner.from_paths(settings.tls_key, settings.tls_cert)
+        if settings.tls_cert and settings.tls_key
+        else None
     )
 
     @app.middleware("http")

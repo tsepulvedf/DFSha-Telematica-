@@ -98,6 +98,11 @@ class BlockWritePlan(_Dto):
     #: Vacia con R=1, y tambien cuando no se configura direccion de par: entonces la
     #: cadena usa las mismas direcciones y el despliegue es el simple, no uno degradado.
     pipeline: list[str] = []
+    #: Autorizacion de ESCRITURA para este bloque, firmada por el ControlNode. El cliente
+    #: la copia en `X-DFSha-Block-Token` y el DataNode la verifica contra la CA. Viaja en
+    #: el plan y no en una llamada aparte porque es la misma decision: el ControlNode ya
+    #: comprobo el permiso al construirlo. Ver common/blocktoken.py.
+    token: str = ""
 
 
 class BlockReadPlan(_Dto):
@@ -108,6 +113,8 @@ class BlockReadPlan(_Dto):
     size: int
     checksum_sha256: str
     replicas: list[ReplicaRef]
+    #: Autorizacion de LECTURA para este bloque. Ver `BlockWritePlan.token`.
+    token: str = ""
 
 
 # --- Autenticacion ---------------------------------------------------------
@@ -260,6 +267,10 @@ class OrphanBlock(_Dto):
     block_id: str
     size: int
     replicas: list[ReplicaRef]
+    #: Autorizacion de BORRADO. El GC corre fuera del cluster y presenta un certificado
+    #: de cliente, no uno de ControlNode: sin token no podria borrar nada, que es lo
+    #: correcto. Quien decide que un bloque es huerfano sigue siendo el ControlNode.
+    token: str = ""
 
 
 class OrphanBlocksResponse(_Dto):

@@ -9,6 +9,7 @@ from pathlib import Path
 import httpx
 import pytest
 
+from dfsha.common.blocktoken import BLOCK_TOKEN_HEADER
 from dfsha.client.api import ControlApi
 from dfsha.client.session import Session
 from dfsha.client.transfer import download_blocks, upload_blocks
@@ -40,6 +41,19 @@ def nueva_sesion(cluster: Cluster, username: str) -> Session:
 def api(cluster: Cluster, request) -> ControlApi:
     return ControlApi(nueva_sesion(cluster, f"u{abs(hash(request.node.name)) % 10**9}"))
 
+
+
+def cabeceras_de_token(bloque, **extra) -> dict[str, str]:
+    """Las cabeceras de una peticion directa al DataNode, con su autorizacion.
+
+    Hablar con el DataNode "a mano" sigue siendo legitimo —es lo que hace el cliente—,
+    pero desde el Bloque C hay que llevar el token que el plan trae. Antes no: un `GET
+    /blocks/{id}` sin credencial ninguna devolvia los bytes, que es justo el agujero que
+    el token cierra. Estas pruebas lo ejercitaban sin darse cuenta.
+    """
+    cabeceras = {BLOCK_TOKEN_HEADER: bloque.token} if getattr(bloque, "token", "") else {}
+    cabeceras.update(extra)
+    return cabeceras
 
 def generar(path: Path, size: int, semilla: int = 1234) -> str:
     """Contenido pseudoaleatorio reproducible. Devuelve su SHA-256."""
@@ -152,7 +166,7 @@ class TestIntegridad:
         respuesta = httpx.put(
             f"{destino}/api/v1/blocks/{bloque.block_id}",
             content=b"0123456789",
-            headers={"X-DFSha-Checksum": "0" * 64},
+            headers=cabeceras_de_token(bloque, **{"X-DFSha-Checksum": "0" * 64}),
             timeout=30,
         )
         assert respuesta.status_code == 422
@@ -174,6 +188,7 @@ class TestIntegridad:
         respuesta = httpx.put(
             f"{bloque.replicas[0].base_url}/api/v1/blocks/{bloque.block_id}",
             content=b"0123456789",
+            headers=cabeceras_de_token(bloque),
             timeout=30,
         )
         assert respuesta.status_code == 422
@@ -183,7 +198,7 @@ class TestIntegridad:
         plan = api.create_file("/inmutable.bin", len(datos))
         bloque = plan.blocks[0]
         url = f"{bloque.replicas[0].base_url}/api/v1/blocks/{bloque.block_id}"
-        cabeceras = {"X-DFSha-Checksum": sha256_bytes(datos)}
+        cabeceras = cabeceras_de_token(bloque, **{"X-DFSha-Checksum": sha256_bytes(datos)})
 
         assert httpx.put(url, content=datos, headers=cabeceras, timeout=30).status_code == 201
         segunda = httpx.put(url, content=datos, headers=cabeceras, timeout=30)
@@ -200,7 +215,9 @@ class TestIntegridad:
         plan = api.open_file("/con-checksum.bin")
         bloque = plan.blocks[0]
         respuesta = httpx.get(
-            f"{bloque.replicas[0].base_url}/api/v1/blocks/{bloque.block_id}", timeout=30
+            f"{bloque.replicas[0].base_url}/api/v1/blocks/{bloque.block_id}",
+            headers=cabeceras_de_token(bloque),
+            timeout=30,
         )
         assert respuesta.headers["X-DFSha-Checksum"] == bloque.checksum_sha256
         assert sha256_bytes(respuesta.content) == bloque.checksum_sha256

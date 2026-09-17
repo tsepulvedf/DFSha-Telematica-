@@ -12,6 +12,7 @@ from typing import Annotated, Callable
 from fastapi import Depends, Header, Request
 
 from dfsha.common.errors import AuthenticationError
+from dfsha.common.blocktoken import TokenSigner
 from dfsha.control_node.config import ControlNodeSettings
 from dfsha.control_node.repositories.sql import SqlUnitOfWork
 from dfsha.control_node.services.auth import TokenClaims, decode_access_token
@@ -36,10 +37,21 @@ __all__ = [
     "UowFactory",
     "Placement",
     "CurrentUser",
+    "Signer",
 ]
 
 def get_settings_dep(request: Request) -> ControlNodeSettings:
     return request.app.state.settings
+
+
+def get_token_signer(request: Request) -> "TokenSigner | None":
+    """El firmante de tokens de bloque. `None` cuando no hay TLS configurado.
+
+    Que sea opcional no es una puerta trasera: el DataNode solo exige token cuando el
+    tambien tiene CA, y las dos condiciones son la misma —hay material TLS o no lo hay—.
+    En un despliegue sin TLS no hay nada que verificar contra nada.
+    """
+    return request.app.state.token_signer
 
 
 def get_uow_factory(request: Request) -> Callable[[], SqlUnitOfWork]:
@@ -120,4 +132,5 @@ Uow = Annotated[SqlUnitOfWork, Depends(get_uow)]
 QueryUow = Annotated[SqlUnitOfWork, Depends(get_query_uow)]
 UowFactory = Annotated[Callable[[], SqlUnitOfWork], Depends(get_uow_factory)]
 Placement = Annotated[BlockPlacementPolicy, Depends(get_placement)]
+Signer = Annotated["TokenSigner | None", Depends(get_token_signer)]
 CurrentUser = Annotated[TokenClaims, Depends(current_user)]

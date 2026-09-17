@@ -44,6 +44,7 @@ from pathlib import Path
 import httpx
 import pytest
 
+from dfsha.common.blocktoken import BLOCK_TOKEN_HEADER
 from dfsha.client.api import ControlApi
 from dfsha.client.session import Session
 from dfsha.client.transfer import PIPELINE_HEADER, upload_blocks
@@ -239,6 +240,10 @@ class TestDireccionDeClienteMuerta:
                 headers={
                     "X-DFSha-Checksum": hashlib.sha256(datos).hexdigest(),
                     PIPELINE_HEADER: ",".join(bloque.pipeline),
+                    # El token viaja con los bytes y cada salto de la cadena lo
+                    # reenvia tal cual: los tres nodos escriben el mismo bloque por
+                    # orden del mismo ControlNode.
+                    BLOCK_TOKEN_HEADER: bloque.token,
                 },
                 timeout=60,
             )
@@ -298,6 +303,10 @@ class TestDireccionDeClienteMuerta:
                 headers={
                     "X-DFSha-Checksum": hashlib.sha256(datos).hexdigest(),
                     PIPELINE_HEADER: ",".join(bloque.pipeline),
+                    # El token viaja con los bytes y cada salto de la cadena lo
+                    # reenvia tal cual: los tres nodos escriben el mismo bloque por
+                    # orden del mismo ControlNode.
+                    BLOCK_TOKEN_HEADER: bloque.token,
                 },
                 timeout=60,
             )

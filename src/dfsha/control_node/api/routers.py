@@ -60,7 +60,7 @@ from dfsha.control_node.queries import namespace as namespace_queries
 from dfsha.control_node.domain.entities import utcnow
 from dfsha.control_node.domain.membership import MembershipThresholds
 
-from .deps import CurrentUser, Placement, QueryUow, Settings, Uow
+from .deps import CurrentUser, Placement, QueryUow, Settings, Signer, Uow
 
 __all__ = [
     "auth_router",
@@ -322,6 +322,17 @@ def remove_member(body: GroupMemberRequest, uow: Uow, user: CurrentUser) -> Resp
     return Response(status_code=status.HTTP_204_NO_CONTENT)
 
 
+def _emitir(signer, block_id: str, operacion: str, sujeto: str) -> str:
+    """Un token de bloque, o cadena vacia si el despliegue no tiene TLS.
+
+    Sin material TLS no hay con que firmar, y tampoco hay DataNode que pueda verificar:
+    las dos mitades se encienden y se apagan juntas. Ver `deps.get_token_signer`.
+    """
+    if signer is None:
+        return ""
+    return signer.issue(block_id, operacion, now=utcnow(), subject=sujeto)
+
+
 # --- Transferencia (RF2) ---------------------------------------------------
 
 
@@ -332,6 +343,7 @@ def create_file(
     user: CurrentUser,
     settings: Settings,
     placement: Placement,
+    signer: Signer,
 ) -> CreateFileResponse:
     creado = file_commands.create_file(
         uow,
@@ -356,6 +368,7 @@ def create_file(
                 size=b.size,
                 replicas=_replicas(b.replicas),
                 pipeline=b.pipeline,
+                token=_emitir(signer, b.block_id, "write", user.user_id),
             )
             for b in creado.blocks
         ],
@@ -391,7 +404,9 @@ def abort_file(file_id: str, uow: Uow, user: CurrentUser) -> Response:
 
 
 @files_router.get("/open")
-def open_file(path: str, uow: QueryUow, user: CurrentUser) -> OpenFileResponse:
+def open_file(
+    path: str, uow: QueryUow, user: CurrentUser, signer: Signer
+) -> OpenFileResponse:
     plan = file_queries.open_file(uow, user.user_id, path)
     return OpenFileResponse(
         file_id=plan.file_id,
@@ -406,6 +421,11 @@ def open_file(path: str, uow: QueryUow, user: CurrentUser) -> OpenFileResponse:
                 size=b.size,
                 checksum_sha256=b.checksum_sha256,
                 replicas=_replicas(b.replicas),
+                # Se emite DESPUES de que `open_file` haya resuelto los permisos: si el
+                # usuario no puede leer la ruta, no se llega hasta aqui. El token es la
+                # forma de que esa decision viaje hasta el DataNode, que es donde estan
+                # los bytes y donde no hay ni ruta ni usuario que consultar.
+                token=_emitir(signer, b.block_id, "read", user.user_id),
             )
             for b in plan.blocks
         ],
@@ -429,7 +449,7 @@ def block_stored(block_id: str, body: BlockStoredRequest, uow: Uow) -> Response:
 
 
 @internal_router.get("/gc/orphan-blocks")
-def orphan_blocks(uow: Uow) -> OrphanBlocksResponse:
+def orphan_blocks(uow: Uow, signer: Signer) -> OrphanBlocksResponse:
     """Es una consulta, pero va al PRIMARIO a proposito.
 
     El GC no lee esta lista para mostrarla: la lee para **borrar bloques del disco**. Una
@@ -441,7 +461,10 @@ def orphan_blocks(uow: Uow) -> OrphanBlocksResponse:
     return OrphanBlocksResponse(
         blocks=[
             OrphanBlock(
-                block_id=b.block_id, size=b.size, replicas=_replicas(b.replicas)
+                block_id=b.block_id,
+                size=b.size,
+                replicas=_replicas(b.replicas),
+                token=_emitir(signer, b.block_id, "delete", "gc"),
             )
             for b in gc_queries.orphan_blocks(uow)
         ]

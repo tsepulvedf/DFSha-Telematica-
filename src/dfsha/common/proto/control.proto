@@ -101,6 +101,15 @@ message ReplicateBlock {
   string source_node_id  = 4;
   uint64 size            = 5;
   string checksum_sha256 = 6;  // se verifica antes de escribir, como en el pipeline
+  // Token de LECTURA sobre ese bloque, firmado por el ControlNode. El destino descarga
+  // del origen por REST, que es un camino sin autenticar, asi que necesita presentarlo
+  // igual que lo haria un cliente.
+  //
+  // DeleteBlock NO lleva token, y la asimetria es deliberada: ese borrado lo ejecuta el
+  // propio nodo en su disco, sin salir a la red. La orden llego por este stream, que ya
+  // esta autenticado con mTLS, asi que el canal ES la autorizacion. Un token ahi seria
+  // ceremonia: el nodo tendria que presentarselo a si mismo.
+  string block_token     = 7;
 }
 
 // Borrado de un bloque huerfano por el canal de control.

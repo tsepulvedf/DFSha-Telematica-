@@ -66,6 +66,10 @@ class ReplicationOrder:
     source_node_id: str
     size: int
     checksum_sha256: str
+    #: Token de LECTURA sobre el bloque. El destino descarga del origen por REST, que es
+    #: un camino sin autenticar: sin esto, activar el token de bloque romperia la
+    #: re-replicacion con 403 y el cluster dejaria de repararse solo.
+    block_token: str = ""
 
 
 @dataclass(frozen=True, slots=True)
@@ -350,6 +354,7 @@ def pending_orders(
     data_node_id: str,
     resend_after: timedelta,
     now: datetime | None = None,
+    signer=None,
 ) -> PendingOrders:
     """Ordenes que hay que empujarle a este nodo, y las marca como enviadas.
 
@@ -359,6 +364,14 @@ def pending_orders(
     liderazgo (`scan_and_enqueue` y `dispatch`); esto solo entrega una decision ya
     tomada, y negarse a entregarla porque la atiende otra instancia dejaria la copia
     esperando hasta que el lease cambiara de manos.
+
+    **El token se emite AQUI y no al programar la copia**, aunque programar sea el momento
+    en que se toma la decision. El motivo es el reloj: una tarea puede quedarse en la cola
+    minutos —la gracia son cinco— y reintentarse despues, asi que un token firmado al
+    programarla llegaria caducado justo en el caso que importa, el de un cluster que va
+    lento porque se esta recuperando. Emitirlo al entregar la orden le da su vida entera
+    para hacer el trabajo. La decision sigue siendo la de antes; esto solo es cuando se
+    escribe el permiso.
     """
     ahora = now or utcnow()
     tareas = uow.rereplication.orders_for(data_node_id, ahora, resend_after)
@@ -404,6 +417,13 @@ def pending_orders(
                 source_node_id=origen.id,
                 size=bloque.size,
                 checksum_sha256=bloque.checksum_sha256 or "",
+                block_token=(
+                    signer.issue(
+                        tarea.block_id, "read", now=ahora, subject="rereplication"
+                    )
+                    if signer is not None
+                    else ""
+                ),
             )
         )
 

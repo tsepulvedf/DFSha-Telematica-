@@ -17,6 +17,7 @@ import httpx
 
 import hashlib
 
+from dfsha.common.blocktoken import BLOCK_TOKEN_HEADER
 from dfsha.common.checksum import CHUNK_SIZE, Sha256Accumulator, checksum_matches
 from dfsha.common.crypto import FileCrypto
 from dfsha.common.dto import BlockReadPlan, BlockWritePlan
@@ -60,6 +61,9 @@ class _Slot:
     checksum: str | None = None
     #: URL de las replicas 2..R, por orden. Vacia con R=1.
     pipeline: tuple[str, ...] = ()
+    #: Autorizacion firmada por el ControlNode. Se copia TAL CUAL del plan: el cliente no
+    #: la construye ni la interpreta, solo la lleva.
+    token: str = ""
 
 
 def _slots_de_escritura(blocks: Sequence[BlockWritePlan], overhead: int = 0) -> list[_Slot]:
@@ -97,6 +101,7 @@ def _slots_de_escritura(blocks: Sequence[BlockWritePlan], overhead: int = 0) -> 
                 base_url=replica.base_url,
                 data_node_id=replica.data_node_id,
                 pipeline=tuple(getattr(bloque, "pipeline", ()) or ()),
+                token=getattr(bloque, "token", "") or "",
             )
         )
         offset += claro
@@ -152,6 +157,8 @@ def upload_blocks(
         }
         if slot.pipeline:
             cabeceras[PIPELINE_HEADER] = ",".join(slot.pipeline)
+        if slot.token:
+            cabeceras[BLOCK_TOKEN_HEADER] = slot.token
 
         with timed(
             "block.upload",
@@ -351,6 +358,11 @@ def _bajar_de(
             "GET",
             f"{replica.base_url.rstrip('/')}/api/v1/blocks/{bloque.block_id}",
             timeout=timeout,
+            headers=(
+                {BLOCK_TOKEN_HEADER: bloque.token}
+                if getattr(bloque, "token", "")
+                else {}
+            ),
         ) as respuesta:
             if respuesta.status_code != 200:
                 respuesta.read()

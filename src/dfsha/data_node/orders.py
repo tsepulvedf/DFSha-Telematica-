@@ -39,6 +39,7 @@ from concurrent.futures import ThreadPoolExecutor
 
 import httpx
 
+from dfsha.common.blocktoken import BLOCK_TOKEN_HEADER
 from dfsha.common.checksum import CHUNK_SIZE, Sha256Accumulator, checksum_matches
 from dfsha.common.errors import BlockAlreadyExistsError, ChecksumMismatchError
 from dfsha.common.logging import get_logger, timed
@@ -188,7 +189,15 @@ class OrderExecutor:
         acumulador = Sha256Accumulator()
         trozos: list[bytes] = []
 
-        with httpx.stream("GET", url, timeout=self._timeout) as respuesta:
+        cabeceras = (
+            {BLOCK_TOKEN_HEADER: orden.block_token}
+            if getattr(orden, "block_token", "")
+            else {}
+        )
+
+        with httpx.stream(
+            "GET", url, timeout=self._timeout, headers=cabeceras
+        ) as respuesta:
             if respuesta.status_code != 200:
                 respuesta.read()
                 raise RuntimeError(

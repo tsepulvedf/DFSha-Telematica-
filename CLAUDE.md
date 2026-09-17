@@ -716,6 +716,162 @@ no esta en un `if` del caso de uso, esta en la llamada que obtiene el directorio
 al vuelo con las concesiones que apuntan a este usuario. No es una fila porque no tiene
 dueno ni padre, y darle uno obligaria a inventar reglas para renombrarlo o borrarlo.
 
+### Token de bloque: lo que hace que las ACLs sean ciertas
+
+Sin esto, las ACLs del Bloque C **eran ciertas a medias**, y la mitad que faltaba era la
+que importa. Conviene enunciar el problema antes que la solucion, porque es el mejor
+ejemplo del proyecto de una decision de arquitectura que crea una obligacion de seguridad
+en otro sitio:
+
+- El ControlNode resuelve permisos sobre **rutas**.
+- Los bytes van **directos** entre cliente y DataNode (decision 4 de la seccion 1), que es
+  lo que hace que anadir nodos sume ancho de banda en vez de saturar un nodo central.
+- El DataNode **no sabe nada de rutas ni de usuarios**: almacena por `block_id` (decision
+  2 de la seccion 1).
+
+Juntando las tres: **el unico sitio donde se comprobaba el permiso no estaba en el camino
+de los datos**. `GET /blocks/{id}` servia a cualquiera que supiera el id.
+
+«Un UUID no se adivina» no es una respuesta, y merece la pena decir por que: un `block_id`
+aparece en todo plan que el ControlNode haya entregado alguna vez, en los logs, y en el
+metadato de un archivo que se dejo de compartir. El dia que a alguien se le retira el
+acceso, los ids que ya vio **siguen siendo validos para siempre**. Seguridad por
+desconocimiento del identificador es exactamente lo que un sistema con ACLs explicitas no
+deberia necesitar.
+
+#### Como funciona
+
+El ControlNode **firma** una autorizacion corta y el DataNode la **verifica sin
+preguntarle a nadie**. No hay viaje extra: el token va en el mismo plan que ya se
+entregaba.
+
+    token = base64url(payload) . base64url(firma) . base64url(certificado del firmante)
+
+`payload` lleva `block_id`, operacion (`read`/`write`/`delete`), expiracion y sujeto. La
+firma es RSA-PSS SHA-256 **sobre los bytes ya codificados**, no sobre el JSON
+reserializado: firmar lo que se transmite evita depender de que dos versiones de Python
+ordenen las claves igual.
+
+La tercera parte es la que no es obvia. El certificado del ControlNode **viaja dentro del
+token** para que el DataNode no necesite tenerlo configurado: le basta **la CA**, que ya
+tiene por el mTLS. Rotar el certificado del ControlNode no obliga a tocar ningun DataNode,
+y esa es la propiedad que hace esto mantenible. Es la misma idea que `x5c` en JWS.
+
+| Camino | Quien pide el token | Operacion |
+|---|---|---|
+| `dfsha put` -> DataNode | El plan de `/files/create` | `write` |
+| Pipeline DN1 -> DN2 -> DN3 | **Se reenvia el mismo**, no se genera otro | `write` |
+| `dfsha get` -> DataNode | El plan de `/files/open` | `read` |
+| Re-replicacion: destino -> origen | La orden `ReplicateBlock` | `read` |
+| GC por REST -> DataNode | La respuesta de `/gc/orphan-blocks` | `delete` |
+| GC por el canal de control | *ninguno* | — |
+
+Las dos filas raras, que son las que hay que saber defender:
+
+**El pipeline reenvia el token tal cual, no fabrica uno nuevo.** No podria: la clave que
+firma vive solo en el ControlNode, y esa es justamente la propiedad que hace que un
+DataNode comprometido no pueda autorizarse nada. El token vale para *ese* bloque, con
+`write`, hasta su expiracion, asi que sirve igual en cada salto: los tres nodos estan
+escribiendo el mismo bloque por orden del mismo ControlNode.
+
+**`DeleteBlock` por el canal de control NO lleva token**, y la asimetria es deliberada: ese
+borrado lo ejecuta el propio nodo en su disco, sin salir a la red. La orden llego por el
+stream de heartbeat, que ya esta autenticado con mTLS, asi que **el canal ES la
+autorizacion**. Un token ahi seria ceremonia: el nodo tendria que presentarselo a si mismo.
+
+#### NO es un secreto compartido, y la diferencia es la decision
+
+`DFSHA_INTERNAL_SECRET` desaparecio en el Bloque C y esto **no lo reintroduce por la puerta
+de atras**. Un HMAC con clave compartida obligaria a que el DataNode tuviera la misma clave
+con la que se firma, y entonces **el DataNode podria emitir tokens**: autorizarse cualquier
+bloque, y quien comprometiera un DataNode se llevaria la capacidad de firmar para todo el
+cluster. Con firma asimetrica el DataNode solo puede **verificar**. La clave privada no
+sale del ControlNode. Lo fija `test_el_token_NO_lleva_la_clave_que_lo_firma`.
+
+#### Firmado por la CA no basta. Esta es la trampa
+
+La intuicion natural al implementarlo es «el DataNode valida que el certificado del
+firmante encadena a nuestra CA», y **eso solo seria un agujero**: la misma CA firmo
+`dfsha-control`, `dfsha-data` y `dfsha-client`. Cualquier DataNode podria emitirse tokens
+con su propio certificado y el de al lado se los aceptaria. Se habria construido un sistema
+de autorizacion que autoriza justo a quien debia limitar.
+
+Y no es hipotetico: el DataNode **ya tiene** ese certificado y su clave privada, porque los
+necesita para el mTLS. No habria que robar nada.
+
+Por eso la verificacion exige **dos** cosas y las dos son obligatorias:
+
+1. Que el certificado del firmante encadene a nuestra CA.
+2. Que su Common Name sea `dfsha-control`: que el firmante sea **el rol con derecho a
+   decidir**.
+
+Lo fijan `test_un_datanode_no_puede_firmar_sus_propios_tokens` y
+`test_el_cliente_tampoco_puede_firmar`.
+
+Es la tercera vez en la Etapa 3 que aparece el mismo tipo de fallo —**algo que aparenta
+estar puesto y no lo esta**—, solo que esta vez se vio antes de escribirlo y no despues.
+
+#### El minimo va en la firma. Otra vez
+
+`verify_token(token, *, block_id, operation, now)` **resuelve y exige a la vez**, igual que
+`directory_for(uow, user, path, minimum)` y que la epoca del Bloque A. No devuelve el grant
+para que el llamante compare: si lo hiciera, el camino nuevo que se anada dentro de seis
+meses se olvidaria de mirarlo y no fallaria ninguna prueba.
+
+Las dos consecuencias concretas, cada una con su prueba:
+
+- **Un token de un bloque no abre otro.** El `block_id` va firmado dentro, no solo en la
+  URL. Sin eso, tener acceso a un bloque propio daria acceso a todos: basta cambiar el id
+  de la URL y reusar el token.
+- **Leer no autoriza a borrar.** La operacion va firmada. Sin eso, cualquiera con permiso
+  de lectura sobre un archivo compartido podria destruirlo.
+
+#### Tres detalles que parecen menores y no lo son
+
+1. **El PUT autoriza ANTES de leer el cuerpo.** Si no, un no autorizado haria que el nodo
+   se tragara 64 MB por la red antes de rechazarlo. Autorizar primero convierte un abuso de
+   ancho de banda en una respuesta corta.
+2. **El DELETE autoriza ANTES de la idempotencia.** Un bloque que no existe tambien exige
+   token. Si el 204 de «no estaba» llegara primero, el endpoint seria un **oraculo** —204
+   si no existe, 403 si existe— con el que se puede enumerar el contenido de un disco sin
+   autorizacion ninguna. Lo fija
+   `test_borrar_un_bloque_inexistente_tambien_exige_token`.
+3. **El motivo del rechazo va al log, no a la respuesta.** Hacia fuera es siempre un 403
+   con el mismo texto. Quien prueba tokens no deberia recibir pistas sobre cual de sus
+   intentos estuvo mas cerca; quien diagnostica tiene el motivo exacto en
+   `block.token_rejected`.
+
+#### El token se emite al ENTREGAR la orden, no al programarla
+
+En la re-replicacion hay dos momentos: cuando el lider decide la copia y cuando el nodo
+destino recibe la orden. El token se firma en el **segundo**, y es por el reloj: una tarea
+puede quedarse en la cola minutos —la gracia son cinco— y reintentarse despues, asi que un
+token firmado al programarla llegaria caducado **justo en el caso que importa**, el de un
+cluster que va lento porque se esta recuperando de una caida. Emitirlo al entregar la orden
+le da su vida entera para hacer el trabajo. La decision sigue siendo la de antes; esto solo
+es cuando se escribe el permiso.
+
+#### El limite: no hay revocacion
+
+Retirar un permiso corta la **emision** de tokens nuevos; no invalida los ya emitidos. Un
+token que alguien guardara sigue sirviendo hasta que caduque, y por eso la vida por defecto
+son **10 minutos**: cubre de sobra la subida o bajada de un bloque de 64 MB y coincide con
+el TTL de las reservas de escritura, que es el otro reloj de la misma operacion.
+
+Es el compromiso clasico de una credencial sin estado, y la alternativa —consultar al
+ControlNode en cada peticion de bloque— devolveria el plano de control al camino de los
+datos, que es justo lo que la decision 4 evita. Queda fijado como comportamiento esperado
+en `test_al_retirar_el_permiso_deja_de_emitirse_token`, para que sea una decision escrita y
+no un descubrimiento en la sustentacion.
+
+#### Las dos mitades se encienden juntas
+
+Sin material TLS, el ControlNode no firma (`token_signer is None`) y el DataNode no exige
+(`block_token_ca is None`). Es la **misma condicion** en los dos lados —hay certificados o
+no los hay—, y esta escrito asi a proposito: lo que no puede pasar es que una mitad este y
+la otra no. En un despliegue sin TLS no hay nada que verificar contra nada; en el real el
+material TLS no tiene default y el servicio no arranca sin el.
+
 ### Cifrado extremo a extremo: tres niveles de clave
 
 El servidor **nunca ve una clave**. Con el metadato entero, la base de datos y todos los
@@ -1164,15 +1320,24 @@ comparado en tiempo constante. En la Etapa 3 esto pasa a gRPC con mTLS.
 ```
 PUT    /blocks/{block_id}    body: bytes crudos
                              header X-DFSha-Checksum: <sha256 hex>
+                             header X-DFSha-Block-Token: <token firmado>
        -> 201, o 422 si el checksum no coincide, 409 si el block_id ya existe
        el DataNode notifica al ControlNode antes de responder 201
 GET    /blocks/{block_id}    -> bytes crudos, header X-DFSha-Checksum
+                             exige X-DFSha-Block-Token con operacion `read`
 DELETE /blocks/{block_id}    -> 204
+                             exige X-DFSha-Block-Token con operacion `delete`
 GET    /health               -> {status, used_bytes, capacity_bytes, block_count,
                                 disk_free_bytes}
 ```
 
 Los bloques son inmutables: reescribir un `block_id` existente es 409.
+
+**Las tres operaciones exigen token de bloque**, y sin el responden 403. Es lo que hace
+que las ACLs alcancen a los bytes y no solo al metadato: el DataNode no conoce rutas ni
+usuarios, asi que la unica forma de que un permiso llegue hasta aqui es que viaje firmado.
+Ver "Token de bloque". `/health` no lo exige: no revela contenido, y es lo que consultan
+las sondas del despliegue.
 
 `used_bytes` y `block_count` se calculan del estado real en disco, no de un contador en
 memoria; `used_bytes` suma solo los bytes de los `.blk`, ignorando los `.meta`. En la
@@ -1322,6 +1487,11 @@ Etapa 3 (Bloque B):
 - `rereplication.expired` — `requeued`, `gave_up`
 - `block.replica_failed` — una replica no sirvio la lectura; se prueba la siguiente
 
+Etapa 3 (Bloque C):
+
+- `block.token_rejected` — `block_id`, `operation`, `reason`. El motivo concreto va SOLO
+  aqui: hacia fuera todo rechazo es el mismo 403 con el mismo texto
+
 ---
 
 ## 9. Cliente CLI
@@ -1394,6 +1564,7 @@ El repositorio es **público**. No negociable:
 src/dfsha/
 ├── common/          # DTOs compartidos, checksum, errores, logging
 │   ├── crypto.py        # las tres capas de clave (Bloque C)
+│   ├── blocktoken.py    # autorizacion por bloque que el DataNode verifica solo
 │   └── tls.py           # UNICO sitio donde se construye un contexto TLS de cliente
 ├── control_node/
 │   ├── main.py, config.py
@@ -1411,7 +1582,8 @@ src/dfsha/
     ├── cli.py, session.py, chunker.py, transfer.py
 alembic/{env.py,versions/}      # migraciones del metadato (Etapa 3)
 tests/{unit,integration}/
-scripts/{gen_testfile.py,gc.py,gen_certs.py}
+scripts/{gen_testfile.py,gc.py,gen_certs.py,gen_proto.py}
+scripts/demo/                   # guiones de la demostracion del video
 docker/{control_node,data_node,client}.Dockerfile
 docker/nginx/{nginx.conf,dfsha.conf,dfsha-stream.conf}
 docker/postgres/*.sh

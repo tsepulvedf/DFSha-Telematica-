@@ -28,6 +28,7 @@ from pathlib import Path
 
 import httpx
 
+from dfsha.common.blocktoken import BLOCK_TOKEN_HEADER
 from dfsha.common.tls import TlsMaterial
 
 # El secreto compartido de las Etapas 1 y 2 ya no existe: el plano interno vive en su
@@ -133,10 +134,20 @@ def recolectar(
         tamano = bloque.get("size", 0)
         todas_fuera = True
 
+        # El token de borrado lo emitio el ControlNode al decidir que este bloque es
+        # huerfano. El GC no puede fabricarlo: presenta un certificado de CLIENTE, no de
+        # ControlNode, y la verificacion exige el rol. Es lo que impide que un script con
+        # acceso a la red borre bloques por su cuenta.
+        cabeceras = {BLOCK_TOKEN_HEADER: bloque["token"]} if bloque.get("token") else {}
+
         for replica in replicas:
             base = replica["base_url"].rstrip("/")
             try:
-                borrado = httpx.delete(f"{base}/api/v1/blocks/{block_id}", timeout=timeout)
+                borrado = httpx.delete(
+                    f"{base}/api/v1/blocks/{block_id}",
+                    timeout=timeout,
+                    headers=cabeceras,
+                )
                 if borrado.status_code not in (204, 404):
                     todas_fuera = False
                     resumen.fallos.append(

@@ -52,3 +52,6 @@ htmlcov/
 .vscode/
 .DS_Store
 Thumbs.db
+
+# Salida de los guiones de scripts/demo/: ficheros de prueba, nada que versionar.
+tmp/

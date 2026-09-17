@@ -161,6 +161,10 @@ def create_app(
 
     app_state_holder.bind(app.state)
 
+    # La CA en memoria: es contra ella contra la que se valida el firmante de cada token
+    # de bloque. `None` sin TLS, y entonces no se exige token — la misma condicion que
+    # apaga la firma en el ControlNode. Se lee una vez porque no cambia.
+    app.state.block_token_ca = tls.ca_cert.read_bytes() if tls is not None else None
     app.state.settings = settings
     app.state.orders = orders
     app.state.storage = storage

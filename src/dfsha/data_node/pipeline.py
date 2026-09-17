@@ -49,6 +49,7 @@ from dataclasses import dataclass
 
 import httpx
 
+from dfsha.common.blocktoken import BLOCK_TOKEN_HEADER
 from dfsha.common.logging import get_logger
 
 __all__ = [
@@ -67,10 +68,11 @@ PIPELINE_HEADER = "X-DFSha-Pipeline"
 ACKED_HEADER = "X-DFSha-Replicas-Acked"
 CHECKSUM_HEADER = "X-DFSha-Checksum"
 
-#: Tope de saltos. El DataNode todavia no autentica al cliente (el token de bloque llega
-#: en el Bloque C), asi que cualquiera podria mandar una cadena de mil nodos y convertir
-#: un PUT en una tormenta. R=3 necesita 2 saltos; 4 deja margen sin dejar la puerta
-#: abierta.
+#: Tope de saltos. El token de bloque autoriza a escribir ESE bloque, no a fijar la
+#: longitud de la cadena: quien tenga un token valido podria mandar una cadena de mil
+#: nodos y convertir un PUT en una tormenta de trafico entre DataNodes. Son dos cosas
+#: distintas —autorizacion y limite de recursos— y el token solo cubre la primera. R=3
+#: necesita 2 saltos; 4 deja margen sin dejar la puerta abierta.
 MAX_HOPS = 4
 
 
@@ -107,6 +109,7 @@ def forward(
     checksum: str,
     cadena: list[str],
     timeout: float = 120.0,
+    token: str = "",
 ) -> PipelineResult:
     """Manda el bloque al siguiente de la cadena con el resto de la cadena detras.
 
@@ -115,6 +118,13 @@ def forward(
 
     Nunca lanza. Un fallo aguas abajo es una replica de menos, no un error de la subida:
     quien llama responde 201 igual y el hueco lo recoge la re-replicacion.
+
+    **El token de bloque se reenvia tal cual**, no se genera uno nuevo. No podria: la
+    clave que firma vive solo en el ControlNode, y esa es justamente la propiedad que
+    hace que un DataNode comprometido no pueda autorizarse nada. El token que el cliente
+    presento vale para ESTE bloque, con `write`, hasta su expiracion, asi que sirve igual
+    en cada salto de la cadena: los tres nodos estan escribiendo el mismo bloque por
+    orden del mismo ControlNode.
     """
     log = get_logger("data_node")
 
@@ -128,6 +138,8 @@ def forward(
     }
     if resto:
         cabeceras[PIPELINE_HEADER] = ",".join(resto)
+    if token:
+        cabeceras[BLOCK_TOKEN_HEADER] = token
 
     try:
         respuesta = httpx.put(
