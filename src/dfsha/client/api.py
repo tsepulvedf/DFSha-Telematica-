@@ -32,6 +32,7 @@ from dfsha.common.dto import (
 from dfsha.common.errors import DFShaError
 
 from .session import Session, SessionStore
+from .tls import verificacion_para
 
 __all__ = ["ControlApi", "resolve_path", "READ_LSN_HEADER", "WRITE_LSN_HEADER"]
 
@@ -65,8 +66,17 @@ class ControlApi:
         if self.session.last_write_lsn:
             cabeceras[READ_LSN_HEADER] = self.session.last_write_lsn
 
+        destino = f"{self.base}{url}"
         respuesta = httpx.request(
-            method, f"{self.base}{url}", headers=cabeceras, timeout=self._timeout, **kwargs
+            method,
+            destino,
+            headers=cabeceras,
+            timeout=self._timeout,
+            # Con http:// esto es `True` y httpx lo ignora. El mismo camino sirve para
+            # los dos esquemas, que es lo que evita que el de TLS sea uno aparte que
+            # nadie ejercita. Ver client/tls.py.
+            verify=verificacion_para(destino),
+            **kwargs,
         )
         if respuesta.status_code >= 400:
             raise _to_error(respuesta)

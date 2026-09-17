@@ -69,6 +69,16 @@ class DataNodeSettings(BaseSettings):
     tls_ca_cert: str
     tls_cert: str
     tls_key: str
+    #: Certificado con el que este servicio se presenta ante el CLIENTE (C2). Vacias =
+    #: HTTP plano, que es el default y el modo de desarrollo. Van LAS DOS o NINGUNA.
+    #:
+    #: Separadas de DFSHA_TLS_CERT a proposito: aquel identifica al servicio DENTRO del
+    #: cluster y sus nombres son internos; este lleva el nombre por el que llega el
+    #: usuario, que en un despliegue real es publico. Que sean dos variables permite usar
+    #: el mismo fichero en desarrollo sin que el diseno lo de por supuesto.
+    client_tls_cert: str = ""
+    client_tls_key: str = ""
+
     log_level: str = "INFO"
     register_retry_seconds: float = Field(default=2.0, gt=0)
     register_max_attempts: int = Field(default=30, gt=0)

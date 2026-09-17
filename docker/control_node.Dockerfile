@@ -41,5 +41,8 @@ HEALTHCHECK --interval=5s --timeout=3s --start-period=5s --retries=10 \
 
 # --factory: la app se construye al arrancar, no al importar el modulo, para que la
 # falta de un secreto falle con un mensaje claro en vez de a mitad de la importacion.
-CMD ["uvicorn", "dfsha.control_node.main:create_app", "--factory", \
-     "--host", "0.0.0.0", "--port", "8000"]
+# Se arranca por el modulo y no por `uvicorn` directamente porque el TLS de cliente es
+# OPCIONAL: un CMD con las banderas puestas obligaria a que todo despliegue tuviera
+# certificados de cliente, y sin ellas no habria forma de activarlo. La decision la toma
+# la configuracion. Ver src/dfsha/common/serve.py.
+CMD ["python", "-m", "dfsha.control_node"]

@@ -49,6 +49,7 @@ from dfsha.common.crypto import (
     wrap_file_key,
 )
 
+from .tls import verificacion_para
 from .transfer import PIPELINE_HEADER, download_blocks, upload_blocks
 
 __all__ = ["app", "main"]
@@ -991,10 +992,12 @@ def _bajar_bloque_suelto(bloque) -> bytes:
     fallos: list[str] = []
     for replica in bloque.replicas:
         try:
+            destino = f"{replica.base_url.rstrip('/')}/api/v1/blocks/{bloque.block_id}"
             respuesta = httpx.get(
-                f"{replica.base_url.rstrip('/')}/api/v1/blocks/{bloque.block_id}",
+                destino,
                 headers=({BLOCK_TOKEN_HEADER: bloque.token} if bloque.token else {}),
                 timeout=120,
+                verify=verificacion_para(destino),
             )
             if respuesta.status_code == 200:
                 return respuesta.content
@@ -1100,8 +1103,9 @@ def append(remoto: str, local: str) -> None:
 
 
 def _subir_bloque_suelto(bloque, cuerpo: bytes) -> None:
+    destino = f"{bloque.replicas[0].base_url.rstrip('/')}/api/v1/blocks/{bloque.block_id}"
     respuesta = httpx.put(
-        f"{bloque.replicas[0].base_url.rstrip('/')}/api/v1/blocks/{bloque.block_id}",
+        destino,
         content=cuerpo,
         headers={
             "X-DFSha-Checksum": hashlib.sha256(cuerpo).hexdigest(),
@@ -1110,6 +1114,7 @@ def _subir_bloque_suelto(bloque, cuerpo: bytes) -> None:
             **({BLOCK_TOKEN_HEADER: bloque.token} if bloque.token else {}),
         },
         timeout=300,
+        verify=verificacion_para(destino),
     )
     if respuesta.status_code != 201:
         console.print(

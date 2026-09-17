@@ -1,6 +1,6 @@
 # DFSha — sistema de archivos distribuido por bloques
 
-**Hito 3 (en curso · Bloques A, B y C completos; falta TLS de cliente)** · SI3007 / ST0263 Sistemas Distribuidos
+**Hito 3 (completo)** · SI3007 / ST0263 Sistemas Distribuidos
 
 DFSha parte archivos en bloques de tamaño fijo, los reparte entre DataNodes y guarda todo
 el metadato en un ControlNode. La arquitectura es de tipo HDFS, opción cliente/servidor:
@@ -36,10 +36,10 @@ se **cifran en el cliente** —el servidor guarda los bloques y no puede leerlos
 firmada** que el DataNode verifica por su cuenta. Más el **RF3**: `open`, lectura por
 rango, `append` y bloqueo de archivos con lease.
 
-> **Estado.** Los Bloques A (PostgreSQL, CQRS con réplica de lectura, elección de líder),
-> B (replicación R=3 con pipeline, quórum W=2 y re-replicación) y C (mTLS, cifrado extremo
-> a extremo, ACLs, token de bloque y RF3) están terminados y probados. Falta el TLS del
-> tráfico de **cliente**, que es lo último del hito.
+> **Estado.** El hito está **completo**: Bloques A (PostgreSQL, CQRS con réplica de
+> lectura, elección de líder), B (replicación R=3 con pipeline, quórum W=2 y
+> re-replicación) y C (mTLS, cifrado extremo a extremo, ACLs, token de bloque, RF3 y TLS
+> de cliente). 529 pruebas en verde.
 
 ---
 
@@ -1051,14 +1051,16 @@ qué cambia en cada instancia están en **[`deploy/README.md`](deploy/README.md)
 | **B** | Replicación **R=3** con pipeline encadenado, quórum **W=2** en el commit, re-replicación automática con tres frenos |
 | **C** | **mTLS** en el plano interno, **cifrado extremo a extremo**, **ACLs** con grupos, **token de bloque**, y **RF3** (`open`, lectura por rango, `append`, `lock` con lease) |
 
-**Falta para cerrar el hito**: TLS para el tráfico de **cliente**. Hoy el cliente habla
-con el ControlNode y con los DataNodes en HTTP plano; el plano interno ya va cifrado y
-autenticado por los dos lados.
+**El TLS de cliente es opcional y viene apagado por defecto** (`DFSHA_CLIENT_TLS_CERT` y
+`DFSHA_CLIENT_TLS_KEY` vacías = HTTP plano). No es una concesión: es lo que permite que
+`curl http://localhost:8000/health` siga funcionando en desarrollo. Y lo que aporta cuando
+se enciende conviene decirlo en el orden correcto: **los bloques ya viajaban cifrados**
+desde el Bloque C, así que esto no salva la confidencialidad del contenido —eso ya estaba—
+sino el **token JWT**, el **metadato** (nombres, rutas, tamaños) y los tokens de bloque.
 
-Que esa pieza vaya al final es deliberado: era la primera de la lista de recortes acordada
-al empezar, junto con los grupos de las ACLs. El cifrado de los archivos **no depende de
-ella** —los bloques viajan ya cifrados desde el cliente, así que un observador de la red
-tampoco los lee—; lo que falta es proteger el **metadato** en tránsito y el token JWT.
+No es mTLS: al cliente **no** se le pide certificado, porque su identidad es el JWT. Dar un
+certificado a cada usuario sería montar una PKI para acabar sabiendo lo mismo que ya dice
+el token.
 
 ### Límites conocidos, escritos a propósito
 

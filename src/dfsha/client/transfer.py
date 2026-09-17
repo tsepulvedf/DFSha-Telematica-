@@ -25,6 +25,7 @@ from dfsha.common.errors import ChecksumMismatchError, DFShaError, StorageError
 from dfsha.common.logging import get_logger, timed
 
 from .chunker import checksum_block, read_block
+from .tls import verificacion_para
 
 __all__ = [
     "CHECKSUM_HEADER",
@@ -168,8 +169,9 @@ def upload_blocks(
             data_node_id=slot.data_node_id,
             replicas_planned=1 + len(slot.pipeline),
         ) as t:
+            destino = f"{slot.base_url.rstrip('/')}/api/v1/blocks/{slot.block_id}"
             respuesta = httpx.put(
-                f"{slot.base_url.rstrip('/')}/api/v1/blocks/{slot.block_id}",
+                destino,
                 content=(
                     cuerpo
                     if cuerpo is not None
@@ -177,6 +179,7 @@ def upload_blocks(
                 ),
                 headers=cabeceras,
                 timeout=timeout,
+                verify=verificacion_para(destino),
             )
             if respuesta.status_code == 201:
                 t.bind(replicas_acked=_acked(respuesta))
@@ -354,10 +357,12 @@ def _bajar_de(
         size_bytes=bloque.size,
         data_node_id=replica.data_node_id,
     ):
+        origen = f"{replica.base_url.rstrip('/')}/api/v1/blocks/{bloque.block_id}"
         with httpx.stream(
             "GET",
-            f"{replica.base_url.rstrip('/')}/api/v1/blocks/{bloque.block_id}",
+            origen,
             timeout=timeout,
+            verify=verificacion_para(origen),
             headers=(
                 {BLOCK_TOKEN_HEADER: bloque.token}
                 if getattr(bloque, "token", "")

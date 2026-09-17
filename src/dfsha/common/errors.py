@@ -206,6 +206,16 @@ class StaleLockError(DFShaError):
     code = "stale_lock"
 
 
+class TlsCaNotFoundError(DFShaError):
+    """El servidor habla HTTPS y el cliente no encuentra la CA con la que verificarlo.
+
+    Es un error de CONFIGURACION del cliente, no del servidor, y por eso lleva la lista de
+    rutas donde buscó: un «SSL: CERTIFICATE_VERIFY_FAILED» a secas no dice qué hacer.
+    """
+
+    code = "tls_ca_no_encontrada"
+
+
 class StorageError(DFShaError):
     """Fallo de E/S en el DataNode."""
 

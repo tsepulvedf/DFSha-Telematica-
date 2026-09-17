@@ -101,8 +101,8 @@ Diseñar contra esta hoja de ruta, no adelantarla.
   **Hecho en la Etapa 3, Bloque B.**
 - Alta disponibilidad del ControlNode, edit log, failover, réplicas de lectura.
 - mTLS, cifrado en reposo, 2FA, ACLs por grupo.
-  **Hecho en la Etapa 3, Bloque C**: mTLS en el plano interno, cifrado extremo a extremo
-  y ACLs con grupos. 2FA no entra: no esta en el enunciado.
+  **Hecho en la Etapa 3, Bloque C**: mTLS en el plano interno, TLS en el de cliente,
+  cifrado extremo a extremo y ACLs con grupos. 2FA no entra: no esta en el enunciado.
 - RF3 (`open`/`read`/`write`/`lock`), leases, lecturas por rango.
   **Hecho en la Etapa 3, Bloque C.** Ver "RF3" mas abajo.
 - El GC se sigue corriendo a mano.
@@ -1352,6 +1352,89 @@ Dos avisos:
 El servicio `migrate` **no lleva certificados**: solo ejecuta `alembic upgrade head`
 contra PostgreSQL y no habla con el plano interno.
 
+### TLS de cliente (C2): cifrado e identidad DEL SERVIDOR, y nada mas
+
+Lo ultimo del hito, y lo primero de la lista de recortes acordada al empezar. Que fuera al
+final no lo hace menos necesario, pero si acota lo que aporta, y conviene decirlo en el
+orden correcto.
+
+#### Que protege de verdad
+
+**Los bloques ya viajaban cifrados** desde el Bloque C: el cliente los cifra antes de que
+salgan de su maquina, asi que un observador de la red nunca pudo leer el contenido de un
+archivo. Esto **no** es lo que salva la confidencialidad de los datos; eso ya estaba.
+
+Lo que anade es proteger lo que quedaba en claro:
+
+- el **token JWT**, que viajaba en una cabecera y con el que cualquiera podria suplantar al
+  usuario durante toda la vida del token;
+- el **metadato**: nombres de archivos, rutas, tamanos, con quien se comparte;
+- los **tokens de bloque**, que autorizan a descargar un bloque concreto.
+
+#### No es mTLS, y la diferencia es la decision
+
+| | Plano interno | Plano de cliente |
+|---|---|---|
+| Quien llama | un servicio nuestro | una **persona** |
+| Como se identifica | su **certificado** | su **JWT** |
+| El servidor exige certificado | **si** (`CERT_REQUIRED`) | **no** (`CERT_NONE`) |
+| Que aporta TLS | cifrado **e identidad de los dos** | cifrado e identidad **del servidor** |
+
+Darle un certificado a cada usuario seria montar una PKI para usuarios —emision,
+distribucion, revocacion, rotacion— para acabar sabiendo lo mismo que ya dice el token. Asi
+que aqui TLS hace lo que hace bien: cifrar el canal y demostrar que el servidor es quien
+dice ser. **Quien es el usuario lo dice la capa de arriba, y eso no es un hueco.**
+
+`CERT_NONE` esta fijado en `test_al_cliente_no_se_le_exige_certificado_en_la_configuracion`
+a proposito: un copia y pega desde `_ServidorInterno` lo convertiria en `CERT_REQUIRED`, y
+el sintoma seria que **ningun cliente puede conectarse**, lo cual al menos es ruidoso —pero
+el error hablaria de handshake y no de configuracion.
+
+#### Es OPCIONAL, y por eso hay un modulo de arranque
+
+`DFSHA_CLIENT_TLS_CERT` y `DFSHA_CLIENT_TLS_KEY` vacias = HTTP plano, que es el default y
+el modo de desarrollo. Eso obliga a decidir en tiempo de ejecucion, y un `CMD` de uvicorn
+en el Dockerfile no puede: con las banderas puestas, **todo** despliegue necesitaria
+certificados de cliente y `curl localhost:8000` dejaria de funcionar; sin ellas no habria
+forma de activarlo. De ahi `common/serve.py` y el `python -m dfsha.control_node`.
+
+**Las dos variables van juntas o ninguna.** Configurar solo una es casi siempre un error de
+copia y pega, y arrancar en HTTP ignorandolo dejaria a alguien convencido de que su trafico
+va cifrado. Falla al arrancar y lo dice.
+
+Y son **distintas de `DFSHA_TLS_CERT`** aunque en desarrollo se use el mismo fichero: aquel
+identifica al servicio **dentro** del cluster y sus nombres son internos (`control-node-1`,
+IP privadas); este lleva el nombre por el que llega el **usuario**, que en un despliegue
+real es publico y no tiene por que parecerse. Que sean dos variables permite compartir
+fichero sin que el diseno lo dé por supuesto.
+
+#### `verify=False` no aparece en ningun sitio, y es deliberado
+
+Es la salida que hace que todo funcione a la primera, y es **exactamente el fallo que esta
+etapa lleva persiguiendo**: algo que aparenta estar puesto y no lo esta. Un TLS sin
+verificar cifra contra un observador pasivo y no protege de nada frente a quien pueda
+ponerse en medio, que es el atacante que importa. El `https://` se ve igual.
+
+La CA de DFSha es propia, asi que hay que decirle al cliente en quien confiar. Dos formas y
+solo una aceptable:
+
+- **Instalarla en el almacen del sistema.** Afecta a TODO el equipo: cualquier programa
+  pasaria a confiar en certificados firmados por nosotros. Desproporcionado.
+- **Decirselo a este cliente y solo a el**, con `DFSHA_TLS_CA_CERT` o buscandola donde
+  `gen_certs.py` la deja. Es lo que se hace.
+
+Si falta, **falla y dice donde buscó** (`TlsCaNotFoundError`). Un
+«SSL: CERTIFICATE_VERIFY_FAILED» a secas no dice que hacer.
+
+#### El mismo codigo para los dos esquemas
+
+`client/tls.verificacion_para(url)` devuelve `True` con `http://` —httpx lo ignora— y un
+contexto con `https://`. Quien llama no pregunta por el esquema.
+
+No es azucar: si el camino con TLS fuera uno aparte, seria **uno que nadie ejercita** en
+desarrollo, y se enteraria de que esta roto el dia del despliegue. Asi las 529 pruebas
+recorren la misma linea que usa el despliegue con TLS, aunque lo hagan en HTTP.
+
 ### RF3: `open`, `read` por rango, `write` como append, y `lock` con lease
 
 #### El lock: la epoca, por tercera vez
@@ -1889,6 +1972,11 @@ DFSHA_TLS_CA_CERT=certs/ca.crt
 DFSHA_TLS_CERT=certs/control.crt
 DFSHA_TLS_KEY=certs/control.key
 DFSHA_INTERNAL_PORT=8443
+# TLS de cara al CLIENTE (C2). Vacias = HTTP plano, que es el default. Las dos o ninguna.
+DFSHA_CLIENT_TLS_CERT=
+DFSHA_CLIENT_TLS_KEY=
+# Solo del lado del CLIENTE: donde esta la CA con la que verificar al servidor.
+DFSHA_TLS_CA_CERT=certs/ca.crt
 ```
 
 `DFSHA_DATANODE_BASE_URL` de la Etapa 1 pasó a llamarse `DFSHA_DATANODE_ADVERTISE_URL`,
@@ -2078,6 +2166,7 @@ src/dfsha/
 ├── common/          # DTOs compartidos, checksum, errores, logging
 │   ├── crypto.py        # las tres capas de clave (Bloque C)
 │   ├── blocktoken.py    # autorizacion por bloque que el DataNode verifica solo
+│   ├── serve.py         # arranque con TLS de cliente opcional (C2)
 │   └── tls.py           # UNICO sitio donde se construye un contexto TLS de cliente
 ├── control_node/
 │   ├── main.py, config.py
@@ -2093,6 +2182,7 @@ src/dfsha/
 │   └── runtime.py       # carga instantanea que alimenta el heartbeat
 └── client/
     ├── cli.py, session.py, chunker.py, transfer.py
+    └── tls.py           # UNICO sitio que decide como verificar HTTPS de cliente
 alembic/{env.py,versions/}      # migraciones del metadato (Etapa 3)
 tests/{unit,integration}/
 scripts/{gen_testfile.py,gc.py,gen_certs.py,gen_proto.py,verificar_pruebas.py}

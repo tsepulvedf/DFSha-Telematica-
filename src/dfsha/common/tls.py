@@ -35,6 +35,7 @@ import grpc
 __all__ = [
     "TlsMaterial",
     "client_ssl_context",
+    "ca_only_context",
     "server_ssl_context",
     "grpc_server_credentials",
     "grpc_channel_credentials",
@@ -94,6 +95,29 @@ def client_ssl_context(material: TlsMaterial) -> ssl.SSLContext:
         ssl.Purpose.SERVER_AUTH, cafile=str(material.ca_cert)
     )
     contexto.load_cert_chain(certfile=str(material.cert), keyfile=str(material.key))
+    contexto.minimum_version = ssl.TLSVersion.TLSv1_2
+    return contexto
+
+
+def ca_only_context(ca_cert: str | Path) -> ssl.SSLContext:
+    """Contexto de cliente que **valida al servidor y no presenta certificado propio**.
+
+    Es lo que usa el trafico de USUARIO, y la diferencia con `client_ssl_context` es la
+    decision entera del C2:
+
+    - En el **plano interno** los dos extremos son servicios nuestros, asi que cada uno
+      tiene su certificado y la autenticacion es **mutua**. Ahi el certificado ES la
+      identidad.
+    - En el **plano de cliente** el que llama es una persona, y su identidad la lleva el
+      **JWT**. Darle un certificado a cada usuario seria montar una PKI para usuarios
+      —emision, distribucion, revocacion— para acabar sabiendo lo mismo que ya dice el
+      token.
+
+    Asi que aqui TLS hace lo que TLS hace bien y nada mas: cifrar el canal y **demostrar
+    que el servidor es quien dice ser**. Lo que falta —quien es el usuario— no es un hueco:
+    lo cubre la capa de arriba.
+    """
+    contexto = ssl.create_default_context(ssl.Purpose.SERVER_AUTH, cafile=str(ca_cert))
     contexto.minimum_version = ssl.TLSVersion.TLSv1_2
     return contexto
 
