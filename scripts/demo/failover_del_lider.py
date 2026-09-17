@@ -30,7 +30,7 @@ from __future__ import annotations
 import sys
 import time
 
-from _comun import Demo, exigir_docker, exigir_sesion
+from _comun import Demo, exigir_docker, exigir_sesion, sesion_del_cli
 
 INSTANCIAS = [f"dfsha-control-node-{n}" for n in (1, 2, 3)]
 #: Margen sobre el TTL del lease (6 s por defecto) para que el relevo se haya completado.
@@ -46,11 +46,9 @@ def leer_liderazgo(demo: Demo):
     romperia la demostracion sin que nadie relacionara las dos cosas.
     """
     from dfsha.client.api import ControlApi
-    from dfsha.client.session import SessionStore
 
     try:
-        sesion = SessionStore().load(None)
-        return ControlApi(sesion).leadership()
+        return ControlApi(sesion_del_cli()).leadership()
     except Exception as exc:  # noqa: BLE001
         demo.aviso(f"no se pudo leer el liderazgo por la API: {exc}")
         return None

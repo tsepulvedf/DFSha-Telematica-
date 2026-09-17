@@ -11,6 +11,53 @@ python scripts/demo/failover_del_lider.py     # relevo de liderazgo con época
 python scripts/demo/permisos_y_token.py       # ACLs y token de bloque
 ```
 
+## Orden recomendado, y qué deja cada uno
+
+**Córrelos en este orden.** Los dos primeros no tocan ningún contenedor, así que si algo
+sale mal en los dos últimos ya tienes grabado lo que no depende de ellos.
+
+| # | Guion | ¿Toca contenedores? | Qué deja detrás |
+|---|---|---|---|
+| 1 | `cifrado_en_reposo` | no | bloques huérfanos (el `rm` es lógico) |
+| 2 | `permisos_y_token` | no | usuarios `*-demo`, el grupo `equipo` y `/proyecto` |
+| 3 | `replicacion_y_caida` | **para y levanta un DataNode** | puede dejar bloques con **4 copias** |
+| 4 | `failover_del_lider` | **para y levanta un ControlNode** | la época sube de forma permanente |
+
+### Entre el 3 y el 4: espera a que el nodo vuelva
+
+`replicacion_y_caida` levanta el DataNode al terminar, pero **volver no es instantáneo**:
+el nodo tiene que registrarse otra vez y mandar un block report completo. Antes de seguir:
+
+```bash
+dfsha cluster       # los cuatro DataNodes tienen que salir ALIVE
+```
+
+Suele tardar menos de diez segundos. Si sigues sin esperar, el guion siguiente puede
+encontrarse un clúster con un nodo DEAD y la lectura sería más confusa de lo necesario.
+
+### Después del 3: cuatro copias en algunos bloques
+
+Si la espera de gracia se cumplió antes de que el nodo volviera, algunos bloques quedan
+con **4 copias y R=3**. Es un estado esperable, está explicado en CLAUDE.md
+(«Sobre-replicación tras una reincorporación») y **no se limpia solo**: el GC recoge
+bloques de archivos borrados, y estos pertenecen a archivos vivos. No estorba para el
+resto de la demostración.
+
+### Después del 4: si el plano interno se comporta raro
+
+nginx resuelve los nombres de sus *upstreams* **al arrancar**. Si al reiniciar el
+ControlNode su IP cambia dentro de la red de compose, el balanceador puede quedarse
+apuntando a la anterior, y el síntoma sería que las subidas empiezan a fallar en el
+`commit` aunque los tres ControlNodes estén vivos. No siempre pasa —Docker suele conservar
+la IP tras un `stop`/`start`— pero si ocurre, la salida es:
+
+```bash
+docker compose restart lb
+```
+
+**Ninguno de los cuatro obliga a `docker compose down -v`.** Si prefieres empezar de cero
+para grabar, eso sí borra el metadato y los bloques.
+
 ## Antes de correrlos
 
 ```bash

@@ -30,20 +30,19 @@ import sys
 
 import httpx
 
-from _comun import TRABAJO, Demo, exigir_docker
+from _comun import CONTROL_URL, TRABAJO, Demo, exigir_docker
 
 from dfsha.client.api import ControlApi
 from dfsha.client.session import Session
 from dfsha.common.blocktoken import BLOCK_TOKEN_HEADER
 
-CONTROL = "http://localhost:8000"
 CLAVE = "contrasena-de-la-demo"
 SECRETO = b"informe confidencial de Ana, no deberia leerlo un tercero\n" * 4
 
 
 def usuario(nombre: str) -> ControlApi:
     """Registra (o reusa) un usuario y devuelve su cliente."""
-    sesion = Session(control_url=CONTROL)
+    sesion = Session(control_url=CONTROL_URL)
     api = ControlApi(sesion)
     try:
         api.register(nombre, CLAVE)

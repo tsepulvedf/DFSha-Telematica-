@@ -20,6 +20,7 @@ lo malo se rechaza no comprueba que lo bueno funciona*.
 
 from __future__ import annotations
 
+import os
 import subprocess
 import sys
 import time
@@ -34,6 +35,23 @@ FIN = "\033[0m"
 
 #: Donde los guiones dejan sus ficheros de trabajo. Esta en .gitignore.
 TRABAJO = Path("tmp")
+
+#: El ControlNode, con la MISMA variable que usa el CLI. Escribirlo a mano en cada guion
+#: significaria que apuntar la demostracion a otro despliegue —AWS, por ejemplo— obliga a
+#: editar cuatro ficheros y acordarse de los cuatro.
+CONTROL_URL = os.environ.get("DFSHA_CONTROL_URL", "http://localhost:8000")
+
+
+def sesion_del_cli():
+    """La sesion que dejo `dfsha login`, para los guiones que necesitan la API directa.
+
+    Se pasa `CONTROL_URL` explicitamente y no `None`: sin fichero de sesion, `load(None)`
+    devolveria una sesion con `control_url=None` y el fallo aparecerian mas adelante como
+    una URL malformada, que no dice nada. Quien llame a esto ya paso por `exigir_sesion`.
+    """
+    from dfsha.client.session import SessionStore
+
+    return SessionStore().load(CONTROL_URL)
 
 
 class Demo:
