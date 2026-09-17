@@ -77,6 +77,7 @@ def _to_user(row: UserRow) -> User:
         id=row.id,
         username=row.username,
         password_hash=row.password_hash,
+        kdf_salt=row.kdf_salt or "",
         created_at=row.created_at,
     )
 
@@ -105,6 +106,8 @@ def _to_file(row: FileRow) -> File:
         committed_at=row.committed_at,
         expires_at=row.expires_at,
         deleted_at=row.deleted_at,
+        wrapped_key=row.wrapped_key or "",
+        key_algo=row.key_algo or "",
     )
 
 
@@ -165,6 +168,7 @@ class SqlUserRepository:
                 id=user.id,
                 username=user.username,
                 password_hash=user.password_hash,
+                kdf_salt=user.kdf_salt,
                 created_at=user.created_at,
             )
         )
@@ -312,6 +316,8 @@ class SqlFileRepository:
                 created_at=file.created_at,
                 committed_at=file.committed_at,
                 expires_at=file.expires_at,
+                wrapped_key=file.wrapped_key,
+                key_algo=file.key_algo,
                 deleted_at=file.deleted_at,
             )
         )
@@ -368,6 +374,14 @@ class SqlFileRepository:
             )
         )
         return int(total or 0)
+
+    def set_wrapped_key(self, file_id: str, wrapped_key: str, key_algo: str) -> None:
+        """Guarda la clave envuelta del archivo. El ControlNode no puede abrirla."""
+        self._session.execute(
+            update(FileRow)
+            .where(FileRow.id == file_id)
+            .values(wrapped_key=wrapped_key, key_algo=key_algo)
+        )
 
     def mark_committed(self, file_id: str, committed_at: datetime) -> None:
         self._session.execute(

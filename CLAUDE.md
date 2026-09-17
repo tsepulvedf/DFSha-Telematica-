@@ -101,6 +101,8 @@ Diseñar contra esta hoja de ruta, no adelantarla.
   **Hecho en la Etapa 3, Bloque B.**
 - Alta disponibilidad del ControlNode, edit log, failover, réplicas de lectura.
 - mTLS, cifrado en reposo, 2FA, ACLs por grupo.
+  **Hecho en la Etapa 3, Bloque C**: mTLS en el plano interno, cifrado extremo a extremo
+  y ACLs con grupos. 2FA no entra: no esta en el enunciado.
 - RF3 (`open`/`read`/`write`/`lock`), leases, lecturas por rango.
 - El GC se sigue corriendo a mano.
 
@@ -613,6 +615,156 @@ rechaza no comprueba que lo bueno funciona**, y en seguridad las dos mitades hac
 De ahi que `test_mtls.py` empiece por el caso bueno con un comentario que lo dice: si ese
 falla, los demas no prueban nada.
 
+### ACLs: cuatro reglas, una funcion, y ningun «denegar»
+
+**No hay reglas de denegacion.** Solo concesiones, y la ausencia de concesion es
+denegacion. Es la decision que mantiene el modelo explicable: en cuanto existe un
+«denegar» hay que definir que gana cuando un ancestro permite y un descendiente niega, y
+en que orden se evaluan los grupos, y ahi es donde estos sistemas dejan de poder contarse
+en un parrafo.
+
+Tres permisos **ordenados**: `READ < WRITE < ADMIN`. Que esten ordenados y no sean un
+conjunto de banderas es lo que permite que la comprobacion sea un `>=` y no una tabla.
+
+Las cuatro reglas viven en **una sola funcion**, `domain/acl.resolve`, pura y probada sin
+base de datos:
+
+1. **La herencia va HACIA ARRIBA.** Se sube por el arbol hasta la primera regla
+   aplicable. No se propagan permisos a los hijos al conceder, porque eso se corrompe en
+   cuanto se mueve un directorio: el hijo llevaria permisos de un padre que ya no es el
+   suyo. Y `mv` es metadato puro (decision 2 de la seccion 1), asi que mover tiene que
+   seguir siendo O(1).
+2. **Gana la regla MAS CERCANA, aunque conceda MENOS.** Es la unica forma que tiene un
+   modelo sin denegaciones de acotar el alcance: si se tomara el maximo de todo el camino,
+   una concesion amplia arriba haria imposible dar menos permiso abajo.
+3. **El MAXIMO entre lo concedido al usuario y a sus grupos**, que es la consecuencia
+   directa de no tener denegaciones: los permisos solo pueden sumar.
+4. **El propietario es ADMIN de su arbol, y NO como un caso especial cosido aparte**:
+   entra por la misma funcion. Eso es lo que hace que todas las pruebas de las Etapas 1 y
+   2 —cada usuario en su propio arbol— sigan describiendo el mismo comportamiento sin
+   tocar ni una.
+
+**El permiso minimo se pasa como argumento, no se comprueba despues.** `directory_for(uow,
+user_id, path, minimum)` resuelve y exige a la vez. Un `resolve()` que devolviera el
+permiso para que el llamante lo comparara seria el mismo patron que `soy_el_lider()`: una
+consulta que alguien acabara olvidandose de mirar. Por eso subir un archivo pide `WRITE`
+sobre el directorio destino, que es lo que separa a quien puede leer un directorio
+compartido de quien puede meter cosas en el.
+
+`/compartido-conmigo` es un directorio **virtual**: no existe en `directories`, se compone
+al vuelo con las concesiones que apuntan a este usuario. No es una fila porque no tiene
+dueno ni padre, y darle uno obligaria a inventar reglas para renombrarlo o borrarlo.
+
+### Cifrado extremo a extremo: tres niveles de clave
+
+El servidor **nunca ve una clave**. Con el metadato entero, la base de datos y todos los
+bloques del disco, no puede descifrar un byte. Eso es lo que distingue cifrar en el
+cliente de cifrar en el servidor, y es la afirmacion que
+`test_con_el_metadato_entero_y_el_disco_no_se_descifra_sin_la_contrasena` comprueba por su
+efecto.
+
+    contrasena del usuario
+        |  PBKDF2-HMAC-SHA256, 600 000 iteraciones, con users.kdf_salt
+        v
+    clave maestra  ------ no sale NUNCA del cliente
+        |  AES-256-GCM, con el file_id como dato autenticado
+        v
+    clave de archivo  --- una por archivo; lo que se guarda es su ENVOLTURA
+        |  AES-256-GCM, nonce = HMAC-SHA256(clave, "file_id:index")[:12]
+        v
+    bloque cifrado en el DataNode
+
+Lo que el servidor guarda son **dos columnas inofensivas por separado**: `users.kdf_salt`,
+que no es secreta —su trabajo es que dos usuarios con la misma contrasena tengan claves
+distintas, por eso puede viajar en el login— y `files.wrapped_key`, que sin la clave
+maestra es ruido.
+
+**Una clave por archivo y no una por usuario**, aunque sea mas trabajo: asi compartir un
+archivo puede llegar a ser entregar su clave, sin dar acceso a todo lo demas.
+
+**El `file_id` entra en la envoltura como dato autenticado.** Sin eso, alguien con acceso
+de escritura al metadato podria intercambiar envolturas y hacer que el cliente descifrara
+el archivo equivocado con una clave que si valida. No rompe la criptografia; rompe la
+integridad de lo que el usuario cree estar leyendo.
+
+**La envoltura viaja en el COMMIT y no en el create**, y no es una preferencia: se envuelve
+con el `file_id`, que en el momento de crear todavia no existe. Ademas es metadato que
+tiene que quedar durable justo cuando el archivo se hace visible, que es la definicion del
+commit.
+
+**`wrapped_key` vacia = archivo SIN cifrar**, y el cliente lo **mira** en vez de suponerlo.
+Es lo que permite que un metadato migrado desde la Etapa 2 siga siendo utilizable.
+
+#### El nonce es DETERMINISTA, y eso es lo contrario de un descuido
+
+`nonce = HMAC-SHA256(clave_archivo, "file_id:index")[:12]`. No se guarda en ninguna parte:
+se vuelve a derivar al descifrar.
+
+Repetir un nonce con la misma clave en GCM no degrada la seguridad, la **elimina**: revela
+el XOR de los dos textos claros y permite falsificar mensajes. Un nonce aleatorio podria
+repetirse **sin que nada lo detecte**. Aqui la unicidad esta garantizada por construccion:
+`(file_id, index)` es unico por el `UNIQUE(file_id, index)` de `blocks`, y los bloques **no
+se reescriben nunca** (WORM, decision 1 de la seccion 1). La propiedad criptografica se
+apoya en una decision de diseno que ya estaba tomada en la Etapa 1.
+
+Pasa por HMAC en vez de concatenar los valores en claro para que quien mire el disco no
+pueda deducir la posicion de un bloque a partir de su nonce.
+
+Efecto util: descifrar el bloque 1 con los bytes del 0 **falla**, en vez de devolver
+basura. Un reordenamiento no pasa desapercibido.
+
+#### El checksum va sobre el texto CIFRADO
+
+El cliente cifra **y luego** calcula el SHA-256. Asi el DataNode verifica integridad sin
+tener la clave, y —lo que importa para el Bloque B— **el pipeline puede seguir comprobando
+antes de reenviar**. Con el checksum del texto claro, el DataNode no podria comprobar nada
+y habria que fiarse del cliente.
+
+Las dos comprobaciones no son redundantes: el SHA-256 lo verifica quien **no** tiene la
+clave y protege contra corrupcion accidental; la etiqueta de GCM solo la puede verificar
+quien **si** la tiene, y protege contra alteracion deliberada.
+
+#### `files.size` es el claro; `blocks.size` es lo ALMACENADO
+
+GCM anade 16 bytes por bloque (`crypto.TAG_BYTES`). Los dos tamanos dejan de coincidir, y
+hay que decidir que guarda cada columna:
+
+| Columna | Significa | Por que |
+|---|---|---|
+| `files.size` | bytes **claros** | Es el tamano del archivo que el usuario subio, y el que `ls` y `stat` tienen que mostrar |
+| `blocks.size` | bytes **en disco** | Es contra lo que el cliente comprueba lo que descarga, y lo que cuentan la colocacion, la cuota y el GC |
+
+Por eso el cliente declara `cipher_overhead` en `/files/create`: el ControlNode planifica
+ahi los bloques y necesita saber cuanto ocupara cada uno **de verdad** antes de elegir
+destinos. Y por eso `download_blocks` recibe `plain_size`: el archivo destino se reserva
+con el tamano claro mientras los offsets se calculan restando el sobrecoste.
+
+Esto costo el ultimo fallo del Bloque C, y es del mismo tipo que los otros dos: no se veia
+leyendo el codigo, porque **cada mitad era coherente consigo misma**. El metadato decia el
+tamano claro, el disco tenia el cifrado, y la comprobacion de tamano del cliente —que
+existe desde la Etapa 1 y era correcta— fallaba en el cruce. El sintoma tampoco apuntaba
+ahi: el relevo de replicas del Bloque B capturaba el `StorageError`, agotaba las replicas y
+reportaba «ninguna de las 1 replicas pudo servir el bloque», que parece un problema de
+disponibilidad. **Nadie escribe un 16 a mano**: sale de `crypto.TAG_BYTES`.
+
+#### El limite reconocido, enunciado con precision
+
+El modelo es **«el servidor nunca ve la clave»**, no «la clave nunca toca el disco». La
+clave maestra se deriva en el login y se guarda en `~/.dfsha/session.json` para que `put` y
+`get` no pidan la contrasena en cada invocacion —cada `dfsha` es un proceso nuevo, en
+memoria no serviria—. Quien no quiera eso tiene `dfsha login --ask-password`, que no la
+guarda y la pide en cada operacion.
+
+El otro limite, ya escrito en la seccion 4: **Argon2id seria preferible** a PBKDF2 por su
+resistencia a GPU y ASIC. Se eligio PBKDF2 por estar en la biblioteca estandar. Cambiarlo
+es cambiar `derive_master_key` y nada mas.
+
+Y uno que conviene decir en voz alta: **cambiar la contrasena no re-cifra nada**. La clave
+maestra cambiaria y las envolturas existentes dejarian de abrirse. Re-envolverlas exige
+tener la contrasena vieja y la nueva a la vez, es decir, hacerlo **durante** el cambio y
+desde el cliente. No esta implementado, y el CLI lo dice al fallar en vez de dejar un
+archivo ilegible sin explicacion.
+
 ### Enrutado CQRS: que consulta va a donde
 
 La separacion `commands/` / `queries/` existe desde la Etapa 1. Aqui se cobra.
@@ -666,7 +818,9 @@ OpenTelemetry ni exportadores de métricas. Logs JSON y nada más.
 ## 5. Modelo de metadatos
 
 ```
-users(id, username UNIQUE, password_hash, created_at)
+users(id, username UNIQUE, password_hash, kdf_salt, created_at)
+    kdf_salt: sal del KDF del CLIENTE. NO es secreta y viaja en el login; su
+    trabajo es que dos usuarios con la misma contrasena tengan claves distintas
 
 directories(id, parent_id NULL, name, owner_id, created_at, deleted_at NULL)
     UNIQUE(parent_id, name) solo sobre filas con deleted_at NULL
@@ -674,13 +828,22 @@ directories(id, parent_id NULL, name, owner_id, created_at, deleted_at NULL)
     el root de cada usuario es una fila con parent_id NULL
 
 files(id, directory_id, name, owner_id, size, block_size,
-      state, created_at, committed_at, expires_at NULL, deleted_at NULL)
+      state, created_at, committed_at, expires_at NULL, deleted_at NULL,
+      wrapped_key, key_algo)
     state in {WRITING, COMMITTED, DELETED}
     UNIQUE(directory_id, name) solo sobre filas COMMITTED
     expires_at se fija al crear (estado WRITING) y se pone a NULL al hacer commit
+    size son bytes CLAROS: el tamano del archivo tal y como el usuario lo subio
+    wrapped_key: clave del archivo envuelta con la maestra del usuario. Se fija
+    en el COMMIT, porque se envuelve con el file_id. Vacia = SIN CIFRAR, que es
+    como se reconocen los archivos de las Etapas 1 y 2
 
 blocks(block_id UUID PK, file_id, index, size, checksum_sha256)
-    UNIQUE(file_id, index)
+    UNIQUE(file_id, index) -- ademas de un invariante, es lo que garantiza que
+    el nonce derivado de (file_id, index) no se repita nunca
+    size son los bytes ALMACENADOS: con cifrado, los claros mas los 16 de la
+    etiqueta de GCM. NO coincide con files.size; ver "Cifrado extremo a extremo"
+    checksum_sha256 es el del texto CIFRADO, que es lo unico que el DataNode ve
 
 block_replicas(block_id, data_node_id, state, created_at)
     state in {PENDING, STORED, MISSING}
@@ -700,6 +863,20 @@ rereplication_tasks(id, block_id, kind, state, source_node_id, target_node_id,
     UNIQUE(block_id) solo sobre filas PENDING o IN_FLIGHT: una tarea viva por
     bloque, que es lo que impide programar la misma copia dos veces cuando dos
     lideres se solapan durante un relevo
+
+groups(id, name, owner_id, created_at)
+    UNIQUE(owner_id, name): el nombre es unico POR DUENO, no globalmente
+
+group_members(group_id, user_id, added_at)
+    PK(group_id, user_id). Grupos PLANOS: un grupo no contiene a otro
+
+acl_entries(id, directory_id, principal_type, principal_id, permission,
+            granted_by, granted_at)
+    principal_type in {1=USER, 2=GROUP}
+    permission   in {1=READ, 2=WRITE, 3=ADMIN}, guardado como entero para que
+                 el orden de potencia sea el del propio dato
+    SOLO concesiones: no hay denegaciones. Se cuelgan de un DIRECTORIO, nunca de
+    un archivo; ver "ACLs: cuatro reglas"
 
 data_nodes(id, advertise_url, peer_url, capacity_bytes, used_bytes, state,
            registered_at, fault_domain, boot_id, stat_*)
@@ -771,12 +948,16 @@ Transferencia (RF2). Escritura en tres fases para respetar WORM: reservar el pla
 directo a los DataNodes, y recién entonces commit.
 
 ```
-POST /files/create   {path, size, block_size?}
+POST /files/create   {path, size, block_size?, cipher_overhead?}
      -> 201 {file_id, block_size, expires_at,
              blocks:[{block_id, index, size,
-                      replicas:[{data_node_id, base_url}]}]}
+                      replicas:[{data_node_id, base_url}],
+                      pipeline:[peer_url, ...]}]}
+     size son bytes CLAROS; cipher_overhead lo que el cifrado del cliente anade
+     a cada bloque. El `size` de cada bloque del plan ya los lleva sumados: es
+     lo que ocupara en disco
 
-POST /files/{file_id}/commit
+POST /files/{file_id}/commit  {wrapped_key?, key_algo?}
      -> 200 {path, size, block_count}
      409 si algún bloque no está en estado STORED
      410 si la reserva venció (expires_at en el pasado)
@@ -784,9 +965,11 @@ POST /files/{file_id}/commit
 POST /files/{file_id}/abort   -> 204
 
 GET  /files/open?path=/a/b/c
-     -> {file_id, size, block_size,
+     -> {file_id, size, block_size, wrapped_key, key_algo,
          blocks:[{block_id, index, size, checksum_sha256,
                   replicas:[{data_node_id, base_url}]}]}
+     wrapped_key vacia = archivo sin cifrar, y el cliente lo MIRA en vez de
+     suponerlo: es lo que mantiene legibles los archivos de la Etapa 2
 ```
 
 ### Alcance de gRPC (Etapa 2) — material del informe
@@ -996,6 +1179,13 @@ Etapa 3 (Bloque B):
 Comandos: `login`, `register`, `ls`, `cd`, `pwd`, `mkdir`, `rmdir`, `rm`, `mv`, `stat`,
 `put <local> <remoto>`, `get <remoto> <local>`, `cluster`.
 
+Etapa 3: `share`, `unshare`, `shared` y los de grupos, y `login --ask-password`, que no
+guarda la clave maestra en disco y la pide en cada `put` y `get`.
+
+`login` **deriva la clave maestra en el cliente** y no la envia a ninguna parte. `put`
+genera una clave por archivo, la envuelve y cifra los bloques antes de subirlos; `get`
+abre la envoltura y descifra. Ver "Cifrado extremo a extremo".
+
 - `cd` y `pwd` operan sobre un cwd **del lado del cliente**, persistido junto al token en
   `~/.dfsha/session.json`. El ControlNode no guarda sesión: es stateless.
 - Las rutas relativas se resuelven contra el cwd antes de enviarse.
@@ -1053,14 +1243,16 @@ El repositorio es **público**. No negociable:
 ```
 src/dfsha/
 ├── common/          # DTOs compartidos, checksum, errores, logging
+│   ├── crypto.py        # las tres capas de clave (Bloque C)
+│   └── tls.py           # UNICO sitio donde se construye un contexto TLS de cliente
 ├── control_node/
 │   ├── main.py, config.py
 │   ├── api/         # routers FastAPI, solo traducción HTTP <-> casos de uso
 │   ├── commands/    # lado escritura CQRS
 │   ├── queries/     # lado lectura CQRS
-│   ├── domain/      # entidades y reglas: Path, File, Block, User, Lease
+│   ├── domain/      # entidades y reglas: Path, File, Block, User, Lease, acl
 │   ├── repositories/
-│   └── services/    # auth, placement, leadership, read_routing
+│   └── services/    # auth, placement, leadership, read_routing, access, shared
 ├── data_node/
 │   ├── main.py, config.py, api/, storage.py
 │   ├── heartbeat.py     # cliente gRPC del plano de control
@@ -1069,7 +1261,7 @@ src/dfsha/
     ├── cli.py, session.py, chunker.py, transfer.py
 alembic/{env.py,versions/}      # migraciones del metadato (Etapa 3)
 tests/{unit,integration}/
-scripts/{gen_testfile.py,gc.py}
+scripts/{gen_testfile.py,gc.py,gen_certs.py}
 docker/{control_node,data_node,client}.Dockerfile
 docker/{nginx/dfsha.conf,postgres/*.sh}
 deploy/RUNBOOK-postgres.md      # promocion manual de la replica

@@ -79,6 +79,7 @@ def create_file(
     write_ttl_seconds: int,
     block_size: int | None = None,
     replication_factor: int = 1,
+    cipher_overhead: int = 0,
 ) -> CreatedFile:
     path = Path.parse(raw_path)
     if path.is_root:
@@ -112,6 +113,9 @@ def create_file(
             block_size=efectivo,
             state=FileState.WRITING,
             created_at=ahora,
+            # `size` son bytes CLAROS: es el tamano del archivo tal y como el usuario
+            # lo ve. La clave envuelta no se fija aqui sino en el commit, porque se
+            # envuelve con el `file_id`, que en este punto todavia no existe.
             expires_at=ahora + timedelta(seconds=write_ttl_seconds),
         )
         uow.files.add(archivo)
@@ -122,10 +126,19 @@ def create_file(
 
         for spec in plan_blocks(size, efectivo):
             block_id = new_id()
+            # `blocks.size` es lo que habra EN DISCO. Con cifrado son los bytes claros
+            # mas la etiqueta de GCM. `files.size` (arriba) sigue siendo el tamano claro:
+            # uno es lo que ocupa y el otro lo que el usuario ve.
+            tamano_almacenado = spec.size + cipher_overhead
             # La colocacion se decide aqui y se registra: no se recalcula nunca por hash.
-            destinos = placement.select(spec.size, replication_factor)
+            destinos = placement.select(tamano_almacenado, replication_factor)
             bloques.append(
-                Block(block_id=block_id, file_id=archivo.id, index=spec.index, size=spec.size)
+                Block(
+                    block_id=block_id,
+                    file_id=archivo.id,
+                    index=spec.index,
+                    size=tamano_almacenado,
+                )
             )
             replicas.extend(
                 BlockReplica(
@@ -140,7 +153,7 @@ def create_file(
                 PlannedBlock(
                     block_id=block_id,
                     index=spec.index,
-                    size=spec.size,
+                    size=tamano_almacenado,
                     # Al cliente, las direcciones que el puede alcanzar...
                     replicas=[(nodo.id, nodo.advertise_url) for nodo in destinos],
                     # ...y para la cadena, las que se alcanzan entre nodos. Las dos son
@@ -168,6 +181,8 @@ def commit_file(
     file_id: str,
     write_quorum: int = 1,
     replication_factor: int = 1,
+    wrapped_key: str = "",
+    key_algo: str = "",
 ) -> CommittedFile:
     """Confirma la reserva y, si habia un archivo en esa ruta, lo retira.
 
@@ -214,6 +229,13 @@ def commit_file(
                 # Copy-on-write: la version anterior sale de escena y sus bloques pasan a
                 # ser huerfanos para el GC. Los bytes nuevos ya estan en disco.
                 uow.files.mark_deleted(anterior.id, ahora)
+
+        if wrapped_key:
+            # La envoltura de la clave llega ahora y se guarda en la MISMA transaccion
+            # que el commit. Si se guardara antes y el commit fallara, quedaria una clave
+            # apuntando a un archivo que nunca existio; si se guardara despues, un fallo
+            # entre medias dejaria un archivo visible que nadie puede descifrar.
+            uow.files.set_wrapped_key(file_id, wrapped_key, key_algo)
 
         uow.files.mark_committed(file_id, ahora)
         uow.commit()

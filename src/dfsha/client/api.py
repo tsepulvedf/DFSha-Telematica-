@@ -193,18 +193,36 @@ class ControlApi:
     # --- Transferencia -----------------------------------------------------
 
     def create_file(
-        self, path: str, size: int, block_size: int | None = None
+        self,
+        path: str,
+        size: int,
+        block_size: int | None = None,
+        cipher_overhead: int = 0,
     ) -> CreateFileResponse:
+        """Reserva el plan de escritura.
+
+        `size` son bytes CLAROS y `cipher_overhead` lo que el cifrado del cliente anade a
+        cada bloque. El ControlNode los necesita separados: uno es lo que el usuario ve y
+        el otro lo que hay que reservar en disco.
+        """
         cuerpo: dict = {"path": path, "size": size}
         if block_size:
             cuerpo["block_size"] = block_size
+        if cipher_overhead:
+            cuerpo["cipher_overhead"] = cipher_overhead
         return CreateFileResponse.model_validate(
             self._request("POST", f"{API}/files/create", json=cuerpo).json()
         )
 
-    def commit_file(self, file_id: str) -> CommitResponse:
+    def commit_file(
+        self, file_id: str, wrapped_key: str = "", key_algo: str = ""
+    ) -> CommitResponse:
         return CommitResponse.model_validate(
-            self._request("POST", f"{API}/files/{file_id}/commit").json()
+            self._request(
+                "POST",
+                f"{API}/files/{file_id}/commit",
+                json={"wrapped_key": wrapped_key, "key_algo": key_algo},
+            ).json()
         )
 
     def abort_file(self, file_id: str) -> None:

@@ -34,6 +34,16 @@ from dfsha.common.logging import configure_logging, get_logger, timed
 from .api import ControlApi, resolve_path
 from .chunker import file_size
 from .session import Session, SessionStore
+from dfsha.common.crypto import (
+    TAG_BYTES,
+    DecryptionError,
+    FileCrypto,
+    derive_master_key,
+    new_file_key,
+    unwrap_file_key,
+    wrap_file_key,
+)
+
 from .transfer import download_blocks, upload_blocks
 
 __all__ = ["app", "main"]
@@ -62,6 +72,22 @@ def _api() -> tuple[ControlApi, Session]:
     # El almacen viaja con la API para que el LSN de la ultima escritura se persista en
     # cuanto llega: cada invocacion de `dfsha` es un proceso nuevo.
     return ControlApi(sesion, store=almacen), sesion
+
+
+def _clave_maestra(sesion: Session) -> bytes | None:
+    """La clave con la que cifrar o descifrar. `None` si la sesion no tiene cifrado.
+
+    Si se inicio sesion con `--ask-password`, se pide la contrasena ahora y se deriva sin
+    guardarla. La sal viene de la sesion: es la misma con la que se derivo la primera vez,
+    y sin ella la clave saldria distinta y no abriria nada.
+    """
+    if sesion.master_key:
+        return bytes.fromhex(sesion.master_key)
+    if not sesion.kdf_salt:
+        return None  # sesion de una etapa anterior: sin cifrado
+
+    contrasena = typer.prompt("contrasena", hide_input=True)
+    return derive_master_key(contrasena, bytes.fromhex(sesion.kdf_salt))
 
 
 def _fallar(error: DFShaError) -> None:
@@ -104,8 +130,26 @@ def register(
 def login(
     username: str = typer.Argument(..., help="Nombre de usuario."),
     password: str = typer.Option(..., prompt=True, hide_input=True),
+    ask_password: bool = typer.Option(
+        False,
+        "--ask-password",
+        help=(
+            "No guarda la clave de cifrado en disco; la pide en cada put y get. "
+            "Mas seguro y menos comodo."
+        ),
+    ),
 ) -> None:
-    """Inicia sesion y guarda el token en ~/.dfsha/session.json."""
+    """Inicia sesion y guarda el token en ~/.dfsha/session.json.
+
+    Tambien deriva la **clave maestra** con la que se cifran tus archivos, a partir de tu
+    contrasena y de la sal que devuelve el servidor. Esa clave **no se envia a ninguna
+    parte**: el ControlNode y los DataNodes nunca la ven.
+
+    Por defecto se guarda junto al token para que `put` y `get` no tengan que pedir la
+    contrasena cada vez. El limite de eso, dicho con precision: el modelo es «el servidor
+    nunca ve la clave», no «la clave nunca toca el disco». Con `--ask-password` no se
+    guarda y se pide en cada operacion.
+    """
     store = _store()
     sesion = store.load(os.environ.get("DFSHA_CONTROL_URL", DEFAULT_CONTROL_URL))
     try:
@@ -116,6 +160,12 @@ def login(
     sesion.token = token.access_token
     sesion.username = username
     sesion.cwd = "/"
+    sesion.kdf_salt = token.kdf_salt
+    sesion.master_key = (
+        None
+        if ask_password or not token.kdf_salt
+        else derive_master_key(password, bytes.fromhex(token.kdf_salt)).hex()
+    )
     try:
         store.save(sesion)
     except DFShaError as error:
@@ -125,6 +175,16 @@ def login(
     # esta linea es la mitad del diagnostico. Pasa dentro de contenedores, cuando el
     # directorio no es el que persiste.
     console.print(f"[dim]sesion guardada en {store.path}[/dim]")
+    if sesion.master_key:
+        console.print(
+            "[dim]tus archivos se cifran en este equipo antes de subirse; la clave no "
+            "sale de aqui[/dim]"
+        )
+    elif token.kdf_salt:
+        console.print(
+            "[dim]la clave no se guardo: se pedira la contrasena en cada put y get"
+            "[/dim]"
+        )
 
 
 @app.command()
@@ -605,10 +665,34 @@ def put(
     tamano = file_size(local)
     log = get_logger("client")
 
+    # La clave del archivo se genera AQUI, se envuelve con la maestra, y lo que viaja al
+    # servidor es la envoltura. Una clave por archivo y no una por usuario: compartir un
+    # archivo puede llegar a ser entregar su clave sin dar acceso a todo lo demas.
+    maestra = _clave_maestra(sesion)
+    clave_archivo = new_file_key() if maestra else None
+
     try:
-        plan = api.create_file(destino, tamano, block_size)
+        # El sobrecoste del cifrado viaja en la creacion, no en el commit: el ControlNode
+        # planifica AHI los bloques y necesita saber cuanto ocupara cada uno de verdad.
+        plan = api.create_file(
+            destino,
+            tamano,
+            block_size,
+            cipher_overhead=TAG_BYTES if clave_archivo is not None else 0,
+        )
     except DFShaError as error:
         _fallar(error)
+
+    # La envoltura se calcula DESPUES de crear, porque el `file_id` entra en ella como
+    # dato autenticado y ata la clave a SU archivo. Y viaja en el COMMIT, no en un
+    # endpoint aparte: es metadato que tiene que quedar durable justo cuando el archivo
+    # se hace visible, que es la definicion del commit. Un viaje menos y un endpoint
+    # menos que proteger.
+    cripto = None
+    envoltura = ""
+    if clave_archivo is not None:
+        envoltura = wrap_file_key(clave_archivo, maestra, plan.file_id).hex()
+        cripto = FileCrypto(file_id=plan.file_id, file_key=clave_archivo)
 
     confirmado = False
     try:
@@ -627,11 +711,12 @@ def put(
                     plan.blocks,
                     parallel=parallel,
                     on_block=lambda n: progreso.advance(tarea, n),
+                    crypto=cripto,
                 )
             if not plan.blocks:
                 progreso.advance(tarea, 1)  # archivo vacio: la barra igual se completa
 
-        resultado = api.commit_file(plan.file_id)
+        resultado = api.commit_file(plan.file_id, wrapped_key=envoltura)
         confirmado = True
     except DFShaError as error:
         _fallar(error)
@@ -669,6 +754,29 @@ def get(
     except DFShaError as error:
         _fallar(error)
 
+    # `wrapped_key` vacia = archivo SIN cifrar. Se mira el campo en vez de suponerlo, que
+    # es lo que permite que los archivos de las Etapas 1 y 2 se sigan pudiendo bajar.
+    cripto = None
+    if plan.wrapped_key:
+        maestra = _clave_maestra(sesion)
+        if maestra is None:
+            console.print(
+                "[red]error[/red] este archivo esta cifrado y esta sesion no tiene "
+                "clave; vuelve a iniciar sesion"
+            )
+            raise typer.Exit(code=1)
+        try:
+            clave = unwrap_file_key(
+                bytes.fromhex(plan.wrapped_key), maestra, plan.file_id
+            )
+        except DecryptionError:
+            console.print(
+                "[red]error[/red] no se pudo abrir la clave del archivo. Si cambiaste "
+                "de contrasena, los archivos cifrados con la anterior no se recuperan."
+            )
+            raise typer.Exit(code=1)
+        cripto = FileCrypto(file_id=plan.file_id, file_key=clave)
+
     try:
         with _barra("descargando") as (progreso, tarea):
             progreso.update(tarea, total=max(plan.size, 1))
@@ -685,6 +793,8 @@ def get(
                     plan.blocks,
                     parallel=parallel,
                     on_block=lambda n: progreso.advance(tarea, n),
+                    crypto=cripto,
+                    plain_size=plan.size,
                 )
             if not plan.blocks:
                 progreso.advance(tarea, 1)

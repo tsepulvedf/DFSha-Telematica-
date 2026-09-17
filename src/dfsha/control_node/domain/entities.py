@@ -63,6 +63,8 @@ class User:
     username: str
     password_hash: str
     created_at: datetime
+    #: Sal del KDF del CLIENTE. No es secreta; ver models.UserRow.
+    kdf_salt: str = ""
 
 
 @dataclass(frozen=True, slots=True)
@@ -100,6 +102,14 @@ class File:
     committed_at: datetime | None = None
     expires_at: datetime | None = None
     deleted_at: datetime | None = None
+    #: Clave del archivo envuelta con la maestra del usuario. Vacia = SIN CIFRAR, que es
+    #: como se reconocen los archivos de las Etapas 1 y 2.
+    wrapped_key: str = ""
+    key_algo: str = ""
+
+    @property
+    def is_encrypted(self) -> bool:
+        return bool(self.wrapped_key)
 
     def is_expired(self, now: datetime | None = None) -> bool:
         """Solo un archivo en WRITING puede vencer: al hacer commit, `expires_at` se

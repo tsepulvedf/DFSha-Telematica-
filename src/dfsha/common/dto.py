@@ -30,6 +30,7 @@ __all__ = [
     "MvRequest",
     "CreateFileRequest",
     "CreateFileResponse",
+    "CommitRequest",
     "CommitResponse",
     "OpenFileResponse",
     "DataNodeRegisterRequest",
@@ -126,6 +127,11 @@ class TokenResponse(_Dto):
     access_token: str
     expires_in: int
     token_type: str = "bearer"
+    #: Sal del KDF con la que el CLIENTE deriva su clave maestra. No es un secreto: su
+    #: trabajo es que dos usuarios con la misma contrasena no compartan clave. Sin la
+    #: contrasena no sirve de nada, y el cliente la necesita para poder reconstruir su
+    #: clave en una sesion nueva.
+    kdf_salt: str = ""
 
 
 # --- Namespace (RF1) -------------------------------------------------------
@@ -176,6 +182,15 @@ class CreateFileRequest(_Dto):
     path: str
     size: int = Field(ge=0)
     block_size: int | None = Field(default=None, gt=0)
+    #: Bytes que el cifrado anade a CADA bloque (16 con AES-GCM: su etiqueta de
+    #: autenticacion). Lo declara el cliente porque es el quien cifra.
+    #:
+    #: Hace falta porque `blocks.size` es el tamano ALMACENADO, no el claro: es lo que el
+    #: DataNode tiene en disco y lo que cuentan la cuota, el GC y la re-replicacion.
+    #: `files.size` sigue siendo el tamano claro, que es el que el usuario ve. Sin esta
+    #: distincion, el cliente descargaba 16 bytes mas de los que el metadato decia y la
+    #: comprobacion de tamano fallaba.
+    cipher_overhead: int = Field(default=0, ge=0)
 
 
 class CreateFileResponse(_Dto):
@@ -183,6 +198,18 @@ class CreateFileResponse(_Dto):
     block_size: int
     expires_at: datetime
     blocks: list[BlockWritePlan]
+
+
+class CommitRequest(_Dto):
+    """Lo que acompana al commit. Hoy solo la clave envuelta.
+
+    Viaja aqui y no en un endpoint propio porque es metadato que tiene que quedar durable
+    justo cuando el archivo se hace visible, que es la definicion del commit. Y no puede
+    ir en `create` porque se envuelve con el `file_id`, que ahi todavia no existe.
+    """
+
+    wrapped_key: str = ""
+    key_algo: str = ""
 
 
 class CommitResponse(_Dto):
@@ -196,6 +223,11 @@ class OpenFileResponse(_Dto):
     size: int
     block_size: int
     blocks: list[BlockReadPlan]
+    #: La misma envoltura que se guardo al crear. El cliente la abre con su clave
+    #: maestra; el servidor se limita a devolverla. Vacia = archivo sin cifrar, que es
+    #: como se reconocen los de las Etapas 1 y 2.
+    wrapped_key: str = ""
+    key_algo: str = ""
 
 
 # --- Interno: DataNode y GC ------------------------------------------------

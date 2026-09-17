@@ -15,6 +15,7 @@ from dfsha.common.dto import (
     DataNodeStatus,
     BlockStoredRequest,
     BlockWritePlan,
+    CommitRequest,
     CommitResponse,
     CreateFileRequest,
     CreateFileResponse,
@@ -97,10 +98,10 @@ def register(body: RegisterRequest, uow: Uow) -> dict[str, str]:
 
 @auth_router.post("/login")
 def login(body: LoginRequest, uow: Uow, settings: Settings) -> TokenResponse:
-    token, expires_in = auth_commands.login(
+    token, expires_in, kdf_salt = auth_commands.login(
         uow, body.username, body.password, settings.jwt_secret, settings.jwt_ttl_seconds
     )
-    return TokenResponse(access_token=token, expires_in=expires_in)
+    return TokenResponse(access_token=token, expires_in=expires_in, kdf_salt=kdf_salt)
 
 
 # --- Cluster ---------------------------------------------------------------
@@ -342,6 +343,7 @@ def create_file(
         write_ttl_seconds=settings.write_ttl_seconds,
         block_size=body.block_size,
         replication_factor=settings.replication_factor,
+        cipher_overhead=body.cipher_overhead,
     )
     return CreateFileResponse(
         file_id=creado.file_id,
@@ -362,7 +364,11 @@ def create_file(
 
 @files_router.post("/{file_id}/commit")
 def commit_file(
-    file_id: str, uow: Uow, user: CurrentUser, settings: Settings
+    file_id: str,
+    uow: Uow,
+    user: CurrentUser,
+    settings: Settings,
+    body: CommitRequest | None = None,
 ) -> CommitResponse:
     confirmado = file_commands.commit_file(
         uow,
@@ -370,6 +376,8 @@ def commit_file(
         file_id,
         write_quorum=settings.write_quorum,
         replication_factor=settings.replication_factor,
+        wrapped_key=body.wrapped_key if body else "",
+        key_algo=body.key_algo if body else "",
     )
     return CommitResponse(
         path=confirmado.path, size=confirmado.size, block_count=confirmado.block_count
@@ -389,6 +397,8 @@ def open_file(path: str, uow: QueryUow, user: CurrentUser) -> OpenFileResponse:
         file_id=plan.file_id,
         size=plan.size,
         block_size=plan.block_size,
+        wrapped_key=plan.wrapped_key,
+        key_algo=plan.key_algo,
         blocks=[
             BlockReadPlan(
                 block_id=b.block_id,

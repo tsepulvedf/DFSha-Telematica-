@@ -15,7 +15,10 @@ from typing import Callable, Iterable, Sequence
 
 import httpx
 
+import hashlib
+
 from dfsha.common.checksum import CHUNK_SIZE, Sha256Accumulator, checksum_matches
+from dfsha.common.crypto import FileCrypto
 from dfsha.common.dto import BlockReadPlan, BlockWritePlan
 from dfsha.common.errors import ChecksumMismatchError, DFShaError, StorageError
 from dfsha.common.logging import get_logger, timed
@@ -59,7 +62,14 @@ class _Slot:
     pipeline: tuple[str, ...] = ()
 
 
-def _slots_de_escritura(blocks: Sequence[BlockWritePlan]) -> list[_Slot]:
+def _slots_de_escritura(blocks: Sequence[BlockWritePlan], overhead: int = 0) -> list[_Slot]:
+    """Traduce el plan del ControlNode a posiciones en el archivo LOCAL.
+
+    `bloque.size` del plan es el tamano que el bloque ocupara EN DISCO; el archivo local
+    esta en claro. Con cifrado los dos no coinciden, asi que aqui se resta el sobrecoste
+    una vez y `_Slot.size` significa siempre bytes claros: los que hay que leer, los que
+    avanzan el offset y los que cuentan para la barra de progreso.
+    """
     slots: list[_Slot] = []
     offset = 0
     for bloque in sorted(blocks, key=lambda b: b.index):
@@ -77,18 +87,19 @@ def _slots_de_escritura(blocks: Sequence[BlockWritePlan]) -> list[_Slot]:
         # por el CLIENTE, que en contenedores son `localhost:800N` y desde dentro de un
         # DataNode resuelven al propio nodo. Ver "Dos direcciones por nodo" en CLAUDE.md.
         replica = bloque.replicas[0]
+        claro = bloque.size - overhead
         slots.append(
             _Slot(
                 block_id=bloque.block_id,
                 index=bloque.index,
-                size=bloque.size,
+                size=claro,
                 offset=offset,
                 base_url=replica.base_url,
                 data_node_id=replica.data_node_id,
                 pipeline=tuple(getattr(bloque, "pipeline", ()) or ()),
             )
         )
-        offset += bloque.size
+        offset += claro
     return slots
 
 
@@ -98,6 +109,7 @@ def upload_blocks(
     parallel: int = 4,
     timeout: float = 300.0,
     on_block: Callable[[int], None] | None = None,
+    crypto: "FileCrypto | None" = None,
 ) -> int:
     """Sube todos los bloques y devuelve los bytes enviados.
 
@@ -110,7 +122,7 @@ def upload_blocks(
     resto. Subir R veces desde aqui multiplicaria por R el tiempo de un `put` y el ancho
     de banda de subida, que es el recurso mas escaso del lado del cliente.
     """
-    slots = _slots_de_escritura(blocks)
+    slots = _slots_de_escritura(blocks, overhead=crypto.overhead if crypto else 0)
     if not slots:
         return 0
 
@@ -118,11 +130,25 @@ def upload_blocks(
     enviados = 0
 
     def subir(slot: _Slot) -> int:
-        checksum = checksum_block(local_path, slot.offset, slot.size)
+        # Con cifrado, el bloque se cifra ANTES de calcular el checksum: lo que el
+        # DataNode verifica es el texto cifrado, que es lo unico que el ve. Asi puede
+        # comprobar integridad —y el pipeline puede comprobar antes de reenviar— sin
+        # tener la clave.
+        if crypto is not None:
+            cuerpo = crypto.encrypt(
+                b"".join(read_block(local_path, slot.offset, slot.size)), slot.index
+            )
+            checksum = hashlib.sha256(cuerpo).hexdigest()
+            longitud = len(cuerpo)
+        else:
+            cuerpo = None
+            checksum = checksum_block(local_path, slot.offset, slot.size)
+            longitud = slot.size
+
         cabeceras = {
             CHECKSUM_HEADER: checksum,
             "Content-Type": "application/octet-stream",
-            "Content-Length": str(slot.size),
+            "Content-Length": str(longitud),
         }
         if slot.pipeline:
             cabeceras[PIPELINE_HEADER] = ",".join(slot.pipeline)
@@ -137,7 +163,11 @@ def upload_blocks(
         ) as t:
             respuesta = httpx.put(
                 f"{slot.base_url.rstrip('/')}/api/v1/blocks/{slot.block_id}",
-                content=read_block(local_path, slot.offset, slot.size),
+                content=(
+                    cuerpo
+                    if cuerpo is not None
+                    else read_block(local_path, slot.offset, slot.size)
+                ),
                 headers=cabeceras,
                 timeout=timeout,
             )
@@ -202,6 +232,8 @@ def download_blocks(
     timeout: float = 300.0,
     on_block: Callable[[int], None] | None = None,
     chunk_size: int = CHUNK_SIZE,
+    crypto: "FileCrypto | None" = None,
+    plain_size: int | None = None,
 ) -> int:
     """Descarga los bloques y reconstruye el archivo.
 
@@ -214,7 +246,11 @@ def download_blocks(
     destino = Path(destination)
     destino.parent.mkdir(parents=True, exist_ok=True)
 
-    total = sum(b.size for b in ordenados)
+    # `b.size` es el tamano ALMACENADO. Con cifrado incluye la etiqueta de GCM, asi que
+    # el archivo destino se reserva con el tamano claro, que es el que el metadato guarda
+    # en `files.size` y llega aqui como `plain_size`.
+    sobrecoste = crypto.overhead if crypto is not None else 0
+    total = plain_size if plain_size is not None else sum(b.size for b in ordenados)
     # Se reserva el archivo completo por adelantado para poder escribir cada bloque en su
     # sitio desde varios hilos.
     with open(destino, "wb") as fh:
@@ -228,7 +264,9 @@ def download_blocks(
     acumulado = 0
     for bloque in ordenados:
         offsets[bloque.block_id] = acumulado
-        acumulado += bloque.size
+        # El desplazamiento en el archivo destino va en bytes CLAROS: de un bloque
+        # cifrado salen `sobrecoste` bytes menos al descifrarlo.
+        acumulado += bloque.size - sobrecoste
 
     def bajar(bloque: BlockReadPlan) -> int:
         """Descarga un bloque probando sus replicas por orden hasta que una responde.
@@ -253,7 +291,7 @@ def download_blocks(
         for intento, replica in enumerate(bloque.replicas, start=1):
             try:
                 return _bajar_de(
-                    bloque, replica, offset, destino, timeout, chunk_size, log
+                    bloque, replica, offset, destino, timeout, chunk_size, log, crypto
                 )
             except (TransferError, ChecksumMismatchError, StorageError, httpx.HTTPError) as exc:
                 motivo = getattr(exc, "message", str(exc))
@@ -284,7 +322,7 @@ def download_blocks(
         for futuro in as_completed(futuros):
             recibidos += futuro.result()
             if on_block:
-                on_block(futuros[futuro].size)
+                on_block(futuros[futuro].size - sobrecoste)
 
     return recibidos
 
@@ -297,6 +335,7 @@ def _bajar_de(
     timeout: float,
     chunk_size: int,
     log,
+    crypto: "FileCrypto | None" = None,
 ) -> int:
     """Un intento contra UNA replica. Lanza si no sirve; el que reintenta es `bajar`."""
     acumulador = Sha256Accumulator()
@@ -320,11 +359,23 @@ def _bajar_de(
                     block_id=bloque.block_id,
                     status=respuesta.status_code,
                 )
-            with open(destino, "r+b") as fh:
-                fh.seek(offset)
+            if crypto is None:
+                with open(destino, "r+b") as fh:
+                    fh.seek(offset)
+                    for trozo in respuesta.iter_bytes(chunk_size):
+                        acumulador.update(trozo)
+                        fh.write(trozo)
+            else:
+                # El checksum se acumula sobre el texto CIFRADO —que es lo que el
+                # metadato guarda— y lo que se escribe en disco es el claro.
+                cifrado = bytearray()
                 for trozo in respuesta.iter_bytes(chunk_size):
                     acumulador.update(trozo)
-                    fh.write(trozo)
+                    cifrado.extend(trozo)
+                claro = crypto.decrypt(bytes(cifrado), bloque.index)
+                with open(destino, "r+b") as fh:
+                    fh.seek(offset)
+                    fh.write(claro)
 
     if not checksum_matches(bloque.checksum_sha256, acumulador.hexdigest):
         raise ChecksumMismatchError(
@@ -340,7 +391,9 @@ def _bajar_de(
             expected=bloque.size,
             actual=acumulador.size,
         )
-    return acumulador.size
+    # Lo comprobado arriba es el texto CIFRADO, que es lo que el metadato describe. Lo
+    # que se devuelve son los bytes CLAROS: es lo que el usuario ve crecer en su disco.
+    return acumulador.size - (crypto.overhead if crypto is not None else 0)
 
 
 def iter_sizes(blocks: Iterable) -> int:

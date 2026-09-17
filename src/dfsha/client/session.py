@@ -35,6 +35,22 @@ class Session:
     #: siguiente no tendria forma de saber que hay una escritura que la replica quiza
     #: no ha reproducido, que es justo el caso que esto existe para cubrir.
     last_write_lsn: str | None = None
+    #: Clave maestra del usuario, en hexadecimal. **Aqui esta el limite reconocido del
+    #: modelo de cifrado**, y conviene enunciarlo con precision:
+    #:
+    #:   el modelo es «EL SERVIDOR nunca ve la clave», no «la clave nunca toca el disco».
+    #:
+    #: Guardarla permite que `put` y `get` funcionen sin pedir la contrasena en cada
+    #: invocacion, que es lo que haria inservibles los scripts y las pruebas. Sigue
+    #: siendo mas fuerte que cifrar en el servidor: quien controla el ControlNode y los
+    #: DataNodes no puede leer nada, ni con el metadato entero y todos los bloques.
+    #:
+    #: Quien no quiera esto tiene `dfsha login --ask-password`, que no la guarda y la
+    #: pide en cada operacion.
+    master_key: str | None = None
+    #: Sal con la que se derivo la clave maestra. Hace falta para volver a derivarla con
+    #: `--ask-password`: con otra sal saldria otra clave y no abriria nada.
+    kdf_salt: str = ""
     #: De donde salio (o saldria) esta sesion. Solo sirve para poder decirlo en los
     #: mensajes de error: saber que fichero se miro ahorra la mitad del diagnostico
     #: cuando la sesion no persiste, por ejemplo dentro de un contenedor.
@@ -81,6 +97,8 @@ class SessionStore:
             username=datos.get("username"),
             cwd=datos.get("cwd", "/"),
             last_write_lsn=datos.get("last_write_lsn"),
+            master_key=datos.get("master_key"),
+            kdf_salt=datos.get("kdf_salt", ""),
             session_path=str(self.path),
         )
 
@@ -95,6 +113,8 @@ class SessionStore:
                         "username": session.username,
                         "cwd": session.cwd,
                         "last_write_lsn": session.last_write_lsn,
+                        "master_key": session.master_key,
+                        "kdf_salt": session.kdf_salt,
                     },
                     indent=2,
                 ),

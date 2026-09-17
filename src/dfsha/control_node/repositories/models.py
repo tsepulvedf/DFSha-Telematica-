@@ -78,6 +78,13 @@ class UserRow(Base):
     id: Mapped[str] = mapped_column(String(ID_LEN), primary_key=True)
     username: Mapped[str] = mapped_column(String(NAME_LEN), unique=True, nullable=False)
     password_hash: Mapped[str] = mapped_column(String(255), nullable=False)
+    #: Sal del KDF con el que el CLIENTE deriva su clave maestra. NO es secreta: su
+    #: trabajo es que dos usuarios con la misma contrasena tengan claves distintas y que
+    #: no se puedan precalcular tablas contra todo el sistema a la vez. Por eso se puede
+    #: devolver en el login sin comprometer nada.
+    #:
+    #: Vacia en un usuario de las Etapas 1 y 2: sus archivos no estaban cifrados.
+    kdf_salt: Mapped[str] = mapped_column(String(64), nullable=False, default="")
     created_at: Mapped[datetime] = mapped_column(UtcDateTime, nullable=False)
 
 
@@ -154,6 +161,20 @@ class FileRow(Base):
     committed_at: Mapped[datetime | None] = mapped_column(UtcDateTime, nullable=True)
     expires_at: Mapped[datetime | None] = mapped_column(UtcDateTime, nullable=True)
     deleted_at: Mapped[datetime | None] = mapped_column(UtcDateTime, nullable=True)
+
+    #: Clave del archivo ENVUELTA con la clave maestra del usuario, en hexadecimal.
+    #:
+    #: Es lo unico del esquema de cifrado que llega al servidor, y sin la clave maestra
+    #: —que nunca sale del cliente— no es mas que ruido. Con esto, la sal del usuario y
+    #: todos los bloques del disco, el servidor sigue sin poder descifrar nada.
+    #:
+    #: Vacia = archivo SIN CIFRAR. Es lo que permite que los archivos subidos en las
+    #: Etapas 1 y 2 se sigan pudiendo bajar: el cliente mira este campo para decidir si
+    #: descifra, en vez de suponerlo.
+    wrapped_key: Mapped[str] = mapped_column(String(255), nullable=False, default="")
+    #: Que algoritmo se uso. Existe para que cambiarlo algun dia no obligue a adivinar
+    #: con que se cifro cada archivo viejo.
+    key_algo: Mapped[str] = mapped_column(String(32), nullable=False, default="")
 
     __table_args__ = (
         # Unicidad solo entre los archivos vivos: la misma ruta puede acumular versiones

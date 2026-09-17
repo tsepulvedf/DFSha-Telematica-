@@ -30,6 +30,9 @@ class ReadPlan:
     size: int
     block_size: int
     blocks: list[ReadBlock]
+    #: Envoltura de la clave del archivo. Vacia = sin cifrar.
+    wrapped_key: str = ""
+    key_algo: str = ""
 
 
 @query("files.open")
@@ -106,4 +109,7 @@ def open_file(uow: SqlUnitOfWork, owner_id: str, raw_path: str) -> ReadPlan:
             size=archivo.size,
             block_size=archivo.block_size,
             blocks=plan,
+            # El servidor devuelve la envoltura sin poder abrirla. Vacia = sin cifrar.
+            wrapped_key=archivo.wrapped_key,
+            key_algo=archivo.key_algo,
         )
