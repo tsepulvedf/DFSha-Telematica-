@@ -421,6 +421,167 @@ def _mostrar_liderazgo(api: ControlApi) -> None:
     )
 
 
+# --- Permisos --------------------------------------------------------------
+
+grupo_app = typer.Typer(help="Grupos planos para compartir con varias personas a la vez.")
+app.add_typer(grupo_app, name="group")
+
+
+@grupo_app.command("create")
+def group_create(name: str) -> None:
+    """Crea un grupo. El nombre es tuyo: otro usuario puede tener uno igual."""
+    api, _ = _api()
+    try:
+        api.create_group(name)
+    except DFShaError as error:
+        _fallar(error)
+    console.print(f"grupo [cyan]{name}[/cyan] creado")
+
+
+@grupo_app.command("add")
+def group_add(name: str, username: str) -> None:
+    """Anade un usuario al grupo."""
+    api, _ = _api()
+    try:
+        api.add_member(name, username)
+    except DFShaError as error:
+        _fallar(error)
+    console.print(f"[green]{username}[/green] anadido a [cyan]{name}[/cyan]")
+
+
+@grupo_app.command("remove")
+def group_remove(name: str, username: str) -> None:
+    """Quita un usuario del grupo."""
+    api, _ = _api()
+    try:
+        api.remove_member(name, username)
+    except DFShaError as error:
+        _fallar(error)
+    console.print(f"[yellow]{username}[/yellow] quitado de [cyan]{name}[/cyan]")
+
+
+@grupo_app.command("ls")
+def group_ls() -> None:
+    """Tus grupos y quien esta en cada uno."""
+    api, _ = _api()
+    try:
+        respuesta = api.list_groups()
+    except DFShaError as error:
+        _fallar(error)
+
+    if not respuesta.groups:
+        console.print("[dim]no tienes ningun grupo[/dim]")
+        return
+
+    tabla = Table(box=None, pad_edge=False)
+    tabla.add_column("grupo", style="cyan")
+    tabla.add_column("miembros")
+    for grupo in respuesta.groups:
+        tabla.add_row(grupo.name, ", ".join(grupo.members) or "[dim](vacio)[/dim]")
+    console.print(tabla)
+
+
+@app.command()
+def share(path: str, principal: str, permission: str) -> None:
+    """Comparte un directorio con un usuario o grupo: read, write o admin."""
+    api, sesion = _api()
+    try:
+        api.share(resolve_path(sesion, path), principal, permission)
+    except DFShaError as error:
+        _fallar(error)
+    console.print(
+        f"[green]{principal}[/green] tiene ahora [bold]{permission.upper()}[/bold] "
+        f"sobre {path}"
+    )
+
+
+@app.command()
+def unshare(path: str, principal: str) -> None:
+    """Quita el acceso de un usuario o grupo.
+
+    Lo que ya se descargo no se recupera: revocar corta el acceso futuro, no deshace el
+    pasado. Es lo que pasa con cualquier sistema de permisos.
+    """
+    api, sesion = _api()
+    try:
+        api.unshare(resolve_path(sesion, path), principal)
+    except DFShaError as error:
+        _fallar(error)
+    console.print(f"[yellow]{principal}[/yellow] ya no tiene acceso a {path}")
+
+
+@app.command()
+def acl(path: str) -> None:
+    """Que puedes hacer aqui, y quien mas tiene acceso."""
+    api, sesion = _api()
+    try:
+        vista = api.acl(resolve_path(sesion, path))
+    except DFShaError as error:
+        _fallar(error)
+
+    origen = {
+        "owner": "eres el dueno",
+        "user": "concedido a ti",
+        "group": "por un grupo tuyo",
+    }.get(vista.source or "", vista.source or "")
+
+    detalle = f" [dim]({origen}"
+    if vista.inherited_from:
+        detalle += f", heredado de {vista.inherited_from}"
+    detalle += ")[/dim]"
+
+    if vista.effective:
+        console.print(f"tu permiso: [bold]{vista.effective}[/bold]{detalle}")
+    else:
+        console.print("[red]sin permiso[/red]")
+
+    if not vista.grants:
+        console.print("[dim]sin concesiones puestas en esta ruta[/dim]")
+        return
+
+    tabla = Table(title="concesiones en esta ruta", box=None, pad_edge=False)
+    tabla.add_column("quien", style="cyan")
+    tabla.add_column("tipo", style="dim")
+    tabla.add_column("permiso")
+    tabla.add_column("concedido por", style="dim")
+    for concesion in vista.grants:
+        tabla.add_row(
+            concesion.principal,
+            concesion.principal_type.lower(),
+            concesion.permission,
+            concesion.granted_by,
+        )
+    console.print(tabla)
+
+
+@app.command("shared")
+def shared() -> None:
+    """Lo que otros comparten contigo. Vive en /compartido-conmigo, aparte de tu arbol."""
+    api, _ = _api()
+    try:
+        respuesta = api.shared_with_me()
+    except DFShaError as error:
+        _fallar(error)
+
+    if not respuesta.entries:
+        console.print("[dim]nadie te ha compartido nada[/dim]")
+        return
+
+    tabla = Table(box=None, pad_edge=False)
+    tabla.add_column("ruta", overflow="fold")
+    tabla.add_column("de", style="cyan")
+    tabla.add_column("permiso")
+    tabla.add_column("por", style="dim")
+    for entrada in respuesta.entries:
+        tabla.add_row(
+            entrada.path,
+            entrada.owner,
+            entrada.permission,
+            f"grupo {entrada.via_group}" if entrada.via_group else "directo",
+        )
+    console.print(tabla)
+
+
 # --- Transferencia ---------------------------------------------------------
 
 

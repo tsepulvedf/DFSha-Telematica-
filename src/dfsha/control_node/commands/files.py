@@ -31,7 +31,9 @@ from dfsha.control_node.domain.rules import (
 )
 from dfsha.control_node.repositories.sql import SqlUnitOfWork, new_id
 from dfsha.control_node.services.placement import BlockPlacementPolicy
-from dfsha.control_node.services.resolver import absolute_path, resolve_directory
+from dfsha.control_node.domain.acl import Permission
+from dfsha.control_node.services.access import directory_for
+from dfsha.control_node.services.resolver import absolute_path
 from dfsha.control_node.tracing import command
 
 __all__ = ["CreatedFile", "PlannedBlock", "CommittedFile", "create_file", "commit_file", "abort_file"]
@@ -85,7 +87,10 @@ def create_file(
     efectivo = block_size or default_block_size
 
     with uow:
-        padre = resolve_directory(uow.directories, owner_id, path.parent)
+        # Subir es escribir: hace falta WRITE sobre el directorio destino. Es lo
+        # que separa a quien puede leer un directorio compartido de quien puede
+        # meter cosas en el.
+        padre = directory_for(uow, owner_id, path.parent, Permission.WRITE).directory
         ahora = utcnow()
 
         existente = uow.files.get_live_by_name(padre.id, path.name)

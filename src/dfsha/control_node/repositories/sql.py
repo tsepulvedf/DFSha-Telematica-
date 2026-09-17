@@ -21,6 +21,7 @@ from typing import Iterable, Sequence
 from sqlalchemy import case, delete, func, select, update
 from sqlalchemy.orm import Session
 
+from dfsha.control_node.domain.acl import AclEntry, Permission, PrincipalType
 from dfsha.control_node.domain.leadership import Lease
 from dfsha.control_node.domain.entities import (
     Block,
@@ -37,6 +38,9 @@ from dfsha.control_node.domain.entities import (
 
 from .models import (
     LEADERSHIP_ROW_ID,
+    AclEntryRow,
+    GroupMemberRow,
+    GroupRow,
     RereplicationTaskRow,
     BlockReplicaRow,
     BlockRow,
@@ -56,6 +60,7 @@ __all__ = [
     "SqlDataNodeRepository",
     "SqlLeadershipRepository",
     "SqlRereplicationRepository",
+    "SqlAclRepository",
     "SqlUnitOfWork",
 ]
 
@@ -1175,6 +1180,190 @@ class SqlRereplicationRepository:
         return {estado: n for estado, n in filas}
 
 
+class SqlAclRepository:
+    """Grupos y concesiones. Solo lectura y escritura; quien DECIDE es `domain/acl`."""
+
+    def __init__(self, session: Session) -> None:
+        self._session = session
+
+    # --- Grupos ------------------------------------------------------------
+
+    def create_group(self, name: str, owner_id: str, now: datetime) -> str:
+        group_id = new_id()
+        self._session.add(
+            GroupRow(id=group_id, name=name, owner_id=owner_id, created_at=now)
+        )
+        self._session.flush()
+        return group_id
+
+    def get_group(self, group_id: str) -> GroupRow | None:
+        return self._session.get(GroupRow, group_id)
+
+    def find_group(self, owner_id: str, name: str) -> GroupRow | None:
+        return self._session.scalar(
+            select(GroupRow).where(
+                GroupRow.owner_id == owner_id, GroupRow.name == name
+            )
+        )
+
+    def list_groups(self, owner_id: str) -> list[GroupRow]:
+        return list(
+            self._session.scalars(
+                select(GroupRow)
+                .where(GroupRow.owner_id == owner_id)
+                .order_by(GroupRow.name)
+            )
+        )
+
+    def add_member(self, group_id: str, user_id: str, now: datetime) -> bool:
+        """Idempotente: anadir dos veces al mismo miembro no es un error."""
+        if self._session.get(GroupMemberRow, (group_id, user_id)) is not None:
+            return False
+        self._session.add(
+            GroupMemberRow(group_id=group_id, user_id=user_id, added_at=now)
+        )
+        self._session.flush()
+        return True
+
+    def remove_member(self, group_id: str, user_id: str) -> bool:
+        borradas = self._session.execute(
+            delete(GroupMemberRow).where(
+                GroupMemberRow.group_id == group_id,
+                GroupMemberRow.user_id == user_id,
+            )
+        ).rowcount
+        return borradas > 0
+
+    def list_members(self, group_id: str) -> list[str]:
+        return list(
+            self._session.scalars(
+                select(GroupMemberRow.user_id).where(
+                    GroupMemberRow.group_id == group_id
+                )
+            )
+        )
+
+    def groups_of(self, user_id: str) -> set[str]:
+        """Grupos a los que pertenece. Una sola consulta porque los grupos son PLANOS:
+        con grupos dentro de grupos esto seria un recorrido con deteccion de ciclos."""
+        return set(
+            self._session.scalars(
+                select(GroupMemberRow.group_id).where(
+                    GroupMemberRow.user_id == user_id
+                )
+            )
+        )
+
+    # --- Concesiones -------------------------------------------------------
+
+    def grant(
+        self,
+        directory_id: str,
+        principal_type: int,
+        principal_id: str,
+        permission: int,
+        granted_by: str,
+        now: datetime,
+    ) -> None:
+        """Concede o ACTUALIZA. Nunca acumula dos filas para el mismo principal.
+
+        Es lo que hace que bajar un permiso baje de verdad: como el permiso efectivo es
+        el maximo, dejar la concesion vieja debajo haria que la mas alta siguiera ganando.
+        """
+        existente = self._session.scalar(
+            select(AclEntryRow).where(
+                AclEntryRow.directory_id == directory_id,
+                AclEntryRow.principal_type == principal_type,
+                AclEntryRow.principal_id == principal_id,
+            )
+        )
+        if existente is not None:
+            existente.permission = permission
+            existente.granted_by = granted_by
+            existente.granted_at = now
+        else:
+            self._session.add(
+                AclEntryRow(
+                    id=new_id(),
+                    directory_id=directory_id,
+                    principal_type=principal_type,
+                    principal_id=principal_id,
+                    permission=permission,
+                    granted_by=granted_by,
+                    granted_at=now,
+                )
+            )
+        self._session.flush()
+
+    def revoke(
+        self, directory_id: str, principal_type: int, principal_id: str
+    ) -> bool:
+        borradas = self._session.execute(
+            delete(AclEntryRow).where(
+                AclEntryRow.directory_id == directory_id,
+                AclEntryRow.principal_type == principal_type,
+                AclEntryRow.principal_id == principal_id,
+            )
+        ).rowcount
+        return borradas > 0
+
+    def entries_for(self, directory_ids: Sequence[str]) -> dict[str, list[AclEntry]]:
+        """Todas las concesiones de una cadena de directorios, en UNA consulta.
+
+        Se piden de golpe y no una por nivel porque resolver un permiso recorre la cadena
+        entera: con una consulta por nivel, comprobar un permiso en `/a/b/c/d` costaria
+        cuatro viajes a la base por cada operacion del namespace.
+        """
+        if not directory_ids:
+            return {}
+        filas = self._session.scalars(
+            select(AclEntryRow).where(AclEntryRow.directory_id.in_(list(directory_ids)))
+        )
+        agrupado: dict[str, list[AclEntry]] = {}
+        for fila in filas:
+            agrupado.setdefault(fila.directory_id, []).append(
+                AclEntry(
+                    directory_id=fila.directory_id,
+                    principal_type=PrincipalType(fila.principal_type),
+                    principal_id=fila.principal_id,
+                    permission=Permission(fila.permission),
+                )
+            )
+        return agrupado
+
+    def entries_on(self, directory_id: str) -> list[AclEntryRow]:
+        """Las concesiones puestas EN este directorio, sin heredar. Para `dfsha acl`."""
+        return list(
+            self._session.scalars(
+                select(AclEntryRow).where(AclEntryRow.directory_id == directory_id)
+            )
+        )
+
+    def shared_with(self, user_id: str, group_ids: set[str]) -> list[AclEntryRow]:
+        """Concesiones que alcanzan a este usuario, directas o por sus grupos.
+
+        Es lo que alimenta `/compartido-conmigo`. No se mezcla con su arbol propio: tu
+        espacio es tuyo y lo ajeno esta aparte, que es lo que mantiene el modelo mental
+        limpio cuando alguien te comparte un directorio que se llama igual que uno tuyo.
+        """
+        condiciones = [
+            (AclEntryRow.principal_type == PrincipalType.USER.value)
+            & (AclEntryRow.principal_id == user_id)
+        ]
+        if group_ids:
+            condiciones.append(
+                (AclEntryRow.principal_type == PrincipalType.GROUP.value)
+                & (AclEntryRow.principal_id.in_(list(group_ids)))
+            )
+        from sqlalchemy import or_
+
+        return list(
+            self._session.scalars(
+                select(AclEntryRow).where(or_(*condiciones)).order_by(AclEntryRow.granted_at)
+            )
+        )
+
+
 class SqlLeadershipRepository:
     """El lease de liderazgo. Una fila, y toda la concurrencia del Bloque A pasa por ella.
 
@@ -1327,6 +1516,7 @@ class SqlUnitOfWork:
         self.data_nodes = SqlDataNodeRepository(self._session)
         self.leadership = SqlLeadershipRepository(self._session)
         self.rereplication = SqlRereplicationRepository(self._session)
+        self.acl = SqlAclRepository(self._session)
 
     def __enter__(self) -> "SqlUnitOfWork":
         if self._session is None:

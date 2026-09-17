@@ -15,8 +15,11 @@ from dfsha.common.dto import (
     ClusterStatusResponse,
     CommitResponse,
     CreateFileResponse,
+    AclResponse,
+    GroupsResponse,
     LeadershipResponse,
     LsResponse,
+    SharedWithMeResponse,
     OpenFileResponse,
     StatResponse,
     TokenResponse,
@@ -108,6 +111,52 @@ class ControlApi:
     def cluster_status(self) -> ClusterStatusResponse:
         return ClusterStatusResponse.model_validate(
             self._request("GET", f"{API}/cluster/status").json()
+        )
+
+    # --- Permisos ----------------------------------------------------------
+
+    def share(self, path: str, principal: str, permission: str) -> None:
+        self._request(
+            "POST",
+            f"{API}/acl/share",
+            json={"path": path, "principal": principal, "permission": permission},
+        )
+
+    def unshare(self, path: str, principal: str) -> None:
+        self._request(
+            "POST", f"{API}/acl/unshare", json={"path": path, "principal": principal}
+        )
+
+    def acl(self, path: str) -> AclResponse:
+        return AclResponse.model_validate(
+            self._request("GET", f"{API}/acl/show", params={"path": path}).json()
+        )
+
+    def shared_with_me(self) -> SharedWithMeResponse:
+        return SharedWithMeResponse.model_validate(
+            self._request("GET", f"{API}/acl/shared-with-me").json()
+        )
+
+    def create_group(self, name: str) -> None:
+        self._request("POST", f"{API}/acl/groups", json={"name": name})
+
+    def list_groups(self) -> GroupsResponse:
+        return GroupsResponse.model_validate(
+            self._request("GET", f"{API}/acl/groups").json()
+        )
+
+    def add_member(self, name: str, username: str) -> None:
+        self._request(
+            "POST",
+            f"{API}/acl/groups/members",
+            json={"name": name, "username": username},
+        )
+
+    def remove_member(self, name: str, username: str) -> None:
+        self._request(
+            "POST",
+            f"{API}/acl/groups/members/remove",
+            json={"name": name, "username": username},
         )
 
     def leadership(self) -> LeadershipResponse:

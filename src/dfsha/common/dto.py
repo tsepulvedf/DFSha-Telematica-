@@ -42,6 +42,16 @@ __all__ = [
     "DataNodeStatus",
     "ClusterStatusResponse",
     "GcDispatchResponse",
+    "ShareRequest",
+    "UnshareRequest",
+    "GroupRequest",
+    "GroupMemberRequest",
+    "GroupInfo",
+    "GroupsResponse",
+    "AclGrant",
+    "AclResponse",
+    "SharedEntryInfo",
+    "SharedWithMeResponse",
     "LeadershipResponse",
     "ErrorResponse",
 ]
@@ -287,6 +297,72 @@ class ClusterStatusResponse(_Dto):
     #: De esos, los que se quedaron con UNA sola copia. Van primero en la cola de
     #: re-replicacion y son los unicos que estan a un fallo de perderse.
     critical_blocks: int = 0
+
+
+class ShareRequest(_Dto):
+    path: str
+    #: Nombre de usuario o de grupo. Se busca primero como grupo propio.
+    principal: str
+    #: read | write | admin
+    permission: str
+
+
+class UnshareRequest(_Dto):
+    path: str
+    principal: str
+
+
+class GroupRequest(_Dto):
+    name: str
+
+
+class GroupMemberRequest(_Dto):
+    name: str
+    username: str
+
+
+class GroupInfo(_Dto):
+    name: str
+    members: list[str]
+
+
+class GroupsResponse(_Dto):
+    groups: list[GroupInfo]
+
+
+class AclGrant(_Dto):
+    """Una concesion puesta EN un directorio, sin heredar."""
+
+    principal: str
+    principal_type: Literal["USER", "GROUP"]
+    permission: Literal["READ", "WRITE", "ADMIN"]
+    granted_by: str
+    granted_at: datetime
+
+
+class AclResponse(_Dto):
+    path: str
+    #: Permiso EFECTIVO de quien pregunta, ya resuelto con herencia y grupos.
+    effective: Literal["READ", "WRITE", "ADMIN"] | None = None
+    #: De donde sale: owner, user o group. Un permiso que no se puede explicar no se
+    #: puede auditar.
+    source: str | None = None
+    #: Ruta del directorio del que se heredo, si no era el consultado.
+    inherited_from: str | None = None
+    #: Concesiones puestas en ESTE directorio. Vacia si solo se hereda.
+    grants: list[AclGrant] = []
+
+
+class SharedEntryInfo(_Dto):
+    owner: str
+    name: str
+    permission: Literal["READ", "WRITE", "ADMIN"]
+    via_group: str | None = None
+    path: str
+
+
+class SharedWithMeResponse(_Dto):
+    entries: list[SharedEntryInfo]
 
 
 class GcDispatchResponse(_Dto):

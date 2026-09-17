@@ -20,7 +20,14 @@ from dfsha.control_node.domain.entities import utcnow
 from dfsha.control_node.domain.partition import block_count_for
 from dfsha.control_node.domain.path import Path
 from dfsha.control_node.repositories.sql import SqlUnitOfWork
-from dfsha.control_node.services.resolver import resolve_directory, resolve_entry
+from dfsha.control_node.domain.acl import Permission
+from dfsha.control_node.services.access import directory_for, entry_for
+from dfsha.control_node.services.shared import (
+    SHARED_ROOT,
+    _VirtualRoot,
+    _VirtualUser,
+    shared_entries,
+)
 from dfsha.control_node.tracing import query
 
 __all__ = ["Entry", "Stat", "ls", "stat"]
@@ -76,7 +83,16 @@ def ls(uow: SqlUnitOfWork, owner_id: str, raw_path: str) -> list[Entry]:
     path = Path.parse(raw_path)
 
     with uow:
-        directorio = resolve_directory(uow.directories, owner_id, path)
+        # Los dos niveles virtuales de `/compartido-conmigo` no son directorios reales,
+        # asi que `resolve_scope` avisa con una excepcion y se listan aqui.
+        try:
+            resuelto = directory_for(uow, owner_id, path, Permission.READ)
+        except _VirtualRoot:
+            return _listar_quien_comparte(uow, owner_id)
+        except _VirtualUser as virtual:
+            return _listar_lo_compartido_por(virtual)
+
+        directorio = resuelto.directory
 
         entradas = [
             Entry(name=d.name, type="directory", size=0, created_at=d.created_at)
@@ -98,7 +114,7 @@ def stat(
     path = Path.parse(raw_path)
 
     with uow:
-        encontrado = resolve_entry(uow.directories, uow.files, owner_id, path)
+        encontrado = entry_for(uow, owner_id, path, Permission.READ)
 
         if encontrado.directory is not None:
             return Stat(
@@ -129,3 +145,31 @@ def stat(
             max_replicas=max(copias.values()) if copias else 0,
             replication_factor=replication_factor,
         )
+
+
+def _listar_quien_comparte(uow: SqlUnitOfWork, user_id: str) -> list[Entry]:
+    """`ls /compartido-conmigo`: un directorio por cada persona que te comparte algo.
+
+    Se agrupa por usuario y no se listan los directorios directamente porque dos personas
+    pueden compartirte cosas que se llamen igual. Con el usuario delante, siguen siendo
+    rutas distintas sin que nadie tenga que renombrar nada.
+    """
+    ahora = utcnow()
+    duenos = {e.owner_username for e in shared_entries(uow, user_id)}
+    return [
+        Entry(name=username, type="directory", size=0, created_at=ahora)
+        for username in sorted(duenos)
+    ]
+
+
+def _listar_lo_compartido_por(virtual: "_VirtualUser") -> list[Entry]:
+    """`ls /compartido-conmigo/ana`: lo que esa persona te comparte."""
+    return [
+        Entry(
+            name=entrada.share_name,
+            type="directory",
+            size=0,
+            created_at=entrada.directory.created_at,
+        )
+        for entrada in virtual.entradas
+    ]

@@ -8,7 +8,8 @@ from dfsha.common.errors import NotFoundError
 from dfsha.control_node.domain.entities import ReplicaState
 from dfsha.control_node.domain.path import Path
 from dfsha.control_node.repositories.sql import SqlUnitOfWork
-from dfsha.control_node.services.resolver import resolve_entry
+from dfsha.control_node.domain.acl import Permission
+from dfsha.control_node.services.access import entry_for
 from dfsha.control_node.tracing import query
 
 __all__ = ["ReadBlock", "ReadPlan", "open_file"]
@@ -41,7 +42,9 @@ def open_file(uow: SqlUnitOfWork, owner_id: str, raw_path: str) -> ReadPlan:
     path = Path.parse(raw_path)
 
     with uow:
-        encontrado = resolve_entry(uow.directories, uow.files, owner_id, path)
+        # Descargar es leer: READ basta, y es lo que permite que alguien con solo
+        # lectura sobre un directorio compartido pueda bajarse sus archivos.
+        encontrado = entry_for(uow, owner_id, path, Permission.READ)
         if encontrado.is_directory:
             raise NotFoundError("es un directorio, no un archivo", path=str(path))
 

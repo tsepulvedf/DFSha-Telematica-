@@ -39,6 +39,7 @@ from dfsha.control_node.services.read_routing import (
 from .api.errors import install_error_handlers
 from .api.grpc import ControlPlaneServicer, build_grpc_server
 from .api.routers import (
+    acl_router,
     auth_router,
     cluster_router,
     files_router,
@@ -337,6 +338,7 @@ def create_app(settings: ControlNodeSettings | None = None) -> FastAPI:
     app.include_router(cluster_router, prefix=API_PREFIX)
     app.include_router(fs_router, prefix=API_PREFIX)
     app.include_router(files_router, prefix=API_PREFIX)
+    app.include_router(acl_router, prefix=API_PREFIX)
     # `internal_router` NO se monta aqui: vive en `create_internal_app`, que se sirve en
     # otro puerto con TLS mutuo. Montarlo tambien aqui abriria el plano interno al
     # puerto de cliente, que es justo lo que el puerto aparte existe para impedir.

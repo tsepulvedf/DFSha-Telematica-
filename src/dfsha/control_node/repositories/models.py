@@ -32,6 +32,9 @@ __all__ = [
     "LeadershipRow",
     "LEADERSHIP_ROW_ID",
     "RereplicationTaskRow",
+    "GroupRow",
+    "GroupMemberRow",
+    "AclEntryRow",
 ]
 
 ID_LEN = 36
@@ -330,4 +333,85 @@ class RereplicationTaskRow(Base):
         ),
         Index("ix_rereplication_state", "state"),
         Index("ix_rereplication_target", "target_node_id", "state"),
+    )
+
+
+class GroupRow(Base):
+    """Un grupo plano: tiene miembros, y no otros grupos.
+
+    Sin anidamiento a proposito. Un grupo dentro de otro obliga a recorrer un grafo para
+    responder "de que grupos es miembro este usuario", con ciclos que hay que detectar, y
+    convierte una consulta constante en un recorrido. Para lo que el enunciado pide
+    —compartir un directorio con un equipo— un grupo plano basta.
+    """
+
+    __tablename__ = "groups"
+
+    id: Mapped[str] = mapped_column(String(ID_LEN), primary_key=True)
+    name: Mapped[str] = mapped_column(String(NAME_LEN), nullable=False)
+    owner_id: Mapped[str] = mapped_column(
+        String(ID_LEN), ForeignKey("users.id"), nullable=False, index=True
+    )
+    created_at: Mapped[datetime] = mapped_column(UtcDateTime, nullable=False)
+
+    __table_args__ = (
+        # El nombre es unico POR DUENO, no globalmente: que Ana tenga un grupo "equipo"
+        # no puede impedir que Beto tenga el suyo. Los grupos se nombran para quien los
+        # usa, no para un espacio compartido.
+        UniqueConstraint("owner_id", "name", name="uq_groups_owner_name"),
+    )
+
+
+class GroupMemberRow(Base):
+    __tablename__ = "group_members"
+
+    group_id: Mapped[str] = mapped_column(
+        String(ID_LEN), ForeignKey("groups.id", ondelete="CASCADE"), primary_key=True
+    )
+    user_id: Mapped[str] = mapped_column(
+        String(ID_LEN), ForeignKey("users.id"), primary_key=True
+    )
+    added_at: Mapped[datetime] = mapped_column(UtcDateTime, nullable=False)
+
+    __table_args__ = (Index("ix_group_members_user", "user_id"),)
+
+
+class AclEntryRow(Base):
+    """Una concesion sobre un directorio. SOLO concesiones: no hay denegaciones.
+
+    Se cuelga de un DIRECTORIO y no de un archivo: el permiso se resuelve subiendo por el
+    arbol, asi que colgarlo de archivos sueltos obligaria a mirar dos sitios en cada
+    comprobacion sin ganar expresividad.
+    """
+
+    __tablename__ = "acl_entries"
+
+    id: Mapped[str] = mapped_column(String(ID_LEN), primary_key=True)
+    directory_id: Mapped[str] = mapped_column(
+        String(ID_LEN), ForeignKey("directories.id", ondelete="CASCADE"), nullable=False
+    )
+    #: 1 = USER, 2 = GROUP. Ver domain/acl.PrincipalType.
+    principal_type: Mapped[int] = mapped_column(Integer, nullable=False)
+    principal_id: Mapped[str] = mapped_column(String(ID_LEN), nullable=False)
+    #: 1 = READ, 2 = WRITE, 3 = ADMIN. Se guarda el entero y no el nombre para que el
+    #: orden de potencia sea el del propio dato: comparar es lo que se hace todo el rato.
+    permission: Mapped[int] = mapped_column(Integer, nullable=False)
+    granted_by: Mapped[str] = mapped_column(
+        String(ID_LEN), ForeignKey("users.id"), nullable=False
+    )
+    granted_at: Mapped[datetime] = mapped_column(UtcDateTime, nullable=False)
+
+    __table_args__ = (
+        # Una sola concesion por (directorio, principal): conceder otra vez ACTUALIZA el
+        # permiso en vez de acumular filas. Sin esto, bajar un permiso dejaria la
+        # concesion vieja debajo y el maximo la haria ganar, o sea que bajar un permiso
+        # no bajaria nada.
+        UniqueConstraint(
+            "directory_id",
+            "principal_type",
+            "principal_id",
+            name="uq_acl_directory_principal",
+        ),
+        Index("ix_acl_directory", "directory_id"),
+        Index("ix_acl_principal", "principal_type", "principal_id"),
     )

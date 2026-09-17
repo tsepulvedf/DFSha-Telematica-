@@ -18,8 +18,18 @@ from dfsha.common.dto import (
     CommitResponse,
     CreateFileRequest,
     CreateFileResponse,
+    AclGrant,
+    AclResponse,
     GcConfirmRequest,
     GcDispatchResponse,
+    GroupInfo,
+    GroupMemberRequest,
+    GroupRequest,
+    GroupsResponse,
+    ShareRequest,
+    SharedEntryInfo,
+    SharedWithMeResponse,
+    UnshareRequest,
     LeadershipResponse,
     LoginRequest,
     LsEntry,
@@ -34,11 +44,13 @@ from dfsha.common.dto import (
     StatResponse,
     TokenResponse,
 )
+from dfsha.control_node.commands import acl as acl_commands
 from dfsha.control_node.commands import auth as auth_commands
 from dfsha.control_node.commands import files as file_commands
 from dfsha.control_node.commands import internal as internal_commands
 from dfsha.control_node.commands import leadership as leadership_commands
 from dfsha.control_node.commands import namespace as namespace_commands
+from dfsha.control_node.queries import acl as acl_queries
 from dfsha.control_node.queries import cluster as cluster_queries
 from dfsha.control_node.queries import files as file_queries
 from dfsha.control_node.queries import gc as gc_queries
@@ -54,6 +66,7 @@ __all__ = [
     "cluster_router",
     "fs_router",
     "files_router",
+    "acl_router",
     "internal_router",
 ]
 
@@ -61,6 +74,7 @@ auth_router = APIRouter(prefix="/auth", tags=["auth"])
 cluster_router = APIRouter(prefix="/cluster", tags=["cluster"])
 fs_router = APIRouter(prefix="/fs", tags=["namespace"])
 files_router = APIRouter(prefix="/files", tags=["transferencia"])
+acl_router = APIRouter(prefix="/acl", tags=["permisos"])
 #: Sin dependencia de autenticacion, y no es un descuido: este router se monta en una
 #: app aparte, servida en un puerto propio con TLS mutuo. La puerta la guarda el
 #: handshake, no el codigo, asi que no hay forma de anadir una ruta aqui y olvidarse de
@@ -210,6 +224,100 @@ def rm(path: str, uow: Uow, user: CurrentUser) -> Response:
 @fs_router.post("/mv", status_code=status.HTTP_204_NO_CONTENT)
 def mv(body: MvRequest, uow: Uow, user: CurrentUser) -> Response:
     namespace_commands.mv(uow, user.user_id, body.src, body.dst)
+    return Response(status_code=status.HTTP_204_NO_CONTENT)
+
+
+# --- Permisos (Etapa 3, Bloque C) ------------------------------------------
+#
+# Todos estos endpoints delegan la comprobacion en `services.permissions.require`, que es
+# la misma que usa el resto del sistema. Un modulo de permisos que comprobara sus propios
+# permisos con su propia logica seria el sitio mas facil de equivocarse y el menos
+# probable de que alguien revisara.
+
+
+@acl_router.post("/share", status_code=status.HTTP_204_NO_CONTENT)
+def share(body: ShareRequest, uow: Uow, user: CurrentUser) -> Response:
+    acl_commands.share(uow, user.user_id, body.path, body.principal, body.permission)
+    return Response(status_code=status.HTTP_204_NO_CONTENT)
+
+
+@acl_router.post("/unshare", status_code=status.HTTP_204_NO_CONTENT)
+def unshare(body: UnshareRequest, uow: Uow, user: CurrentUser) -> Response:
+    acl_commands.unshare(uow, user.user_id, body.path, body.principal)
+    return Response(status_code=status.HTTP_204_NO_CONTENT)
+
+
+@acl_router.get("/show")
+def show_acl(path: str, uow: QueryUow, user: CurrentUser) -> AclResponse:
+    """Que puede quien pregunta, y quien mas tiene concesiones aqui.
+
+    Son dos cosas distintas a proposito: `effective` responde «que puedo hacer», ya
+    resuelto con herencia y grupos; `grants` responde «quien mas puede». Mezclarlas seria
+    la forma mas rapida de que nadie entendiera ninguna.
+    """
+    vista = acl_queries.acl_of(uow, user.user_id, path)
+    return AclResponse(
+        path=vista.path,
+        effective=vista.effective,
+        source=vista.source,
+        inherited_from=vista.inherited_from,
+        grants=[
+            AclGrant(
+                principal=g.principal,
+                principal_type=g.principal_type,
+                permission=g.permission,
+                granted_by=g.granted_by,
+                granted_at=g.granted_at,
+            )
+            for g in vista.grants
+        ],
+    )
+
+
+@acl_router.get("/shared-with-me")
+def shared_with_me(uow: QueryUow, user: CurrentUser) -> SharedWithMeResponse:
+    """Lo que otros comparten contigo. NO se mezcla con tu arbol."""
+    return SharedWithMeResponse(
+        entries=[
+            SharedEntryInfo(
+                owner=e.owner,
+                name=e.name,
+                permission=e.permission,
+                via_group=e.via_group or None,
+                path=e.path,
+            )
+            for e in acl_queries.shared_with_me(uow, user.user_id)
+        ]
+    )
+
+
+@acl_router.post("/groups", status_code=status.HTTP_201_CREATED)
+def create_group(body: GroupRequest, uow: Uow, user: CurrentUser) -> Response:
+    acl_commands.create_group(uow, user.user_id, body.name)
+    return Response(status_code=status.HTTP_201_CREATED)
+
+
+@acl_router.get("/groups")
+def list_groups(uow: QueryUow, user: CurrentUser) -> GroupsResponse:
+    return GroupsResponse(
+        groups=[
+            GroupInfo(name=nombre, members=miembros)
+            for nombre, miembros in acl_queries.groups_of(uow, user.user_id)
+        ]
+    )
+
+
+@acl_router.post("/groups/members", status_code=status.HTTP_204_NO_CONTENT)
+def add_member(body: GroupMemberRequest, uow: Uow, user: CurrentUser) -> Response:
+    acl_commands.add_member(uow, user.user_id, body.name, body.username)
+    return Response(status_code=status.HTTP_204_NO_CONTENT)
+
+
+@acl_router.post("/groups/members/remove", status_code=status.HTTP_204_NO_CONTENT)
+def remove_member(body: GroupMemberRequest, uow: Uow, user: CurrentUser) -> Response:
+    """POST y no DELETE: un DELETE con cuerpo lo tratan distinto proxies y clientes, y
+    aqui hacen falta dos campos (grupo y usuario) que no caben comodos en la ruta."""
+    acl_commands.remove_member(uow, user.user_id, body.name, body.username)
     return Response(status_code=status.HTTP_204_NO_CONTENT)
 
 
