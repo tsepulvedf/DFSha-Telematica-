@@ -814,7 +814,7 @@ aparece un `verify=<ruta>` junto a un `cert=` en algun sitio nuevo, es este fall
 
 #### El patron, que es lo que va al informe
 
-Los **doce** fallos serios de la Etapa 3 de esta tabla han sido el mismo tipo de cosa:
+Los **trece** fallos serios de la Etapa 3 de esta tabla han sido el mismo tipo de cosa:
 **algo que aparenta estar puesto y no lo esta**, y ninguno se detecto leyendo el codigo.
 La tabla crecio a lo largo de la etapa; las tres primeras filas son las del codigo del
 Bloque B y C, que es donde se reconocio el patron.
@@ -833,6 +833,7 @@ Bloque B y C, que es donde se reconocio el patron.
 | `verificar_pruebas.py` | La herramienta que verifica las pruebas | Tenia la raiz del repositorio **escrita a mano** (`F:/DFSha telematica`) y el interprete del venv de esa maquina: solo corria en ella | Leyendo su codigo al anadirle la mutacion 11 |
 | El DataNode con TLS de cliente (C2) | El pipeline y la re-replicacion verificaban a sus pares | Verificaban contra el almacen del **sistema**, sin nuestra CA: con C2, cada reenvio fallaba y el commit daba 409 | Escribiendo los pasos para encender C2, antes de ejecutarlo |
 | Encender C2 (compose, sondas, sesion) | C2 estaba implementado, probado con nueve pruebas y documentado | **No se podia encender**: el compose no pasaba las variables, las sondas fijaban `http://` y el stack no levantaba, y la sesion ignoraba `DFSHA_CONTROL_URL` | Lo mismo: intentar escribir los pasos exactos |
+| La rama por defecto de GitHub (desde el hito 1) | Quien clonara el repositorio obtendria el proyecto | Obtenia **`etapa-1`**: `main` iba cuatro etapas por delante, y el `git clone` de nuestro propio README y del despliegue en AWS no indicaba rama | Al hacer el merge del hito 3, mirando `origin/HEAD` |
 
 **El cuarto (`details`) es distinto de los tres primeros, y esa diferencia es lo que va
 al informe.** Los tres primeros se manifestaban como un **fallo**: un 409, una conexion cerrada, una descarga
@@ -870,13 +871,14 @@ codigo hasta las pruebas y la documentacion**.
 | **Documentacion** | el arranque rapido con un secreto muerto y sin los certificados | 1 |
 | **Arranque** | el `__main__.py` que no compilaba, el `.env` vacio que tumbaba el DataNode en AWS, los guiones de demostracion que no arrancaban en Windows, `verificar_pruebas.py`, que solo arrancaba en la maquina donde se escribio, y C2, que no se podia encender | 5 |
 | **Migracion** | la 0006, que dejo sin sal a los usuarios existentes y con ellos el cifrado desactivado en silencio | 1 |
+| **Repositorio** | la rama por defecto de GitHub, que apuntaba a `etapa-1` desde el hito 1 | 1 |
 | **Pruebas** | tres que pasaban por un camino distinto del que su nombre anunciaba, y la del append «con cifrado» que no comprobaba el cifrado | 4 |
 
-**Dieciseis casos en seis capas.** Conviene contarlos bien, porque la cifra se cita: las
-**doce** filas de la tabla de fallos de arriba cubren las cinco primeras capas, y la
-sexta —las **cuatro** pruebas que no probaban— no esta en esa tabla: tres en la seccion
-«Verificacion por mutacion» y la cuarta en «El agujero de la 0006». Decir «doce casos en
-seis capas» mezclaria las dos cuentas.
+**Diecisiete casos en siete capas.** Conviene contarlos bien, porque la cifra se cita: las
+**trece** filas de la tabla de fallos de arriba cubren las seis primeras capas, y la
+septima —las **cuatro** pruebas que no probaban— no esta en esa tabla: tres en la seccion
+«Verificacion por mutacion» y la cuarta en «El agujero de la 0006». Decir «trece casos en
+siete capas» mezclaria las dos cuentas.
 
 Que se cuenta y que no, para poder defender la cifra: el agujero del cifrado es **un** caso,
 aunque lo arreglen tres capas. `test_criterio_11_el_bloque_en_disco_no_es_el_texto_claro`
@@ -898,7 +900,53 @@ funcionalidad **no se podia encender**, que es un fallo de arranque. Arreglar un
 arreglaba el otro. En cambio las seis filas de su tabla de detalle no son seis casos:
 el GC y el guion de failover son la misma causa que sus vecinos.
 
-Dieciseis casos en seis capas distintas no es un descuido puntual: es un **modo de fallo del
+#### La rama por defecto: el patron en su forma mas externa
+
+La rama por defecto del repositorio en GitHub era **`etapa-1`**, y lo era **desde el hito
+1**. `main` —la que recibe cada merge de etapa y cada tag— iba cuatro etapas por delante.
+Quien clonara sin indicar rama, que es lo que hace cualquiera, obtenia el proyecto de la
+**semana 8**: un ControlNode, un DataNode y nada de lo que esta seccion describe. Un
+evaluador que hiciera eso concluiria, con razon segun lo que tenia delante, que **falta
+casi todo**.
+
+Es el mismo patron que los demas casos, **en su forma mas externa**: lo que decia **donde
+esta el proyecto** llevaba mal desde el primer hito, y nada lo ataba. No hay codigo, ni
+prueba, ni documento del repositorio que dependa de cual es la rama por defecto; el ajuste
+vive fuera, en GitHub, donde no llega nada de lo que se ejecuta aqui. Y quien trabaja en el
+proyecto no lo ve nunca, porque ya tiene su copia y cambia de rama a mano.
+
+**Y lo agravaba la documentacion propia**: el `git clone` del arranque rapido del README y
+el del despliegue en AWS **no indicaban rama**. Seguir nuestras instrucciones al pie de la
+letra daba la etapa 1.
+
+**El del despliegue en AWS era el peor de los dos, y es el que mejor explica por que esta
+capa importa.** El del evaluador es un problema de imagen; el de AWS es un despliegue
+entero montado sobre el codigo equivocado, y hay que contar bien como habria fallado,
+porque no es como parece a primera vista:
+
+1. **Lo que daban nuestras instrucciones**: `etapa-1` **no tiene el directorio `deploy/`**
+   —el material de AWS nacio en la Etapa 2—. Quien siguiera `deploy/README.md`, leido en
+   GitHub sobre `main`, clonaba `etapa-1` y el primer `docker compose -f
+   deploy/docker-compose.control.yml up` fallaba con «no such file». Ruidoso e inmediato.
+2. **Lo que habria venido despues, y ese si es el peligroso**: ante ese error, la salida
+   natural es levantar el `docker-compose.yml` de la raiz, que en `etapa-1` existe y
+   funciona. Eso arranca **un ControlNode y un DataNode, sin replicacion, sin
+   certificados, sin liderazgo** —un sistema sano de la semana 8—. El sintoma habria sido
+   desconcertante («¿donde esta la replicacion?») y la causa, la rama del clon, es de las
+   que nadie mira: todo lo que se esta depurando es codigo, y el codigo esta bien.
+
+La diferencia entre los dos pasos es la leccion: el fallo ruidoso no protege si la forma
+natural de sortearlo lleva al silencioso. El remedio no es depender de que alguien
+entienda el primer error, sino que las instrucciones **no puedan** llevar a la rama
+equivocada: `--branch main`.
+
+Se vio al hacer el merge del hito 3, mirando `origin/HEAD` para comprobar a donde iba el
+merge. **El arreglo tiene dos mitades, igual que el resto de la etapa**: cambiar la rama
+por defecto a `main` en GitHub —un ajuste que no se puede fijar desde el repositorio—, y
+**atar la documentacion al destino** con `git clone --branch main`, que sigue siendo
+correcto aunque el ajuste de GitHub vuelva a cambiar.
+
+Diecisiete casos en siete capas distintas no es un descuido puntual: es un **modo de fallo del
 proyecto**. Y tiene una causa comun que conviene nombrar: en todos, **algo dejo de ser
 verdad y lo que lo afirmaba no se entero**, porque nada los ataba. El codigo no comprueba
 que el README sea cierto, una prueba no comprueba que su nombre describa lo que hace, y un
@@ -1974,7 +2022,9 @@ implementado y probado, y no se podia encender» (18/09):
   volumenes.
 
 **Queda validado en Docker todo lo de la Etapa 3.** Lo unico sin ejecutar nunca es el
-despliegue en AWS (`deploy/README.md`).
+despliegue en AWS (`deploy/README.md`). **No se empieza todavia**: el equipo decide cuando se montan
+las seis instancias. Cuando se haga, clonar con `--branch main` (ver «La rama por
+defecto»).
 
 ### Decision del hito-3: C2 viene APAGADO por defecto
 
