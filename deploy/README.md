@@ -513,11 +513,13 @@ docker kill dfsha-control-node-a     # en T2, si el lider es A
 docker kill dfsha-control-node-b     # en T3, si el lider es B
 ```
 
-**Por qué `kill`.** Una parada ordenada (`docker stop`) **suelta** el lease al salir
-(`leadership.released`), y el otro lo toma en el siguiente ciclo de renovación: se ve un
-traspaso limpio, con `previous_leader: null`. Con `kill` no hay liberación: el lease tiene
-que **caducar** (TTL de 6 s), que es lo que pasa en una caída de verdad. `stop` sirve para
-enseñar después la variante ordenada.
+**Por qué `kill` y no `stop`: una parada ordenada suelta el lease y entonces no se
+demuestra que caduca, que es el mecanismo entero.** Con `docker stop` el ControlNode
+libera el lease al salir (`leadership.released`) y el otro lo toma en el siguiente ciclo de
+renovación: se ve un traspaso limpio, con `previous_leader: null`, y todo parece
+funcionar, pero no se ha puesto a prueba lo que protege de un líder que muere sin avisar.
+Con `kill` no hay liberación: el lease tiene que **caducar** (TTL de 6 s), que es lo que
+pasa en una caída de verdad. `stop` sirve para enseñar después la variante ordenada.
 
 **3. El servicio no se interrumpe (T1), inmediatamente:**
 
