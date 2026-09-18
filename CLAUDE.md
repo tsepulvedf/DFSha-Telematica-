@@ -915,10 +915,30 @@ prueba, ni documento del repositorio que dependa de cual es la rama por defecto;
 vive fuera, en GitHub, donde no llega nada de lo que se ejecuta aqui. Y quien trabaja en el
 proyecto no lo ve nunca, porque ya tiene su copia y cambia de rama a mano.
 
-**Y lo agravaba la documentacion propia**: el `git clone` del arranque rapido del README y el
-del despliegue en AWS **no indicaban rama**. Seguir nuestras instrucciones al pie de la
-letra daba la etapa 1, y el despliegue en AWS habria montado la etapa 1 en las seis
-instancias.
+**Y lo agravaba la documentacion propia**: el `git clone` del arranque rapido del README y
+el del despliegue en AWS **no indicaban rama**. Seguir nuestras instrucciones al pie de la
+letra daba la etapa 1.
+
+**El del despliegue en AWS era el peor de los dos, y es el que mejor explica por que esta
+capa importa.** El del evaluador es un problema de imagen; el de AWS es un despliegue
+entero montado sobre el codigo equivocado, y hay que contar bien como habria fallado,
+porque no es como parece a primera vista:
+
+1. **Lo que daban nuestras instrucciones**: `etapa-1` **no tiene el directorio `deploy/`**
+   —el material de AWS nacio en la Etapa 2—. Quien siguiera `deploy/README.md`, leido en
+   GitHub sobre `main`, clonaba `etapa-1` y el primer `docker compose -f
+   deploy/docker-compose.control.yml up` fallaba con «no such file». Ruidoso e inmediato.
+2. **Lo que habria venido despues, y ese si es el peligroso**: ante ese error, la salida
+   natural es levantar el `docker-compose.yml` de la raiz, que en `etapa-1` existe y
+   funciona. Eso arranca **un ControlNode y un DataNode, sin replicacion, sin
+   certificados, sin liderazgo** —un sistema sano de la semana 8—. El sintoma habria sido
+   desconcertante («¿donde esta la replicacion?») y la causa, la rama del clon, es de las
+   que nadie mira: todo lo que se esta depurando es codigo, y el codigo esta bien.
+
+La diferencia entre los dos pasos es la leccion: el fallo ruidoso no protege si la forma
+natural de sortearlo lleva al silencioso. El remedio no es depender de que alguien
+entienda el primer error, sino que las instrucciones **no puedan** llevar a la rama
+equivocada: `--branch main`.
 
 Se vio al hacer el merge del hito 3, mirando `origin/HEAD` para comprobar a donde iba el
 merge. **El arreglo tiene dos mitades, igual que el resto de la etapa**: cambiar la rama
