@@ -1040,8 +1040,8 @@ qué cambia en cada instancia están en **[`deploy/README.md`](deploy/README.md)
 > **Sin ejecutar todavía.** El material está escrito y revisado, pero nadie lo ha corrido
 > en una cuenta de AWS. El despliegue local con `docker compose` sí está verificado:
 > arranque de los diez servicios, clúster 4/4, liderazgo, los cuatro guiones de
-> demostración y el RF3. Lo que falta —el TLS de cliente— está en CLAUDE.md, «Estado de la
-> validacion en Docker».
+> demostración, el RF3 y el TLS de cliente encendido con el override. El detalle de cada
+> pasada está en CLAUDE.md, «Estado de la validacion en Docker».
 
 ## Alcance de esta etapa
 

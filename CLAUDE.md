@@ -1948,9 +1948,8 @@ y `docker`, rutas ancladas a la raiz del repositorio, subprocesos en UTF-8.
 - `failover_del_lider`: **pasa**. Lider real identificado por `is_self`, el cluster sigue
   sirviendo, relevo en 7,4 s y epoca de 10 a 11.
 - `cifrado_en_reposo`: **FALLO, y con razon**. Encontro el texto claro en un `.blk`: el
-  agujero de la 0006, ver «El agujero de la 0006» en la seccion de cifrado. Arreglado en
-  codigo (migracion 0008, `put` que se niega sin clave), **pendiente de volver a pasar el
-  guion** con el stack reconstruido y un `dfsha login` nuevo.
+  agujero de la 0006, ver «El agujero de la 0006» en la seccion de cifrado. Arreglado con
+  la migracion 0008 y un `put` que se niega sin clave; la pasada siguiente lo valida.
 
 **Validado despues del arreglo de la 0008**, con `down -v` y la pasada completa en
 Windows (18/09): los **cuatro guiones pasan**. `cifrado_en_reposo` con `wrapped_key`
@@ -1959,9 +1958,35 @@ con los controles positivos delante; `failover_del_lider` con relevo en 4,9 s. Y
 **RF3 a mano**: `lock` exclusivo, `append` con reescritura de la cola cifrada, `unlock`,
 `read` por rango exacto y `get` con las dos lineas.
 
-**Sin validar en Docker: C2**, que ademas no se podia encender hasta este arreglo (ver «C2
-estaba implementado y probado, y no se podia encender»). Los pasos estan en el README,
-«Encender y apagar el TLS de cliente».
+**C2 validado en Docker** con `docker-compose.tls.yml`, despues del arreglo de «C2 estaba
+implementado y probado, y no se podia encender» (18/09):
+
+- **Los diez servicios `healthy` con el override.** Que el stack levante ya es la prueba
+  de las sondas: con las de `http://` fijo no habria arrancado, por `depends_on`.
+- `dfsha cluster` con las cuatro direcciones en `https://localhost:800N`; liderazgo en
+  epoca 3.
+- `put` de 50 MB con bloques de 1 MB: **`FULLY_REPLICATED`, 3 de 3 copias por bloque**. Es
+  la prueba del arreglo del DataNode: el pipeline entre nodos cruzo HTTPS verificando la
+  CA propia. Sin el, cada bloque se habria quedado con una copia y el commit en 409.
+- Ida y vuelta con el SHA-256 identico (`6d081597...`): TLS en todos los saltos y cifrado
+  extremo a extremo por debajo.
+- **Apagado** con `docker compose up -d`: vuelve a `http://` sin tocar el `.env` ni los
+  volumenes.
+
+**Queda validado en Docker todo lo de la Etapa 3.** Lo unico sin ejecutar nunca es el
+despliegue en AWS (`deploy/README.md`).
+
+### Decision del hito-3: C2 viene APAGADO por defecto
+
+`hito-3` se etiqueta con el TLS de cliente apagado, y es una decision, no algo pendiente.
+**El modo por defecto tiene que ser el que encuentra quien clona el repositorio y hace
+`docker compose up`**, y que `curl http://localhost:8000/health` conteste sin configurar
+nada vale mas que tenerlo encendido de serie. Encenderlo es una linea de ordenes —el
+override—, y asi se ensena en el video: justo lo que el override hace posible.
+
+No debilita la seguridad del contenido: los bloques viajan cifrados extremo a extremo en
+los dos modos. Lo que C2 anade es proteger el JWT, el metadato y los tokens de bloque en
+la red, que es lo que un despliegue real encenderia.
 
 ### Intermitente conocido: `test_los_bloques_son_inmutables`
 
