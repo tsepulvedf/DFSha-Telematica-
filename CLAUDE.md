@@ -802,8 +802,10 @@ aparece un `verify=<ruta>` junto a un `cert=` en algun sitio nuevo, es este fall
 
 #### El patron, que es lo que va al informe
 
-Los **tres** fallos serios de la Etapa 3 han sido el mismo tipo de cosa: **algo que
-aparenta estar puesto y no lo esta**, y ninguno se detecto leyendo el codigo.
+Los **siete** fallos serios de la Etapa 3 de esta tabla han sido el mismo tipo de cosa:
+**algo que aparenta estar puesto y no lo esta**, y ninguno se detecto leyendo el codigo.
+La tabla crecio a lo largo de la etapa; las tres primeras filas son las del codigo del
+Bloque B y C, que es donde se reconocio el patron.
 
 | Fallo | Que parecia | Que era | Como se detecto |
 |---|---|---|---|
@@ -815,8 +817,8 @@ aparenta estar puesto y no lo esta**, y ninguno se detecto leyendo el codigo.
 | El punto de entrada (C2) | 529 pruebas en verde decian que el servicio estaba bien | `__main__.py` **no compilaba**: ninguna prueba lo importaba | Levantando el stack |
 | `CAPACITY_BYTES=` vacia (AWS, desde la Etapa 2) | Seguir el ejemplo de despliegue levantaba el DataNode | El DataNode **no arrancaba**; el compose local lo tapaba con un default | Ejecutando el punto de entrada, no compilandolo |
 
-**El cuarto es distinto de los otros tres, y esa diferencia es lo que va al informe.** Los
-tres primeros se manifestaban como un **fallo**: un 409, una conexion cerrada, una descarga
+**El cuarto (`details`) es distinto de los tres primeros, y esa diferencia es lo que va
+al informe.** Los tres primeros se manifestaban como un **fallo**: un 409, una conexion cerrada, una descarga
 imposible. Alguien acababa tropezando con ellos. El cuarto **no fallaba nunca**: producia
 mensajes empobrecidos que **parecen completos**. «No alcanzan el quorum de escritura» se lee
 como un mensaje terminado; que le falte la lista de bloques no se nota si no sabes que la
@@ -844,15 +846,20 @@ Nadie lo detecto porque **a la documentacion no se le corren pruebas**, y quien 
 Y esa es la razon de que los cinco casos vayan juntos al informe: **el rango va desde el
 codigo hasta las pruebas y la documentacion**.
 
-| Donde | Caso |
-|---|---|
-| **Codigo** | el direccionamiento, `cert=` de httpx, `blocks.size` |
-| **Cliente** | los `details` descartados desde la Etapa 1 |
-| **Pruebas** | tres que pasaban por un camino distinto del que su nombre anunciaba |
-| **Documentacion** | el arranque rapido con un secreto muerto y sin los certificados |
-| **Arranque** | el `__main__.py` que no compilaba, y el `.env` vacio que tumbaba el DataNode en AWS |
+| Donde | Casos | Cuantos |
+|---|---|---|
+| **Codigo** | el direccionamiento, `cert=` de httpx, `blocks.size` | 3 |
+| **Cliente** | los `details` descartados desde la Etapa 1 | 1 |
+| **Documentacion** | el arranque rapido con un secreto muerto y sin los certificados | 1 |
+| **Arranque** | el `__main__.py` que no compilaba, y el `.env` vacio que tumbaba el DataNode en AWS | 2 |
+| **Pruebas** | tres que pasaban por un camino distinto del que su nombre anunciaba | 3 |
 
-Siete casos en cinco capas distintas no es un descuido puntual: es un **modo de fallo del
+**Diez casos en cinco capas.** Conviene contarlos bien, porque la cifra se cita: las
+**siete** filas de la tabla de fallos de arriba cubren las cuatro primeras capas, y la
+quinta —las **tres** pruebas que no probaban— esta en la seccion «Verificacion por
+mutacion», no en esa tabla. Decir «siete casos en cinco capas» mezclaria las dos cuentas.
+
+Diez casos en cinco capas distintas no es un descuido puntual: es un **modo de fallo del
 proyecto**. Y tiene una causa comun que conviene nombrar: en todos, **algo dejo de ser
 verdad y lo que lo afirmaba no se entero**, porque nada los ataba. El codigo no comprueba
 que el README sea cierto, una prueba no comprueba que su nombre describa lo que hace, y un
@@ -862,8 +869,8 @@ Lo unico que ha funcionado contra esto es **hacer que algo exija el dato**: vali
 Docker, medir en vez de asumir, romper la proteccion para ver caer la prueba, o reescribir
 la documentacion con el sistema delante.
 
-Los tres pasaban por caminos que en el entorno de prueba no se distinguen del correcto: el
-primero porque los nodos compartian espacio de red; el segundo porque todas las pruebas de
+Los **tres primeros** —los del codigo— pasaban por caminos que en el entorno de prueba no
+se distinguen del correcto: el primero porque los nodos compartian espacio de red; el segundo porque todas las pruebas de
 rechazo pasaban —el servidor cerraba la conexion, que es justo lo que se esperaba de un
 intruso— y solo fallaba el camino bueno; el tercero porque **cada mitad era coherente
 consigo misma** y solo discrepaban en el cruce.
@@ -871,7 +878,7 @@ consigo misma** y solo discrepaban en el cruce.
 #### Y la segunda mitad del patron: el sintoma apunta a otro sitio
 
 Esto es lo que mas cuesta en la practica, y es material del informe por derecho propio.
-**En los tres, el error de superficie despistaba sobre la causa**, y en una direccion
+**En los tres primeros, el error de superficie despistaba sobre la causa**, y en una direccion
 concreta: el sistema tiene relevos y reintentos —replicas alternativas, otro DataNode,
 otra instancia del ControlNode—, y un relevo convierte «esto esta mal» en «esto no
 responde».
