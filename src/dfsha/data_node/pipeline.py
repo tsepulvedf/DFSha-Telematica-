@@ -45,6 +45,7 @@ tolera perder un nodo. El hueco lo recoge la cola de re-replicacion.
 
 from __future__ import annotations
 
+import ssl
 from dataclasses import dataclass
 
 import httpx
@@ -110,6 +111,7 @@ def forward(
     cadena: list[str],
     timeout: float = 120.0,
     token: str = "",
+    verify: ssl.SSLContext | bool = True,
 ) -> PipelineResult:
     """Manda el bloque al siguiente de la cadena con el resto de la cadena detras.
 
@@ -147,6 +149,9 @@ def forward(
             content=datos,
             headers=cabeceras,
             timeout=timeout,
+            # La CA del proyecto: con C2 el vecino habla https y su certificado no lo
+            # conoce el almacen del sistema. Ver `peer_verify` en main.py.
+            verify=verify,
         )
     except httpx.HTTPError as exc:
         log.warning(

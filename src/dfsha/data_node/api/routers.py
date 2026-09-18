@@ -180,7 +180,13 @@ def _escribir_y_reenviar(
                 # A la vez, no en secuencia: el reenvio no espera al fsync local.
                 with ThreadPoolExecutor(max_workers=1) as bomba:
                     envio = bomba.submit(
-                        forward, block_id, b"".join(trozos), checksum, cadena, token=token
+                        forward,
+                        block_id,
+                        b"".join(trozos),
+                        checksum,
+                        cadena,
+                        token=token,
+                        verify=getattr(app.state, "peer_verify", True),
                     )
                     meta = storage.write(block_id, iter(trozos), checksum)
                     resultado = envio.result()

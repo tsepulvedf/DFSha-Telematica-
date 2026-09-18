@@ -74,7 +74,7 @@ def red(monkeypatch):
     def instalar(manejador):
         transporte, enviados = _transporte(manejador)
 
-        def put_falso(url, *, content, headers, timeout):
+        def put_falso(url, *, content, headers, timeout, verify=True):
             with httpx.Client(transport=transporte) as cliente:
                 return cliente.put(url, content=content, headers=headers)
 
@@ -162,3 +162,23 @@ def test_un_acked_ausente_o_raro_se_cuenta_como_uno(red, cabecera) -> None:
     red(lambda req: httpx.Response(201, headers=cabeceras))
 
     assert forward("b1", BLOQUE, CHECKSUM, ["http://dn2:8001"]).downstream_acked == 1
+
+
+def test_el_reenvio_verifica_al_vecino_con_el_contexto_que_recibe(monkeypatch) -> None:
+    """Con C2 el vecino habla https y su certificado lo firma NUESTRA CA. Si `forward`
+    dejara de pasar su `verify` a httpx, se volveria a verificar contra el almacen del
+    sistema, cada reenvio fallaria por certificado, y el commit daria 409 de quorum."""
+    import ssl
+
+    vistos = []
+
+    def put_capturador(url, *, content, headers, timeout, verify=True):
+        vistos.append(verify)
+        return httpx.Response(201, headers={"X-DFSha-Replicas-Acked": "1"})
+
+    monkeypatch.setattr("dfsha.data_node.pipeline.httpx.put", put_capturador)
+    contexto = ssl.create_default_context()
+
+    forward("b1", BLOQUE, CHECKSUM, ["https://dn2:8001"], verify=contexto)
+
+    assert vistos == [contexto]

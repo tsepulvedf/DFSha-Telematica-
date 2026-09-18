@@ -73,6 +73,11 @@ para grabar, eso sí borra el metadato y los bloques.
 
 ## Antes de correrlos
 
+**Con el TLS de cliente (C2) encendido también funcionan**: toman la URL de la sesión
+—inicia sesión con `DFSHA_CONTROL_URL=https://localhost:8000`— y la CA de `certs/ca.crt`.
+Cómo encenderlo y apagarlo está en el README principal, «Encender y apagar el TLS de
+cliente».
+
 ```bash
 python scripts/gen_certs.py          # una vez: la CA y los certificados
 docker compose up --build -d

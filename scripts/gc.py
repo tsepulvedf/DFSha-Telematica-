@@ -143,9 +143,11 @@ def recolectar(
         for replica in replicas:
             base = replica["base_url"].rstrip("/")
             try:
-                borrado = httpx.delete(
+                # Por `plano`, que verifica contra la CA del proyecto. Con `httpx.delete`
+                # a secas se verificaba contra el almacen del sistema, y con el TLS de
+                # cliente (C2) encendido cada borrado fallaba por certificado.
+                borrado = plano.delete(
                     f"{base}/api/v1/blocks/{block_id}",
-                    timeout=timeout,
                     headers=cabeceras,
                 )
                 if borrado.status_code not in (204, 404):

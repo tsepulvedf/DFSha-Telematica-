@@ -1039,9 +1039,9 @@ qué cambia en cada instancia están en **[`deploy/README.md`](deploy/README.md)
 
 > **Sin ejecutar todavía.** El material está escrito y revisado, pero nadie lo ha corrido
 > en una cuenta de AWS. El despliegue local con `docker compose` sí está verificado:
-> arranque de los diez servicios, clúster 4/4, liderazgo y un `put` de 50 MB con R=3. Lo
-> que falta validar en Docker —RF3, TLS de cliente y una pasada completa de los guiones
-> de demostración— está listado en CLAUDE.md, «Estado de la validacion en Docker».
+> arranque de los diez servicios, clúster 4/4, liderazgo, los cuatro guiones de
+> demostración y el RF3. Lo que falta —el TLS de cliente— está en CLAUDE.md, «Estado de la
+> validacion en Docker».
 
 ## Alcance de esta etapa
 
@@ -1063,6 +1063,64 @@ sino el **token JWT**, el **metadato** (nombres, rutas, tamaños) y los tokens d
 No es mTLS: al cliente **no** se le pide certificado, porque su identidad es el JWT. Dar un
 certificado a cada usuario sería montar una PKI para acabar sabiendo lo mismo que ya dice
 el token.
+
+### Encender y apagar el TLS de cliente en `docker compose`
+
+Es un fichero que se superpone, no variables en el `.env`: encender C2 cambia a la vez el
+certificado de siete servicios, las ocho direcciones anunciadas y la configuración de nginx,
+y tienen que moverse juntos. No toca el `.env` ni los volúmenes, así que encender y apagar
+no borra datos. En PowerShell, desde la raíz del repositorio:
+
+```powershell
+# 1. Encender: ControlNodes, DataNodes y nginx pasan a HTTPS
+docker compose -f docker-compose.yml -f docker-compose.tls.yml up -d --build
+docker compose ps                  # los diez healthy; las sondas ya preguntan en HTTPS
+
+# 2. El cliente del host cambia de URL (la de la sesión guardada era http://)
+$env:DFSHA_CONTROL_URL = "https://localhost:8000"
+dfsha login ana                    # la CA la toma de certs/ca.crt
+
+# 3. Comprobar que va por HTTPS y que se verifica de verdad (con httpx, como el cliente)
+python -c "import httpx, ssl; print(httpx.get('https://localhost:8000/health', verify=ssl.create_default_context(cafile='certs/ca.crt')).json())"
+#   -> {'status': 'ok', 'service': 'control-node'}
+python -c "import httpx; httpx.get('https://localhost:8000/health')"
+#   -> ConnectError ... CERTIFICATE_VERIFY_FAILED: sin NUESTRA CA no se confia
+python -c "import httpx; print(httpx.get('http://localhost:8000/health').status_code)"
+#   -> 400: nginx contesta "plain HTTP request was sent to HTTPS port"
+python -c "import httpx, ssl; print(httpx.get('https://localhost:8001/health', verify=ssl.create_default_context(cafile='certs/ca.crt')).json()['status'])"
+#   -> ok: el DataNode tambien habla HTTPS
+dfsha cluster                      # las direcciones salen como https://localhost:800N
+python scripts/demo/permisos_y_token.py
+python scripts/demo/replicacion_y_caida.py
+
+# 4. Apagar: volver a levantar SIN el override, y el cliente de vuelta a http://
+docker compose up -d
+$env:DFSHA_CONTROL_URL = "http://localhost:8000"
+dfsha login ana
+Remove-Item Env:DFSHA_CONTROL_URL  # la sesión ya guarda http://
+```
+
+Las dos comprobaciones que **no** devuelven `ok` son la mitad que importa: un TLS que
+acepta cualquier certificado se ve igual que uno que verifica, y solo el rechazo lo
+distingue. No se usa `curl.exe` porque en Windows va con Schannel, que con una CA propia
+sin lista de revocación falla por la revocación y no por la cadena: el rechazo saldría,
+pero por un motivo que no es el que se quiere enseñar.
+
+Qué hace el override, tramo a tramo:
+
+| Tramo | Con el override |
+|---|---|
+| cliente → nginx `:8000` | HTTPS con el certificado de control (SAN `localhost`) |
+| nginx → ControlNode | HTTPS **verificado** contra la CA del proyecto |
+| cliente → DataNode `:800N` | HTTPS con el certificado de datos |
+| DataNode → DataNode (pipeline, re-replicación) | HTTPS **verificado** contra la CA |
+| plano interno `:8443`, gRPC `:9000` | sin cambios: ya llevaban mTLS |
+
+nginx **termina** TLS en `:8000` y vuelve a cifrar hacia el ControlNode, al revés que en
+`:8443` y `:9000`. En el plano interno el certificado es la identidad y no puede morir en
+el balanceador; en el de cliente la identidad es el JWT, que viaja dentro de la petición y
+llega intacto. Terminar aquí conserva lo que justifica el nivel 7: reparto por petición y
+reintento en otra instancia. Está explicado en `docker/nginx/dfsha-tls.conf`.
 
 ### Límites conocidos, escritos a propósito
 

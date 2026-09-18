@@ -79,10 +79,29 @@ DIR_BLOQUES = "/var/lib/dfsha/blocks"
 #: salida redirigida codifica en cp1252 y revienta al primer caracter fuera de ese juego.
 _ENTORNO_HIJO = {**os.environ, "PYTHONUTF8": "1", "PYTHONIOENCODING": "utf-8"}
 
-#: El ControlNode, con la MISMA variable que usa el CLI. Escribirlo a mano en cada guion
-#: significaria que apuntar la demostracion a otro despliegue —AWS, por ejemplo— obliga a
-#: editar cuatro ficheros y acordarse de los cuatro.
-CONTROL_URL = os.environ.get("DFSHA_CONTROL_URL", "http://localhost:8000")
+#: La CA con la que verificar HTTPS (C2): la del repositorio si nadie dijo otra. Se fija
+#: en el entorno para que la hereden tambien los `dfsha` que lanzan los guiones, que asi
+#: no dependen del directorio desde el que se ejecuten.
+if not os.environ.get("DFSHA_TLS_CA_CERT") and (RAIZ / "certs" / "ca.crt").is_file():
+    os.environ["DFSHA_TLS_CA_CERT"] = str(RAIZ / "certs" / "ca.crt")
+
+
+def _url_del_control() -> str:
+    """El ControlNode, resuelto IGUAL que lo resuelve el CLI: la variable si esta, si no
+    la de la sesion guardada, y si no el default. Escribirlo a mano en cada guion obligaria
+    a editar cuatro ficheros para apuntar a otro despliegue; leer solo la variable hacia
+    que, con C2 encendido y la sesion ya en https, los guiones siguieran preguntando en
+    http y esperaran tres minutos a un ControlNode que si estaba.
+    """
+    try:
+        from dfsha.client.session import SessionStore
+
+        return SessionStore().load("http://localhost:8000").control_url
+    except Exception:  # noqa: BLE001 - sin sesion legible, el default
+        return os.environ.get("DFSHA_CONTROL_URL", "http://localhost:8000")
+
+
+CONTROL_URL = _url_del_control()
 
 
 def sesion_del_cli():

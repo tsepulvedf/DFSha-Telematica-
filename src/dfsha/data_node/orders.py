@@ -34,6 +34,7 @@ confirma: la tarea vence en el ControlNode y se vuelve a despachar.
 
 from __future__ import annotations
 
+import ssl
 import threading
 from concurrent.futures import ThreadPoolExecutor
 
@@ -57,8 +58,16 @@ class OrderExecutor:
     a un orden de construccion fragil.
     """
 
-    def __init__(self, app_state, max_workers: int = 2, timeout: float = 300.0) -> None:
+    def __init__(
+        self,
+        app_state,
+        max_workers: int = 2,
+        timeout: float = 300.0,
+        verify: ssl.SSLContext | bool = True,
+    ) -> None:
         self._state = app_state
+        #: Como verificar al nodo ORIGEN de una copia. Ver `peer_verify` en main.py.
+        self._verify = verify
         self._pool = ThreadPoolExecutor(
             max_workers=max(1, max_workers), thread_name_prefix="dfsha-orders"
         )
@@ -196,7 +205,7 @@ class OrderExecutor:
         )
 
         with httpx.stream(
-            "GET", url, timeout=self._timeout, headers=cabeceras
+            "GET", url, timeout=self._timeout, headers=cabeceras, verify=self._verify
         ) as respuesta:
             if respuesta.status_code != 200:
                 respuesta.read()

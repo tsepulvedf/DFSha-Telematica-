@@ -1,0 +1,79 @@
+# DFSha con TLS de CLIENTE (C2) encendido. Se superpone a docker-compose.yml:
+#
+#   docker compose -f docker-compose.yml -f docker-compose.tls.yml up -d
+#
+# y se APAGA volviendo a levantar sin este fichero:
+#
+#   docker compose up -d
+#
+# No toca el .env ni ningun volumen: encender y apagar no borra datos. Lo que cambia:
+#
+#   cliente -> nginx :8000          HTTPS (certificado de control, SAN localhost)
+#   nginx   -> ControlNode :8000    HTTPS, verificado contra la CA del proyecto
+#   cliente -> DataNode :800N       HTTPS (certificado de datos, SAN localhost)
+#   DataNode -> DataNode (pipeline y re-replicacion)   HTTPS, verificado contra la CA
+#
+# El plano interno (:8443) y el gRPC (:9000) no cambian: ya llevaban mTLS.
+#
+# Por que un fichero aparte y no variables en el .env: encender C2 no es UNA variable. Son
+# el certificado de cada servicio, el esquema de las ocho direcciones anunciadas y la
+# configuracion de nginx, y tienen que cambiar juntos. Un override los mueve de una vez y
+# se quita de una vez; repartido por el .env, olvidar una de las ocho URL dejaria un nodo
+# anunciando http:// a un cliente que ya solo habla https.
+#
+# DESPUES DE ENCENDERLO O APAGARLO, el cliente del host tiene que cambiar de URL, porque la
+# URL con la que se inicio sesion queda guardada:
+#
+#   $env:DFSHA_CONTROL_URL="https://localhost:8000"; dfsha login <usuario>
+#
+# La CA la busca en certs/ca.crt (desde la raiz del repositorio) o en DFSHA_TLS_CA_CERT.
+
+x-client-tls-control: &client-tls-control
+  DFSHA_CLIENT_TLS_CERT: "/etc/dfsha/certs/control.crt"
+  DFSHA_CLIENT_TLS_KEY: "/etc/dfsha/certs/control.key"
+
+x-client-tls-data: &client-tls-data
+  DFSHA_CLIENT_TLS_CERT: "/etc/dfsha/certs/data.crt"
+  DFSHA_CLIENT_TLS_KEY: "/etc/dfsha/certs/data.key"
+
+services:
+  control-node-1:
+    environment: *client-tls-control
+  control-node-2:
+    environment: *client-tls-control
+  control-node-3:
+    environment: *client-tls-control
+
+  lb:
+    volumes:
+      # Sustituye a dfsha.conf: mismo destino, y compose fusiona los volumenes por destino.
+      - "./docker/nginx/dfsha-tls.conf:/etc/nginx/conf.d/default.conf:ro"
+      - "./certs:/etc/nginx/certs:ro"
+    healthcheck:
+      # Por la sonda interna de dfsha-tls.conf, que habla HTTPS verificado con los
+      # ControlNodes. El wget de busybox no sabe verificar contra una CA propia, y
+      # desactivar la verificacion no es una opcion en este proyecto.
+      test: ["CMD-SHELL", "wget -q -O - http://127.0.0.1:8081/health || exit 1"]
+
+  # Los ocho valores de URL se pueden seguir sobrescribiendo con DFSHA_ADVERTISE_N y
+  # DFSHA_PEER_N, igual que en el fichero base; solo cambia el esquema por defecto.
+  data-node-1:
+    environment:
+      <<: *client-tls-data
+      DFSHA_DATANODE_ADVERTISE_URL: "${DFSHA_ADVERTISE_1:-https://localhost:8001}"
+      DFSHA_DATANODE_PEER_URL: "${DFSHA_PEER_1:-https://data-node-1:8001}"
+  data-node-2:
+    environment:
+      <<: *client-tls-data
+      DFSHA_DATANODE_ADVERTISE_URL: "${DFSHA_ADVERTISE_2:-https://localhost:8002}"
+      DFSHA_DATANODE_PEER_URL: "${DFSHA_PEER_2:-https://data-node-2:8001}"
+  data-node-3:
+    environment:
+      <<: *client-tls-data
+      DFSHA_DATANODE_ADVERTISE_URL: "${DFSHA_ADVERTISE_3:-https://localhost:8003}"
+      DFSHA_DATANODE_PEER_URL: "${DFSHA_PEER_3:-https://data-node-3:8001}"
+  data-node-4:
+    environment:
+      <<: *client-tls-data
+      DFSHA_DATANODE_ADVERTISE_URL: "${DFSHA_ADVERTISE_4:-https://localhost:8004}"
+      DFSHA_DATANODE_PEER_URL: "${DFSHA_PEER_4:-https://data-node-4:8001}"

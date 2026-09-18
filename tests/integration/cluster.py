@@ -17,6 +17,8 @@ from pathlib import Path
 import httpx
 import uvicorn
 
+from dfsha.common.serve import ClientTls
+from dfsha.common.tls import ca_only_context
 from dfsha.control_node.config import ControlNodeSettings
 from dfsha.control_node.main import create_app as create_control_app
 from dfsha.data_node.config import DataNodeSettings
@@ -36,10 +38,26 @@ def puerto_libre() -> int:
         return s.getsockname()[1]
 
 
+def _verify(url: str):
+    """Como verificar `url` desde las pruebas: la CA de pruebas si es https."""
+    return ca_only_context(material("data").ca_cert) if url.startswith("https://") else True
+
+
+def _tls_cliente(rol: str) -> dict:
+    """Los mismos kwargs de uvicorn que usa `python -m` con C2 encendido."""
+    m = material(rol)
+    return ClientTls(str(m.cert), str(m.key)).uvicorn_kwargs()
+
+
 class _ServidorEnHilo:
-    def __init__(self, app, port: int) -> None:
+    def __init__(self, app, port: int, ssl_kwargs: dict | None = None) -> None:
         config = uvicorn.Config(
-            app, host="127.0.0.1", port=port, log_level="warning", access_log=False
+            app,
+            host="127.0.0.1",
+            port=port,
+            log_level="warning",
+            access_log=False,
+            **(ssl_kwargs or {}),
         )
         self.server = uvicorn.Server(config)
         self.hilo = threading.Thread(target=self.server.run, daemon=True)
@@ -63,9 +81,13 @@ class DataNodeHandle:
     fault_domain: str
     settings: DataNodeSettings
     _servidor: _ServidorEnHilo | None = None
+    #: TLS de cliente (C2) en el puerto que sirve al cliente y a los pares.
+    ssl_kwargs: dict | None = None
 
     def health(self, timeout: float = 5) -> dict:
-        return httpx.get(f"{self.url}/health", timeout=timeout).json()
+        return httpx.get(
+            f"{self.url}/health", timeout=timeout, verify=_verify(self.url)
+        ).json()
 
     @property
     def data_node_id(self) -> str:
@@ -79,7 +101,9 @@ class DataNodeHandle:
         mismo `boot_id` y el ControlNode lo trata como reincorporacion."""
         if self._servidor is not None:
             return
-        self._servidor = _ServidorEnHilo(create_data_app(self.settings), self.port)
+        self._servidor = _ServidorEnHilo(
+            create_data_app(self.settings), self.port, self.ssl_kwargs
+        )
         self._servidor.start()
         _esperar(f"{self.url}/health")
 
@@ -169,6 +193,7 @@ class Cluster:
             f"{self.control_url}/api/v1/cluster/status",
             headers={"Authorization": f"Bearer {token}"},
             timeout=timeout,
+            verify=_verify(self.control_url),
         )
         respuesta.raise_for_status()
         return respuesta.json()
@@ -199,7 +224,7 @@ def _esperar(url: str, timeout: float = 30.0) -> None:
     ultimo: Exception | None = None
     while time.time() < limite:
         try:
-            if httpx.get(url, timeout=2).status_code == 200:
+            if httpx.get(url, timeout=2, verify=_verify(url)).status_code == 200:
                 return
         except Exception as exc:
             ultimo = exc
@@ -217,6 +242,7 @@ def start_cluster(
     replication_factor: int = 1,
     write_quorum: int = 1,
     advertise_muerta: bool = False,
+    tls_cliente: bool = False,
     **control_overrides,
 ) -> Cluster:
     """Levanta el ControlNode y `data_nodes` DataNodes.
@@ -236,11 +262,18 @@ def start_cluster(
     anteriores describen el comportamiento con una replica por bloque: dejarlas heredar
     R=3 no las haria mejores, las haria medir otra cosa. Las pruebas de replicacion piden
     R=3 explicitamente, que es como debe ser: quien necesita tres nodos, los levanta.
+
+    `tls_cliente=True` enciende C2 en el ControlNode y en TODOS los DataNodes, con el
+    mismo `ClientTls` que usa `python -m`. Las direcciones pasan a `https://`, tambien la
+    de par, asi que el pipeline y la re-replicacion viajan por TLS verificando la CA.
+    Las pruebas de C2 anteriores levantaban un solo servidor suelto y no recorrian ese
+    camino, que es por donde se colaba el fallo. Ver `test_tls_cliente.py`.
     """
+    esquema = "https" if tls_cliente else "http"
     puerto_control = puerto_libre()
     puerto_grpc = puerto_libre()
     puerto_interno = puerto_libre()
-    control_url = f"http://127.0.0.1:{puerto_control}"
+    control_url = f"{esquema}://127.0.0.1:{puerto_control}"
 
     control_settings = ControlNodeSettings(
         db_url=f"sqlite:///{(tmp_path / 'dfsha.db').as_posix()}",
@@ -258,7 +291,11 @@ def start_cluster(
         **control_overrides,
     )
 
-    control = _ServidorEnHilo(create_control_app(control_settings), puerto_control)
+    control = _ServidorEnHilo(
+        create_control_app(control_settings),
+        puerto_control,
+        _tls_cliente("control") if tls_cliente else None,
+    )
     control.start()
     _esperar(f"{control_url}/health")
 
@@ -268,11 +305,11 @@ def start_cluster(
     handles: list[DataNodeHandle] = []
     for indice in range(data_nodes):
         puerto = puerto_libre()
-        url = f"http://127.0.0.1:{puerto}"
+        url = f"{esquema}://127.0.0.1:{puerto}"
         data_dir = tmp_path / f"datanode-{indice + 1}"
         # Con `advertise_muerta`, la direccion de cliente apunta a un puerto que nadie
         # escucha: si algun camino nodo-a-nodo la usara, se veria enseguida.
-        anunciada = f"http://127.0.0.1:{puerto_libre()}" if advertise_muerta else url
+        anunciada = f"{esquema}://127.0.0.1:{puerto_libre()}" if advertise_muerta else url
         settings = DataNodeSettings(
             data_dir=str(data_dir),
             control_url=control_url,
@@ -296,6 +333,7 @@ def start_cluster(
             data_dir=data_dir,
             fault_domain=dominios[indice],
             settings=settings,
+            ssl_kwargs=_tls_cliente("data") if tls_cliente else None,
         )
         handle.start()
         handles.append(handle)

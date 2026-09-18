@@ -306,8 +306,9 @@ correspondientes, y **restaura el fichero en un `finally`** pase lo que pase. Di
 mutaciones sobre las cuatro protecciones del patron de la etapa, y una undecima sobre el
 cifrado: devolver el `put` a la rama que subia en claro sin clave (ver «El agujero de la
 0006»). Esa se anadio **despues** de que el fallo apareciera, y demostro que las ocho
-pruebas de cifrado anteriores seguian en verde con el agujero abierto. `--solo N` corre
-una sola.
+pruebas de cifrado anteriores seguian en verde con el agujero abierto. Y tres mas
+sobre C2 (12 a 14): los pares del DataNode sin la CA del proyecto y la URL de la sesion
+que ignoraba la variable. `--solo N` corre una sola.
 
 ### El hallazgo: tres pruebas pasaban por el camino equivocado
 
@@ -369,7 +370,7 @@ a usar otro**.
 
 ### Coste y limite
 
-Once mutaciones tardan unos minutos porque varias arrastran pruebas de integracion. **No
+Catorce mutaciones tardan unos minutos porque varias arrastran pruebas de integracion. **No
 esta en el CI**: se corre a mano al tocar una de las cuatro protecciones, que es cuando
 importa. Meterlo en cada push multiplicaria el tiempo de la suite por el numero de
 mutaciones a cambio de detectar algo que solo cambia cuando alguien edita esos ficheros.
@@ -813,7 +814,7 @@ aparece un `verify=<ruta>` junto a un `cert=` en algun sitio nuevo, es este fall
 
 #### El patron, que es lo que va al informe
 
-Los **diez** fallos serios de la Etapa 3 de esta tabla han sido el mismo tipo de cosa:
+Los **doce** fallos serios de la Etapa 3 de esta tabla han sido el mismo tipo de cosa:
 **algo que aparenta estar puesto y no lo esta**, y ninguno se detecto leyendo el codigo.
 La tabla crecio a lo largo de la etapa; las tres primeras filas son las del codigo del
 Bloque B y C, que es donde se reconocio el patron.
@@ -830,6 +831,8 @@ Bloque B y C, que es donde se reconocio el patron.
 | Los guiones de demostracion (C2) | Cuatro guiones listos para grabar | Ninguno se habia ejecutado; dos **no arrancaban en Windows** y un tercero no mandaba la cadena del pipeline | Ejecutandolos en Windows, donde se graban |
 | El cifrado de los usuarios anteriores a la 0006 | Todo archivo se cifraba en el cliente; diez pruebas de cifrado en verde | Sin sal no habia clave, y el `put` **subia en claro sin avisar**. Ningun archivo de la base de desarrollo se cifro nunca | El guion `cifrado_en_reposo`, con sus controles ya fiables, encontro la frase en un `.blk` |
 | `verificar_pruebas.py` | La herramienta que verifica las pruebas | Tenia la raiz del repositorio **escrita a mano** (`F:/DFSha telematica`) y el interprete del venv de esa maquina: solo corria en ella | Leyendo su codigo al anadirle la mutacion 11 |
+| El DataNode con TLS de cliente (C2) | El pipeline y la re-replicacion verificaban a sus pares | Verificaban contra el almacen del **sistema**, sin nuestra CA: con C2, cada reenvio fallaba y el commit daba 409 | Escribiendo los pasos para encender C2, antes de ejecutarlo |
+| Encender C2 (compose, sondas, sesion) | C2 estaba implementado, probado con nueve pruebas y documentado | **No se podia encender**: el compose no pasaba las variables, las sondas fijaban `http://` y el stack no levantaba, y la sesion ignoraba `DFSHA_CONTROL_URL` | Lo mismo: intentar escribir los pasos exactos |
 
 **El cuarto (`details`) es distinto de los tres primeros, y esa diferencia es lo que va
 al informe.** Los tres primeros se manifestaban como un **fallo**: un 409, una conexion cerrada, una descarga
@@ -862,17 +865,17 @@ codigo hasta las pruebas y la documentacion**.
 
 | Donde | Casos | Cuantos |
 |---|---|---|
-| **Codigo** | el direccionamiento, `cert=` de httpx, `blocks.size` | 3 |
+| **Codigo** | el direccionamiento, `cert=` de httpx, `blocks.size`, y los pares del DataNode sin la CA con C2 | 4 |
 | **Cliente** | los `details` descartados desde la Etapa 1 | 1 |
 | **Documentacion** | el arranque rapido con un secreto muerto y sin los certificados | 1 |
-| **Arranque** | el `__main__.py` que no compilaba, el `.env` vacio que tumbaba el DataNode en AWS, los guiones de demostracion que no arrancaban en Windows, y `verificar_pruebas.py`, que solo arrancaba en la maquina donde se escribio | 4 |
+| **Arranque** | el `__main__.py` que no compilaba, el `.env` vacio que tumbaba el DataNode en AWS, los guiones de demostracion que no arrancaban en Windows, `verificar_pruebas.py`, que solo arrancaba en la maquina donde se escribio, y C2, que no se podia encender | 5 |
 | **Migracion** | la 0006, que dejo sin sal a los usuarios existentes y con ellos el cifrado desactivado en silencio | 1 |
 | **Pruebas** | tres que pasaban por un camino distinto del que su nombre anunciaba, y la del append «con cifrado» que no comprobaba el cifrado | 4 |
 
-**Catorce casos en seis capas.** Conviene contarlos bien, porque la cifra se cita: las
-**diez** filas de la tabla de fallos de arriba cubren las cinco primeras capas, y la
+**Dieciseis casos en seis capas.** Conviene contarlos bien, porque la cifra se cita: las
+**doce** filas de la tabla de fallos de arriba cubren las cinco primeras capas, y la
 sexta —las **cuatro** pruebas que no probaban— no esta en esa tabla: tres en la seccion
-«Verificacion por mutacion» y la cuarta en «El agujero de la 0006». Decir «diez casos en
+«Verificacion por mutacion» y la cuarta en «El agujero de la 0006». Decir «doce casos en
 seis capas» mezclaria las dos cuentas.
 
 Que se cuenta y que no, para poder defender la cifra: el agujero del cifrado es **un** caso,
@@ -888,7 +891,14 @@ familia que los guiones que no arrancaban en Windows. Va en la lista porque es l
 herramienta que existe para detectar pruebas que no prueban, y la seccion de mutacion ya
 advertia que ella misma podia tener el defecto que busca.
 
-Catorce casos en seis capas distintas no es un descuido puntual: es un **modo de fallo del
+C2 son **dos** casos y no uno, y por una razon que se puede defender: tienen causas
+distintas y capas distintas. Los pares del DataNode sin la CA son un fallo de
+**codigo** que rompia la replicacion; lo demas —compose, sondas, sesion— es que la
+funcionalidad **no se podia encender**, que es un fallo de arranque. Arreglar uno no
+arreglaba el otro. En cambio las seis filas de su tabla de detalle no son seis casos:
+el GC y el guion de failover son la misma causa que sus vecinos.
+
+Dieciseis casos en seis capas distintas no es un descuido puntual: es un **modo de fallo del
 proyecto**. Y tiene una causa comun que conviene nombrar: en todos, **algo dejo de ser
 verdad y lo que lo afirmaba no se entero**, porque nada los ataba. El codigo no comprueba
 que el README sea cierto, una prueba no comprueba que su nombre describa lo que hace, y un
@@ -1562,6 +1572,84 @@ No es azucar: si el camino con TLS fuera uno aparte, seria **uno que nadie ejerc
 desarrollo, y se enteraria de que esta roto el dia del despliegue. Asi las 529 pruebas
 recorren la misma linea que usa el despliegue con TLS, aunque lo hagan en HTTP.
 
+#### C2 estaba implementado y probado, y no se podia encender
+
+**El hallazgo mas fuerte de la etapa, y va al informe con estas palabras**: una
+funcionalidad **implementada, probada con nueve pruebas y documentada**, que **no se podia
+encender**. Y con el matiz que lo hace elocuente: las sondas de salud con `http://` fijo no
+dejaban el stack con mal aspecto en `docker compose ps`; lo dejaban **sin arrancar**,
+porque el balanceador y los DataNodes esperan a sus dependencias con `depends_on:
+service_healthy`. Encenderlo no degradaba el sistema: lo apagaba.
+
+**Es el caso limite del patron de la etapa.** Los demas son «algo dejo de ser verdad y lo
+que lo afirmaba no se entero»: un README que envejecio, una migracion que dejo filas
+atras. Aqui **nunca llego a ser verdad**, y todo lo que lo rodeaba decia que si: el codigo
+existia, las nueve pruebas estaban en verde, el README explicaba que protegia y el
+`.env.example` documentaba las dos variables. Nada de eso comprobaba que se pudiera
+encender, y nadie lo habia encendido.
+
+El parrafo de arriba («el mismo codigo para los dos esquemas») era cierto para el cliente
+y falso para todo lo demas: la regla se aplico en `client/tls.py` y en ningun otro sitio.
+Se descubrio al preparar la validacion de C2 en Docker, **antes de ejecutar nada**, al
+intentar escribir los pasos exactos para encenderlo:
+
+| Pieza | Que pasaba al encender C2 | Efecto |
+|---|---|---|
+| `docker-compose.yml` | No pasaba `DFSHA_CLIENT_TLS_*` a ningun servicio: el entorno va por lista explicita | Ponerlas en el `.env` **no encendia nada** |
+| Sondas de salud (los dos Dockerfiles y el compose) | `http://127.0.0.1` escrito a mano | Servidores sanos declarados enfermos, y con `depends_on: service_healthy` **el stack no levantaba** |
+| `SessionStore.load` | La URL guardada ganaba a `DFSHA_CONTROL_URL`, y `login` parte de ahi | Exportar `https://` **no cambiaba nada**, ni tras un login nuevo |
+| Pipeline y re-replicacion del DataNode | `httpx` con la verificacion por defecto: el almacen del sistema, **sin nuestra CA** | Cada reenvio fallaba por certificado; el nodo responde 201 con una copia, y el commit **409 de quorum** |
+| GC por REST | Igual, `httpx.delete` sin la CA | Cada borrado fallaba (esta vez de forma visible, como `fallos`) |
+| `failover_del_lider.py` | `http://127.0.0.1:8000` dentro del contenedor | No identificaba a ningun lider |
+
+La cuarta fila es la grave, y es **el direccionamiento del Bloque B otra vez**: un camino
+nodo a nodo que en las pruebas no se distingue del correcto. Aqui por partida doble: las
+pruebas de C2 levantaban un **servidor de juguete** (una app con `/eco`) detras de
+`ClientTls`, no el ControlNode ni el DataNode, y el cluster de pruebas corria siempre en
+HTTP. El sintoma, de haberse visto, habria sido el mismo `409 no alcanzan el quorum` que
+ya despisto dos veces hacia la capacidad del cluster.
+
+**Lo que no se hizo fue encenderlo.** Cada pieza tenia su prueba y su prueba estaba en
+verde; ninguna prueba encendia el sistema entero con TLS. Es el mismo hueco que el
+`__main__.py`: lo que decide si la funcionalidad existe para un usuario era justo lo que
+nadie recorria.
+
+**Las dos decisiones de diseno del arreglo que hay que saber defender:**
+
+1. **La sonda decide el esquema con la MISMA variable que decide el servidor**
+   (`DFSHA_CLIENT_TLS_CERT`), asi que **no pueden discrepar**. Es el principio de
+   `verificacion_para` aplicado a la sonda: un solo camino para los dos esquemas, porque
+   uno aparte es uno que nadie ejercita. Dos variables —una para el servidor y otra para
+   la sonda— habrian reproducido exactamente el fallo, esperando a que alguien olvidara
+   cambiar una de las dos.
+2. **nginx VERIFICA al ControlNode contra la CA** (`proxy_ssl_verify on`), no se limita a
+   cifrar. Cifrar sin verificar protege del observador pasivo y de nada mas: cualquiera
+   que contestara en esa IP recibiria el JWT. Y hay una prueba que lo fija
+   (`test_nginx_con_C2_verifica_a_los_ControlNodes`) **porque `proxy_ssl_verify off`
+   habria funcionado a la primera**: es la opcion que nadie quitaria al ver que todo va
+   bien, y la que convierte el segundo tramo en un TLS que aparenta estar puesto.
+
+**El arreglo:**
+
+- Una **sonda** (`common/healthcheck.py`) que elige HTTP o HTTPS con la MISMA variable que
+  el servidor, y verifica contra la CA. Los tres sitios la usan.
+- `DFSHA_CONTROL_URL` explicita **gana** a la guardada.
+- El DataNode construye una vez un contexto con la CA del proyecto (`peer_verify`) y lo
+  usan el pipeline y la re-replicacion; el GC borra por el cliente que ya verificaba.
+- `docker-compose.tls.yml`: un **override** que se superpone para encender y se quita para
+  apagar, sin tocar `.env` ni volumenes. Los pasos estan en el README.
+- **nginx termina TLS en `:8000` y vuelve a cifrar** hacia el ControlNode, verificando
+  (`docker/nginx/dfsha-tls.conf`). Al reves que en `:8443` y `:9000`, y la diferencia es
+  la de siempre: en el plano interno el certificado es la identidad y no puede morir en
+  el balanceador; en el de cliente la identidad es el JWT, que llega intacto dentro de la
+  peticion. Terminar aqui conserva lo que justifica el nivel 7.
+
+Lo fijan `start_cluster(tls_cliente=True)` —el sistema real, con TLS en todos los
+saltos— con `test_con_C2_el_put_del_CLI_replica_por_HTTPS_en_tres_nodos` y
+`test_con_C2_la_rereplicacion_copia_por_HTTPS`, y `tests/unit/test_c2_despliegue.py`
+para las piezas sin red. Las mutaciones 12, 13 y 14 de `verificar_pruebas.py` las ven
+caer.
+
 ### RF3: `open`, `read` por rango, `write` como append, y `lock` con lease
 
 #### El lock: la epoca, por tercera vez
@@ -1864,8 +1952,16 @@ y `docker`, rutas ancladas a la raiz del repositorio, subprocesos en UTF-8.
   codigo (migracion 0008, `put` que se niega sin clave), **pendiente de volver a pasar el
   guion** con el stack reconstruido y un `dfsha login` nuevo.
 
-**Sin validar en Docker**: el guion de cifrado tras el arreglo, el **RF3** (`lock`, `read`
-por rango, `append`) y **C2** (TLS de cliente).
+**Validado despues del arreglo de la 0008**, con `down -v` y la pasada completa en
+Windows (18/09): los **cuatro guiones pasan**. `cifrado_en_reposo` con `wrapped_key`
+confirmado, el bloque en tres nodos concretos y el `grep` sin encontrarlo en ninguno,
+con los controles positivos delante; `failover_del_lider` con relevo en 4,9 s. Y el
+**RF3 a mano**: `lock` exclusivo, `append` con reescritura de la cola cifrada, `unlock`,
+`read` por rango exacto y `get` con las dos lineas.
+
+**Sin validar en Docker: C2**, que ademas no se podia encender hasta este arreglo (ver «C2
+estaba implementado y probado, y no se podia encender»). Los pasos estan en el README,
+«Encender y apagar el TLS de cliente».
 
 ### Intermitente conocido: `test_los_bloques_son_inmutables`
 

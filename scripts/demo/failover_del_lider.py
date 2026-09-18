@@ -61,9 +61,15 @@ LIMITE_RELEVO = 30.0
 #: Se ejecuta DENTRO de cada ControlNode, que es el unico sitio donde «127.0.0.1» es esa
 #: instancia y no la que elija el balanceador. El token llega por el entorno y no en la
 #: linea de ordenes, donde lo veria cualquiera con `ps`.
+#:
+#: HTTP o HTTPS con la misma regla que la sonda de salud (`common/healthcheck.destino`):
+#: con C2 encendido la instancia ya solo habla TLS, y una URL http:// fija hacia que el
+#: guion no identificara a ningun lider.
 _PREGUNTA_IS_SELF = (
     "import os, httpx; "
-    "r = httpx.get('http://127.0.0.1:8000/api/v1/cluster/leadership', "
+    "from dfsha.common.healthcheck import destino; "
+    "url, verify = destino(8000); "
+    "r = httpx.get(url.replace('/health', '/api/v1/cluster/leadership'), verify=verify, "
     "headers={'Authorization': 'Bearer ' + os.environ['DFSHA_DEMO_TOKEN']}, timeout=5); "
     "r.raise_for_status(); print(r.json()['is_self'])"
 )

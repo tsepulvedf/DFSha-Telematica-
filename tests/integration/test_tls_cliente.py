@@ -206,3 +206,145 @@ def test_al_cliente_no_se_le_exige_certificado_en_la_configuracion() -> None:
     kwargs = ClientTls(str(m.cert), str(m.key)).uvicorn_kwargs()
 
     assert kwargs["ssl_cert_reqs"] == ssl.CERT_NONE
+
+
+# --- C2 con el sistema de VERDAD, no con un servidor de juguete ---------------
+#
+# Las pruebas de arriba levantan una app de una ruta (`/eco`) detras de `ClientTls`.
+# Comprueban el TLS, no el sistema con TLS: ninguna monta una cadena de DataNodes sobre
+# HTTPS. Y ahi estaba el fallo: el reenvio del pipeline y la descarga de una
+# re-replicacion hablaban con el vecino con la verificacion por defecto de httpx, que no
+# conoce nuestra CA. Con C2 encendido cada reenvio fallaba por certificado, el nodo
+# respondia 201 con una sola copia (un fallo aguas abajo no tumba la subida) y el commit
+# daba 409 de quorum: el sintoma apuntando a la capacidad del cluster, otra vez.
+#
+# Se vio al preparar la validacion de C2 en Docker: el compose ni siquiera pasaba las
+# variables, y al revisar que haria falta para encenderlo aparecio esto.
+
+RAPIDO_C2 = dict(
+    heartbeat_interval_ms=300,
+    suspect_after_ms=1500,
+    dead_after_ms=3000,
+    membership_interval_ms=100,
+    min_free_bytes=0,
+)
+
+
+@pytest.fixture()
+def cluster_c2(tmp_path, monkeypatch):
+    from tests.integration.cluster import start_cluster
+
+    monkeypatch.setenv(CA_ENV, str(material("control").ca_cert))
+    c = start_cluster(
+        tmp_path,
+        block_size=1024 * 1024,
+        data_nodes=4,
+        fault_domains=["zona-a", "zona-b", "zona-c", "zona-d"],
+        replication_factor=3,
+        write_quorum=2,
+        tls_cliente=True,
+        rereplication_grace_ms=1000,
+        rereplication_interval_ms=200,
+        rereplication_max_per_node=2,
+        **RAPIDO_C2,
+    )
+    try:
+        yield c
+    finally:
+        c.stop()
+
+
+def _esperar_a(condicion, timeout: float = 45.0) -> bool:
+    limite = time.time() + timeout
+    while time.time() < limite:
+        try:
+            if condicion():
+                return True
+        except Exception:
+            pass
+        time.sleep(0.3)
+    return False
+
+
+def test_con_C2_el_put_del_CLI_replica_por_HTTPS_en_tres_nodos(
+    cluster_c2, tmp_path, monkeypatch
+) -> None:
+    """El ciclo del usuario con TLS en TODOS los saltos: CLI -> ControlNode, CLI ->
+    DataNode, y DataNode -> DataNode por el pipeline. Con cifrado, como en el video."""
+    from typer.testing import CliRunner
+
+    from dfsha.client.api import ControlApi
+    from dfsha.client.cli import app
+    from dfsha.client.session import SessionStore
+
+    cluster = cluster_c2
+    assert cluster.control_url.startswith("https://")
+    assert all(n.url.startswith("https://") for n in cluster.nodes)
+
+    casa = tmp_path / "casa"
+    casa.mkdir()
+    monkeypatch.setenv("DFSHA_HOME", str(casa))
+    monkeypatch.setenv("DFSHA_CONTROL_URL", cluster.control_url)
+    runner = CliRunner()
+
+    def cli(*args):
+        resultado = runner.invoke(app, list(args))
+        assert resultado.exit_code == 0, f"{args}: {resultado.output}{resultado.exception}"
+        return resultado
+
+    cli("register", "usuario-c2", "--password", "contrasena-de-prueba")
+    cli("login", "usuario-c2", "--password", "contrasena-de-prueba")
+
+    local = tmp_path / "datos.bin"
+    datos = bytes((i * 7 + 13) % 256 for i in range(3 * 1024 * 1024 + 100))
+    local.write_bytes(datos)
+    cli("put", str(local), "/datos.bin")
+
+    api = ControlApi(SessionStore(casa).load(cluster.control_url))
+    plan = api.open_file("/datos.bin")
+    assert plan.wrapped_key, "con C2 el archivo tiene que seguir subiendose cifrado"
+    assert all(r.base_url.startswith("https://") for b in plan.blocks for r in b.replicas)
+
+    # Lo que fallaba: la cadena. Cada bloque en TRES discos, no en uno.
+    for bloque in plan.blocks:
+        con_copia = [n.name for n in cluster.nodes if bloque.block_id in n.blk_en_disco()]
+        assert len(con_copia) == 3, (
+            f"el bloque {bloque.index} esta en {con_copia}: el pipeline no reenvio por HTTPS"
+        )
+    assert api.stat("/datos.bin").replication_state == "FULLY_REPLICATED"
+
+    bajado = tmp_path / "bajado.bin"
+    cli("get", "/datos.bin", str(bajado))
+    assert bajado.read_bytes() == datos
+
+
+def test_con_C2_la_rereplicacion_copia_por_HTTPS(cluster_c2, tmp_path) -> None:
+    """La otra salida de par: el destino DESCARGA la copia del origen por su direccion
+    de par, que con C2 es https. Sin la CA, la orden fallaba y la copia no volvia nunca."""
+    from dfsha.client.api import ControlApi
+    from dfsha.client.session import Session
+    from dfsha.client.transfer import upload_blocks
+
+    cluster = cluster_c2
+    sesion = Session(control_url=cluster.control_url)
+    api = ControlApi(sesion)
+    api.register("c2-rr", "contrasena-de-prueba")
+    sesion.token = api.login("c2-rr", "contrasena-de-prueba").access_token
+
+    local = tmp_path / "uno.bin"
+    local.write_bytes(b"x" * (1024 * 1024))
+    por_id = {n.data_node_id: n for n in cluster.nodes}
+
+    plan = api.create_file("/uno.bin", 1024 * 1024)
+    bloque_id = plan.blocks[0].block_id
+    upload_blocks(local, plan.blocks, parallel=1)
+    api.commit_file(plan.file_id)
+
+    tenedores = {n for n, h in por_id.items() if bloque_id in h.blk_en_disco()}
+    assert len(tenedores) == 3
+    por_id[sorted(tenedores)[0]].stop()
+
+    libres = set(por_id) - tenedores
+    assert _esperar_a(
+        lambda: any(bloque_id in por_id[n].blk_en_disco() for n in libres)
+    ), "la re-replicacion no copio el bloque por HTTPS al nodo libre"

@@ -171,6 +171,28 @@ MUTACIONES = [
 """,
         ["tests/integration/test_cifrado.py"],
     ),
+    (
+        "12. C2: el pipeline vuelve a reenviar al vecino sin la CA del proyecto",
+        "src/dfsha/data_node/pipeline.py",
+        """            verify=verify,""",
+        """            verify=True,""",
+        ["tests/unit/test_pipeline.py", "tests/integration/test_tls_cliente.py"],
+    ),
+    (
+        "13. C2: la re-replicacion vuelve a descargar del origen sin la CA del proyecto",
+        "src/dfsha/data_node/orders.py",
+        """headers=cabeceras, verify=self._verify""",
+        """headers=cabeceras, verify=True""",
+        ["tests/integration/test_tls_cliente.py"],
+    ),
+    (
+        "14. C2: la URL guardada en la sesion vuelve a ganar a DFSHA_CONTROL_URL",
+        "src/dfsha/client/session.py",
+        """                os.environ.get("DFSHA_CONTROL_URL", "").strip()
+                or datos.get("control_url", control_url)""",
+        """                datos.get("control_url", control_url)""",
+        ["tests/unit/test_c2_despliegue.py"],
+    ),
 ]
 
 

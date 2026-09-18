@@ -37,7 +37,7 @@ USER dfsha
 EXPOSE 8000
 
 HEALTHCHECK --interval=5s --timeout=3s --start-period=5s --retries=10 \
-    CMD python -c "import httpx,sys; sys.exit(0 if httpx.get('http://127.0.0.1:8000/health', timeout=3).status_code==200 else 1)"
+    CMD python -m dfsha.common.healthcheck 8000
 
 # --factory: la app se construye al arrancar, no al importar el modulo, para que la
 # falta de un secreto falle con un mensaje claro en vez de a mitad de la importacion.

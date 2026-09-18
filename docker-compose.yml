@@ -92,7 +92,9 @@ x-controlnode-base: &controlnode-base
     postgres-replica:
       condition: "service_healthy"
   healthcheck:
-    test: ["CMD-SHELL", "python -c \"import httpx,sys; sys.exit(0 if httpx.get('http://127.0.0.1:8000/health', timeout=3).status_code==200 else 1)\""]
+    # HTTP o HTTPS segun DFSHA_CLIENT_TLS_CERT, la misma variable que decide el servidor.
+    # Con una URL http:// fija, encender C2 dejaba el stack sin arrancar. Ver la sonda.
+    test: ["CMD", "python", "-m", "dfsha.common.healthcheck", "8000"]
     interval: "5s"
     timeout: "3s"
     start_period: "10s"

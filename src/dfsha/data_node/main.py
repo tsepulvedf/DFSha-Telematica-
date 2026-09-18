@@ -11,7 +11,7 @@ from fastapi import FastAPI
 
 from dfsha.common.logging import configure_logging, get_logger
 from dfsha.common.proto.gen import control_pb2
-from dfsha.common.tls import TlsMaterial
+from dfsha.common.tls import TlsMaterial, ca_only_context
 from dfsha.control_node.api.errors import install_error_handlers
 from dfsha.data_node.config import DataNodeSettings, load_settings_or_exit
 from dfsha.data_node.control_client import ControlClient, Identity, NodeIdentity
@@ -69,6 +69,13 @@ def create_app(
         else None
     )
     control = control or ControlClient(settings.control_internal_url, tls=tls)
+    # Verificacion para hablar con OTROS DATANODES por su direccion de par: el reenvio
+    # del pipeline y la descarga de una re-replicacion. Con TLS de cliente (C2) esas
+    # direcciones son https:// y el certificado del vecino lo firma NUESTRA CA, que no
+    # esta en el almacen del sistema. Sin esto, cada reenvio fallaba por certificado, el
+    # nodo respondia 201 con una sola copia confirmada, y el commit daba 409 de quorum.
+    # Con http:// httpx ignora el contexto: el mismo codigo sirve con C2 y sin el.
+    peer_verify = ca_only_context(tls.ca_cert) if tls is not None else True
     load = LoadTracker()
     changes = BlockChangeLog()
 
@@ -88,7 +95,9 @@ def create_app(
     # recibe `app.state` y no las piezas sueltas: el `data_node_id` definitivo no se
     # conoce hasta despues del registro, que ocurre en el lifespan.
     app_state_holder = _EstadoDiferido()
-    orders = OrderExecutor(app_state_holder, max_workers=settings.order_workers)
+    orders = OrderExecutor(
+        app_state_holder, max_workers=settings.order_workers, verify=peer_verify
+    )
 
     heartbeat = HeartbeatClient(
         grpc_url=settings.control_grpc_url,
@@ -168,6 +177,7 @@ def create_app(
     app.state.settings = settings
     app.state.orders = orders
     app.state.storage = storage
+    app.state.peer_verify = peer_verify
     app.state.control = control
     app.state.capacity_bytes = capacity
     app.state.data_node_id = identity.data_node_id or "sin-registrar"

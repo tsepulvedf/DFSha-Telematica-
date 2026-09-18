@@ -29,7 +29,7 @@ EXPOSE 8001
 # Intervalo mas largo que el del ControlNode a proposito: /health recorre el disco
 # para contar bloques y bytes, en vez de fiarse de un contador en memoria.
 HEALTHCHECK --interval=15s --timeout=5s --start-period=10s --retries=5 \
-    CMD python -c "import httpx,sys; sys.exit(0 if httpx.get('http://127.0.0.1:8001/health', timeout=3).status_code==200 else 1)"
+    CMD python -m dfsha.common.healthcheck 8001
 
 # Se arranca por el modulo y no por `uvicorn` directamente porque el TLS de cliente es
 # OPCIONAL: un CMD con las banderas puestas obligaria a que todo despliegue tuviera

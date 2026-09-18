@@ -104,7 +104,15 @@ class SessionStore:
             ) from exc
 
         return Session(
-            control_url=datos.get("control_url", control_url),
+            # `DFSHA_CONTROL_URL` explicita GANA a la guardada. Antes era al reves, y la
+            # variable dejaba de tener efecto en cuanto existia una sesion: al encender el
+            # TLS de cliente, exportar `https://...` no cambiaba nada y el CLI seguia
+            # hablando `http://` contra un servidor que ya solo aceptaba TLS. Como `login`
+            # tambien parte de aqui, ni volver a iniciar sesion lo arreglaba.
+            control_url=(
+                os.environ.get("DFSHA_CONTROL_URL", "").strip()
+                or datos.get("control_url", control_url)
+            ),
             token=datos.get("token"),
             username=datos.get("username"),
             cwd=datos.get("cwd", "/"),
