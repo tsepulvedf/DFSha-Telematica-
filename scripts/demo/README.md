@@ -79,6 +79,12 @@ docker compose up --build -d
 dfsha register <usuario> && dfsha login <usuario>
 ```
 
+**Haz un `dfsha login` nuevo después de reconstruir el stack**, aunque ya tuvieras sesión.
+Un usuario creado antes del Bloque C no tenía sal de cifrado y el cliente subía sus
+archivos **en claro sin avisar**; la migración 0008 le da una, pero la sesión guardada
+sigue sin clave hasta que vuelvas a iniciarla. Ahora `put` se niega en vez de subir en
+claro, así que lo notarías, pero en mitad de la grabación.
+
 Para el de re-replicación conviene bajar la espera de gracia, que por defecto son cinco
 minutos. El guion espera la reposición hasta 120 s; con la gracia por defecto termina con
 un aviso (no en rojo), o pásale `--espera-reposicion 400`.
@@ -96,7 +102,8 @@ accidente:
 
 | Guion | Lo que podria pasar por accidente | El control que lo descarta |
 |---|---|---|
-| `cifrado_en_reposo` | un `grep` mal escrito no encuentra nada; o se busca en un nodo **sin** el bloque; o `grep` falla y se lee como «no encontrado» | el **mismo** `grep`, en cada contenedor, sobre la frase en claro; se busca solo en los nodos que **tienen** el `.blk`; y solo el código 1 de `grep` cuenta como «no encontrado» |
+| `cifrado_en_reposo` | un `grep` mal escrito no encuentra nada; o se busca en un nodo **sin** el bloque; o `grep` falla y se lee como «no encontrado» |
+| | que el archivo se subiera **sin cifrar** y el guion tardara tres pasos en notarlo | antes de buscar, el metadato tiene que decir que se subió cifrado (`wrapped_key`) | el **mismo** `grep`, en cada contenedor, sobre la frase en claro; se busca solo en los nodos que **tienen** el `.blk`; y solo el código 1 de `grep` cuenta como «no encontrado» |
 | `replicacion_y_caida` | matar un nodo que **no tenía copias** de ese archivo | se mira dónde están las copias y se mata a uno que **sí** tiene |
 | `failover_del_lider` | matar una instancia que **no era la líder** (2 de 3 no lo son) | se pregunta quién sostiene el lease y se mata a ése |
 | `permisos_y_token` | un DataNode que **rechaza a todo el mundo** devuelve 403 igual | Ana **sí** lee su bloque, y Beto **sí** lee lo compartido |

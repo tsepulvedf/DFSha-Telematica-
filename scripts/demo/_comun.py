@@ -308,6 +308,41 @@ def esperar_cluster(
         time.sleep(2)
 
 
+def mostrar_cluster(demo: Demo, api) -> None:
+    """Vista compacta de `dfsha cluster`, que cabe en una consola de Windows.
+
+    La tabla de Rich, con la salida capturada, se dibuja a 80 columnas y parte la
+    direccion de cada nodo en tres lineas: ilegible en un video. Aqui una linea por nodo,
+    con los mismos datos que importan para la demostracion, leidos por la API.
+    """
+    from urllib.parse import urlparse
+
+    colores = {"ALIVE": VERDE, "SUSPECT": AMARILLO, "DEAD": ROJO}
+    print(f"    {GRIS}$ dfsha cluster   (vista compacta){FIN}")
+    try:
+        estado = api.cluster_status()
+    except Exception as exc:  # noqa: BLE001
+        demo.aviso(f"no se pudo leer el estado del cluster: {exc}")
+        return
+    print(f"    {'DataNode':<22}{'estado':<9}{'dominio':<12}{'bloques':>8}")
+    for n in sorted(estado.nodes, key=lambda n: n.advertise_url):
+        color = colores.get(n.state, "")
+        print(
+            f"    {urlparse(n.advertise_url).netloc:<22}{color}{n.state:<9}{FIN}"
+            f"{n.fault_domain:<12}{n.block_count:>8}"
+        )
+    resumen = f"R={estado.replication_factor} W={estado.write_quorum}"
+    if estado.under_replicated_blocks:
+        resumen += f", {estado.under_replicated_blocks} bloques sub-replicados"
+    try:
+        lider = api.leadership()
+        if lider.leader_id:
+            resumen += f"; lider {lider.leader_id[:8]} (epoca {lider.epoch})"
+    except Exception:  # noqa: BLE001 - en pleno relevo puede fallar un instante
+        pass
+    print(f"    {GRIS}{resumen}{FIN}")
+
+
 def esperar(condicion, limite_s: float, cada_s: float = 1.0):
     """Reintenta `condicion()` hasta que devuelva algo verdadero o venza el plazo.
 

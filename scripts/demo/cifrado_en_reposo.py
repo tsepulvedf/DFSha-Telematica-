@@ -136,7 +136,19 @@ def main(argv: list[str] | None = None) -> int:
         "con R=3 y cuatro nodos, uno no tiene copia: buscar solo ahi daria "
         "«no encontrado» sin demostrar nada"
     )
-    bloques = [b.block_id for b in api.open_file(args.remote).blocks]
+    plan = api.open_file(args.remote)
+    # El primer eslabon de la cadena: si el cliente no cifro, el metadato ya lo dice, y
+    # lo dice con la causa. Sin esto, lo unico que se veria es el grep del paso 5
+    # encontrando la frase, que es el sintoma y no el motivo. Asi se descubrio que los
+    # usuarios anteriores a la migracion 0006 subian en claro.
+    if not demo.afirmar(
+        bool(plan.wrapped_key),
+        "el metadato dice que el archivo se subio CIFRADO (tiene clave envuelta)",
+        "el archivo se subio SIN cifrar: wrapped_key vacia. Tu sesion no tiene clave "
+        "maestra; vuelve a hacer `dfsha login`",
+    ):
+        return demo.terminar("")
+    bloques = [b.block_id for b in plan.blocks]
     rutas = " ".join(f"{args.data_dir}/{b[:2]}/{b}.blk" for b in bloques)
     con_bloque = [
         nodo
@@ -152,12 +164,15 @@ def main(argv: list[str] | None = None) -> int:
         return demo.terminar("")
 
     # --- 5. La comprobacion -------------------------------------------------
-    demo.titulo("Se busca la frase en el disco de esos nodos")
+    demo.titulo("Se busca la frase en los bloques de este archivo, en esos nodos")
     demo.nota("con acceso completo al disco del servidor, y sin la clave")
+    # En los `.blk` de ESTE archivo y no en todo el directorio: el criterio habla de este
+    # bloque. Con `grep -r` sobre todo el disco, un resto de una pasada anterior —la que
+    # destapo el agujero de la 0006 salio antes del `rm` y dejo su bloque en claro— haria
+    # fallar la demostracion aunque el cifrado funcione.
+    ficheros = [f"{args.data_dir}/{b[:2]}/{b}.blk" for b in bloques]
     for nodo in con_bloque:
-        busqueda = demo.correr(
-            "docker", "exec", nodo, "grep", "-rl", MARCA, args.data_dir
-        )
+        busqueda = demo.correr("docker", "exec", nodo, "grep", "-l", MARCA, *ficheros)
         # grep: 0 = encontrado, 1 = NO encontrado (el resultado bueno), 2 = error.
         # Solo el 1 demuestra algo; un 2 es una busqueda que no llego a hacerse.
         if busqueda.returncode == 0:

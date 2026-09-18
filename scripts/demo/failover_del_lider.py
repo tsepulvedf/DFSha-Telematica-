@@ -49,6 +49,7 @@ from _comun import (
     Demo,
     esperar,
     esperar_cluster,
+    mostrar_cluster,
     exigir_docker,
     exigir_sesion,
     sesion_del_cli,
@@ -106,7 +107,7 @@ def main(argv: list[str] | None = None) -> int:
     # Las COMPROBACIONES se hacen sobre la API; `dfsha cluster` es lo que se ve en el
     # video. Raspar texto formateado para decidir envejece mal.
     antes = esperar(lambda: (lid := api.leadership()).leader_id and lid, 30)
-    print("    " + "\n    ".join(demo.dfsha("cluster").stdout.strip().splitlines()[-6:]))
+    mostrar_cluster(demo, api)
     if not antes:
         demo.mal("no hay lider registrado tras 30 s; el cluster no esta listo")
         return demo.terminar("")
@@ -166,7 +167,7 @@ def main(argv: list[str] | None = None) -> int:
         cada_s=0.5,
     )
     relevo_s = time.monotonic() - inicio
-    print("    " + "\n    ".join(demo.dfsha("cluster").stdout.strip().splitlines()[-6:]))
+    mostrar_cluster(demo, api)
 
     if not despues:
         demo.mal(f"nadie tomo el lease en {LIMITE_RELEVO:.0f}s tras la caida")

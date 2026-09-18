@@ -39,6 +39,7 @@ from _comun import (
     Demo,
     esperar,
     esperar_cluster,
+    mostrar_cluster,
     exigir_docker,
     exigir_sesion,
     sesion_del_cli,
@@ -187,7 +188,7 @@ def main(argv: list[str] | None = None) -> int:
         "un nodo DEAD y el resto ALIVE: la caida se detecto",
         f"tras {plazo_dead:.0f}s el ControlNode todavia no marca DEAD al nodo parado",
     )
-    print("    " + "\n    ".join(demo.dfsha("cluster").stdout.strip().splitlines()[-8:]))
+    mostrar_cluster(demo, api)
 
     # --- 8. El cluster repone la copia -------------------------------------
     demo.titulo("El cluster repone las copias que faltan")
