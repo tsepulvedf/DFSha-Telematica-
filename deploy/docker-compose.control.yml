@@ -1,16 +1,16 @@
-# ControlNode en su propia instancia t3.micro.
-#
-# Un solo servicio a proposito: t3.micro es 1 GB de RAM. El .env se lee de la raiz del
-# repositorio, no de deploy/, porque es donde lo deja el README.
+# dfsha-control: el PRIMER ControlNode, en su propia t3.micro. El segundo corre en dfsha-db
+# junto a PostgreSQL y el balanceador; ver deploy/docker-compose.db.yml.
 #
 #   docker compose -f deploy/docker-compose.control.yml up --build -d
 #   docker compose -f deploy/docker-compose.control.yml logs -f
 #
-# UNA SOLA INSTANCIA DE CONTROLNODE, y conviene decir por que: el codigo soporta tres
-# —es lo que hace el compose local— pero tres t3.micro mas no caben en el credito del
-# curso. El lease de liderazgo funciona igual con una: la toma, la renueva, y si muere
-# no hay quien la releve. La ALTA DISPONIBILIDAD se demuestra en local; aqui se
-# demuestra que el mismo codigo corre repartido en maquinas de verdad.
+# Esta instancia es tambien donde corre el CLIENTE (opcion (a) del README, la soportada).
+#
+# Nada llega a este ControlNode directamente: DataNodes y cliente hablan con nginx en
+# dfsha-db, que reparte entre los dos. Por eso matarlo no interrumpe el servicio.
+#
+# SIN INTERPOLACION: todo valor que cambia por despliegue esta escrito en el .env, que es
+# el MISMO fichero que el de dfsha-db. Ver la cabecera de docker-compose.db.yml.
 
 name: "dfsha-control"
 
@@ -20,28 +20,16 @@ services:
       context: ".."
       dockerfile: "docker/control_node.Dockerfile"
     image: "dfsha/control-node:0.3.0"
-    container_name: "dfsha-control-node"
+    container_name: "dfsha-control-node-a"
     env_file:
       - "../.env"
     ports:
-      # 8000 REST: al propio grupo y a tu IP (para usar el cliente).
-      - "8000:8000"
-      # 8443 plano interno con mTLS: SOLO al propio grupo. Aqui va la confirmacion de
-      # cada bloque almacenado y los dos endpoints del GC.
-      - "8443:8443"
-      # 9000 gRPC con mTLS: SOLO al propio grupo.
-      - "9000:9000"
-    environment:
-      DFSHA_GRPC_PORT: "9000"
-      DFSHA_INTERNAL_PORT: "8443"
-      # Los tres ficheros de TLS, montados desde el host. No tienen default en el
-      # codigo: sin ellos el servicio no arranca, y eso es deliberado.
-      DFSHA_TLS_CA_CERT: "/etc/dfsha/certs/ca.crt"
-      DFSHA_TLS_CERT: "/etc/dfsha/certs/control.crt"
-      DFSHA_TLS_KEY: "/etc/dfsha/certs/control.key"
+      # Los tres, SOLO al propio grupo de seguridad: quien los usa es nginx en dfsha-db.
+      - "8000:8000"   # REST de cliente, con TLS (C2)
+      - "8443:8443"   # plano interno, mTLS
+      - "9000:9000"   # gRPC del plano de control, mTLS
     volumes:
-      # Solo lectura, y SOLO los tres ficheros que le tocan. A diferencia del compose
-      # local, aqui NO se monta el directorio entero: ca.key no debe salir de la
-      # maquina que firma. Ver el paso 4 del README.
+      # Solo lectura, y SOLO los tres ficheros que le tocan: ca.key no sale de la maquina
+      # que firma. Ver el paso 4 del README.
       - "/etc/dfsha/certs:/etc/dfsha/certs:ro"
     restart: "unless-stopped"

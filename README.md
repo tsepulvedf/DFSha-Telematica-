@@ -1035,8 +1035,10 @@ tests/               unit/, integration/
 
 ## Despliegue en AWS
 
-Seis instancias `t3.micro` —PostgreSQL, un ControlNode y cuatro DataNodes en dos zonas de
-disponibilidad— con su grupo de seguridad propio. Los pasos exactos, las reglas de red y
+Seis instancias `t3.micro` en dos zonas de disponibilidad: cuatro DataNodes, un
+ControlNode, y una instancia con PostgreSQL, un **segundo ControlNode** y **nginx** delante
+de los dos, para que el relevo del líder se pueda enseñar sobre máquinas reales sin que el
+servicio se interrumpa. Con el TLS de cliente encendido. Los pasos exactos, las reglas de red y
 qué cambia en cada instancia están en **[`deploy/README.md`](deploy/README.md)**.
 
 > **Sin ejecutar todavía.** El material está escrito y revisado, pero nadie lo ha corrido
