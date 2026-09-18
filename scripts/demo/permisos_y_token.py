@@ -25,15 +25,25 @@ comprobaba en un sitio por el que los datos no pasan**.
 
 from __future__ import annotations
 
+import argparse
 import hashlib
 import sys
 
 import httpx
 
-from _comun import CONTROL_URL, TRABAJO, Demo, exigir_docker
+from _comun import (
+    CONTROL_URL,
+    TRABAJO,
+    Demo,
+    esperar_cluster,
+    esperar_control_node,
+    exigir_docker,
+)
 
 from dfsha.client.api import ControlApi
 from dfsha.client.session import Session
+from dfsha.client.tls import verificacion_para
+from dfsha.client.transfer import PIPELINE_HEADER
 from dfsha.common.blocktoken import BLOCK_TOKEN_HEADER
 
 CLAVE = "contrasena-de-la-demo"
@@ -54,50 +64,88 @@ def usuario(nombre: str) -> ControlApi:
 
 
 def subir(api: ControlApi, ruta: str, datos: bytes):
-    """Sube un archivo de un bloque y devuelve el bloque del plan."""
+    """Sube un archivo de un bloque, sin cifrar, y devuelve el bloque del plan.
+
+    Va a mano y no por `dfsha put` porque la demostracion necesita el `block_id` y el
+    token en la mano. Y por ir a mano tiene que hacer lo mismo que el cliente real:
+
+    **La cadena del pipeline es obligatoria.** Sin `X-DFSha-Pipeline` el primer DataNode
+    guarda su copia y no reenvia a nadie: una replica de tres, y el commit falla con
+    `409 no alcanzan el quorum de escritura (W=2)`. La primera version de este guion no la
+    mandaba, y ese 409 se atribuyo a haberlo lanzado demasiado pronto: coincidio con
+    DataNodes todavia arrancando, y las dos explicaciones daban el mismo sintoma.
+    """
     plan = api.create_file(ruta, len(datos))
     bloque = plan.blocks[0]
-    httpx.put(
-        f"{bloque.replicas[0].base_url}/api/v1/blocks/{bloque.block_id}",
+    destino = f"{bloque.replicas[0].base_url.rstrip('/')}/api/v1/blocks/{bloque.block_id}"
+    respuesta = httpx.put(
+        destino,
         content=datos,
         headers={
             "X-DFSha-Checksum": hashlib.sha256(datos).hexdigest(),
+            "Content-Type": "application/octet-stream",
             BLOCK_TOKEN_HEADER: bloque.token,
+            # Copiada TAL CUAL del plan, nunca deducida de `replicas`: son direcciones de
+            # PAR, y las de `replicas` son las del cliente. Ver "Dos direcciones por nodo".
+            **({PIPELINE_HEADER: ",".join(bloque.pipeline)} if bloque.pipeline else {}),
         },
         timeout=60,
+        verify=verificacion_para(destino),
     )
+    if respuesta.status_code != 201:
+        api.abort_file(plan.file_id)
+        raise RuntimeError(
+            f"el DataNode rechazo la subida: HTTP {respuesta.status_code} {respuesta.text}"
+        )
     api.commit_file(plan.file_id)
     return bloque
 
 
 def pedir_bloque(bloque, token: str | None) -> httpx.Response:
+    destino = f"{bloque.replicas[0].base_url.rstrip('/')}/api/v1/blocks/{bloque.block_id}"
     return httpx.get(
-        f"{bloque.replicas[0].base_url}/api/v1/blocks/{bloque.block_id}",
+        destino,
         headers=({BLOCK_TOKEN_HEADER: token} if token else {}),
         timeout=60,
+        verify=verificacion_para(destino),
     )
 
 
-def main() -> int:
+def intentar(accion, *args) -> None:
+    """Para lo que puede existir ya de una pasada anterior: usuario, grupo, directorio."""
+    try:
+        accion(*args)
+    except Exception:  # noqa: BLE001
+        pass
+
+
+def main(argv: list[str] | None = None) -> int:
+    # Sin opciones, pero con parser: sin el, `--help` EJECUTABA la demostracion
+    # entera, parando contenedores incluido.
+    argparse.ArgumentParser(description=__doc__.splitlines()[0]).parse_args(argv)
     demo = Demo(
         "ACLs con grupos, y permisos que alcanzan a los bytes",
         "el DataNode no conoce rutas ni usuarios: el permiso viaja FIRMADO",
     )
     exigir_docker(demo)
     TRABAJO.mkdir(exist_ok=True)
+    # Registrar usuarios exige que el ControlNode conteste; subir, que haya R nodos.
+    esperar_control_node(demo)
 
     sufijo = "demo"
     ana = usuario(f"ana-{sufijo}")
     beto = usuario(f"beto-{sufijo}")
     carla = usuario(f"carla-{sufijo}")
     demo.nota("tres usuarios: Ana (duena), Beto (invitado), Carla (ajena)")
+    esperar_cluster(demo, ana)
+
+    # Una pasada anterior que se corto a medias puede haber dejado el permiso concedido,
+    # y entonces el paso 3 («Beto todavia no tiene acceso») fallaria por un resto.
+    intentar(ana.unshare, "/proyecto", "equipo")
 
     # --- 1. Ana sube algo suyo ---------------------------------------------
     demo.titulo("Ana crea un directorio y sube un archivo")
-    try:
-        ana.mkdir("/proyecto", parents=True)
-    except Exception:  # noqa: BLE001
-        pass
+    intentar(ana.mkdir, "/proyecto", True)
     bloque_de_ana = subir(ana, "/proyecto/secreto.txt", SECRETO)
     demo.ok(f"subido, bloque {bloque_de_ana.block_id[:8]}...")
 
@@ -129,11 +177,9 @@ def main() -> int:
 
     # --- 4. Ana comparte con un grupo --------------------------------------
     demo.titulo("Ana crea un grupo, mete a Beto, y comparte con el grupo")
-    try:
-        ana.create_group("equipo")
-        ana.add_member("equipo", beto.session.username)
-    except Exception:  # noqa: BLE001
-        pass
+    # Por separado: si el grupo ya existia, meter a Beto tiene que seguir haciendose.
+    intentar(ana.create_group, "equipo")
+    intentar(ana.add_member, "equipo", beto.session.username)
     ana.share("/proyecto", "equipo", "read")
     demo.ok("concedido READ sobre /proyecto al grupo 'equipo'")
 

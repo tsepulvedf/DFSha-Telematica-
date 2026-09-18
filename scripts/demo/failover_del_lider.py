@@ -9,13 +9,26 @@ que no manda**. Con tres instancias, dos de ellas no son lideres en ningun momen
 matar una al azar tiene dos tercios de probabilidad de no demostrar nada: el cluster
 seguiria porque nunca dependio de ella.
 
-Por eso este guion **pregunta primero quien es el lider** y mata a ese. Y ademas comprueba
-dos cosas mas que la version ingenua se salta:
+Por eso este guion **pregunta a cada instancia si es ella la que sostiene el lease** y mata
+a esa. Si no consigue identificarla, **para**: seguir matando una cualquiera seria hacer la
+demostracion sin su control positivo, y eso no es una version degradada, es otra
+demostracion que no prueba nada.
+
+Y ademas comprueba dos cosas mas que la version ingenua se salta:
 
 1. Que el relevo **ocurrio**: hay un lider nuevo y es OTRA instancia.
 2. Que **la epoca subio**. Es lo que distingue un relevo de verdad de un lider que sigue
    siendo el mismo, y es el token de aislamiento que impide que el congelado escriba al
    despertar. Un relevo sin subida de epoca seria un fallo silencioso.
+
+## Por que no se identifica al lider por los logs
+
+La primera version buscaba el `leader_id` en las ultimas 400 lineas de log de cada
+contenedor. Fallaba de dos formas sin avisar: con el stack en marcha un rato, la linea
+`leadership.acquired` ya no esta en esas 400; y el sucesor de un relevo anterior registra
+el id del lider viejo como `previous_leader`, asi que el primer contenedor que lo
+mencionara no tenia por que ser el suyo. Preguntarle a cada instancia por `is_self` no
+depende de nada de eso.
 
 ## Lo que NO demuestra, y conviene decirlo
 
@@ -27,67 +40,78 @@ montar con `docker stop` y esta cubierto por
 
 from __future__ import annotations
 
+import argparse
 import sys
 import time
 
-from _comun import Demo, exigir_docker, exigir_sesion, sesion_del_cli
+from _comun import (
+    CONTROLNODES,
+    Demo,
+    esperar,
+    esperar_cluster,
+    exigir_docker,
+    exigir_sesion,
+    sesion_del_cli,
+)
 
-INSTANCIAS = [f"dfsha-control-node-{n}" for n in (1, 2, 3)]
-#: Margen sobre el TTL del lease (6 s por defecto) para que el relevo se haya completado.
-ESPERA_RELEVO = 12.0
+#: Margen sobre el TTL del lease (6 s por defecto). Se espera HASTA esto, no esto.
+LIMITE_RELEVO = 30.0
+
+#: Se ejecuta DENTRO de cada ControlNode, que es el unico sitio donde «127.0.0.1» es esa
+#: instancia y no la que elija el balanceador. El token llega por el entorno y no en la
+#: linea de ordenes, donde lo veria cualquiera con `ps`.
+_PREGUNTA_IS_SELF = (
+    "import os, httpx; "
+    "r = httpx.get('http://127.0.0.1:8000/api/v1/cluster/leadership', "
+    "headers={'Authorization': 'Bearer ' + os.environ['DFSHA_DEMO_TOKEN']}, timeout=5); "
+    "r.raise_for_status(); print(r.json()['is_self'])"
+)
 
 
-def leer_liderazgo(demo: Demo):
-    """Quien manda ahora mismo, leido por la API y no raspando la salida del CLI.
-
-    `dfsha cluster` ya lo muestra —y el guion lo imprime, que es lo que se ve en el
-    video— pero las COMPROBACIONES se hacen sobre el dato estructurado. Raspar texto
-    formateado para tomar decisiones envejece mal: cualquier retoque de la presentacion
-    romperia la demostracion sin que nadie relacionara las dos cosas.
-    """
-    from dfsha.client.api import ControlApi
-
-    try:
-        return ControlApi(sesion_del_cli()).leadership()
-    except Exception as exc:  # noqa: BLE001
-        demo.aviso(f"no se pudo leer el liderazgo por la API: {exc}")
-        return None
-
-
-def contenedor_del_lider(demo: Demo, leader_id: str) -> str | None:
-    """Que contenedor sostiene el lease, mirando sus logs.
-
-    El `leader_id` es el identificador de instancia, no el nombre del contenedor, asi que
-    hay que preguntarle a cada uno si es el suyo. Se mira el log porque es donde la
-    instancia dice su propio id al adquirir.
-    """
-    for nombre in INSTANCIAS:
-        logs = demo.correr(
-            "docker", "logs", "--tail", "400", nombre, mostrar=False
+def contenedor_del_lider(demo: Demo, token: str) -> str | None:
+    """Que contenedor sostiene el lease, preguntandole a cada uno por `is_self`."""
+    for nombre in CONTROLNODES:
+        respuesta = demo.correr(
+            "docker", "exec", "-e", "DFSHA_DEMO_TOKEN", nombre,
+            "python", "-c", _PREGUNTA_IS_SELF,
+            mostrar=False,
+            entorno={"DFSHA_DEMO_TOKEN": token},
         )
-        if leader_id and leader_id in (logs.stdout + logs.stderr):
+        if respuesta.returncode != 0:
+            demo.nota(f"{nombre} no contesto: {respuesta.stderr.strip()[-120:]}")
+            continue
+        if respuesta.stdout.strip() == "True":
             return nombre
     return None
 
 
-def main() -> int:
+def main(argv: list[str] | None = None) -> int:
+    # Sin opciones, pero con parser: sin el, `--help` EJECUTABA la demostracion
+    # entera, parando contenedores incluido.
+    argparse.ArgumentParser(description=__doc__.splitlines()[0]).parse_args(argv)
+    from dfsha.client.api import ControlApi
+
     demo = Demo(
         "Relevo de liderazgo: se mata al lider y el cluster sigue",
         "tres ControlNodes sin estado; manda el que sostiene el lease",
     )
     exigir_docker(demo)
     exigir_sesion(demo)
+    sesion = sesion_del_cli()
+    api = ControlApi(sesion)
+    esperar_cluster(demo, api)
 
     # --- 1. Estado inicial -------------------------------------------------
     demo.titulo("Quien manda ahora")
-    vista = demo.dfsha("cluster")
-    print("    " + "\n    ".join(vista.stdout.strip().splitlines()[-6:]))
-
-    antes = leer_liderazgo(demo)
-    if antes is None or antes.leader_id is None:
-        demo.mal("no hay lider registrado; el cluster no esta listo")
+    # Las COMPROBACIONES se hacen sobre la API; `dfsha cluster` es lo que se ve en el
+    # video. Raspar texto formateado para decidir envejece mal.
+    antes = esperar(lambda: (lid := api.leadership()).leader_id and lid, 30)
+    print("    " + "\n    ".join(demo.dfsha("cluster").stdout.strip().splitlines()[-6:]))
+    if not antes:
+        demo.mal("no hay lider registrado tras 30 s; el cluster no esta listo")
         return demo.terminar("")
     lider_antes, epoca_antes = antes.leader_id, antes.epoch
+    demo.nota(f"lider {lider_antes[:8]}..., epoca {epoca_antes}")
 
     # --- 2. EL CONTROL POSITIVO: identificar al lider de verdad ------------
     demo.titulo("Se identifica el CONTENEDOR del lider")
@@ -95,15 +119,14 @@ def main() -> int:
         "matar una instancia al azar tendria dos tercios de probabilidad de matar a "
         "una que no manda, y entonces que el cluster siga no demostraria nada"
     )
-    victima = contenedor_del_lider(demo, lider_antes)
-    if victima is None:
-        demo.aviso(
-            "no se identifico el contenedor del lider en los logs; se usa el primero "
-            "como aproximacion, y la demostracion pierde su control positivo"
-        )
-        victima = INSTANCIAS[0]
-    else:
-        demo.ok(f"{victima} sostiene el lease (instancia {lider_antes[:12]}...)")
+    victima = contenedor_del_lider(demo, sesion.token or "")
+    if not demo.afirmar(
+        victima is not None,
+        f"{victima} responde is_self=True: sostiene el lease",
+        "ninguna instancia dice sostener el lease; sin saber a quien matar, la "
+        "demostracion no tendria control positivo",
+    ):
+        return demo.terminar("")
 
     # --- 3. Algo que funcione antes ----------------------------------------
     demo.titulo("El namespace responde ANTES de matar nada")
@@ -112,7 +135,7 @@ def main() -> int:
     demo.afirmar(
         antes_ls.returncode == 0,
         "el cluster responde con normalidad",
-        "el cluster ya fallaba antes de tocar nada",
+        f"el cluster ya fallaba antes de tocar nada: {antes_ls.stderr.strip()}",
     )
 
     # --- 4. Matar al lider -------------------------------------------------
@@ -126,30 +149,33 @@ def main() -> int:
     demo.afirmar(
         durante.returncode == 0,
         "las lecturas y escrituras no se interrumpen",
-        "el cluster dejo de responder al perder al lider",
+        f"el cluster dejo de responder al perder al lider: {durante.stderr.strip()}",
     )
     demo.nota(
-        "puede responder cualquiera de las tres: lecturas, planes de escritura y "
+        "puede responder cualquiera de las otras dos: lecturas, planes de escritura y "
         "autenticacion NO necesitan liderazgo. El lease solo hace falta para evaluar "
         "la pertenencia y programar re-replicaciones"
     )
 
     # --- 6. El relevo, con la epoca subiendo -------------------------------
-    demo.esperar(ESPERA_RELEVO, "que el lease venza y otra instancia lo tome")
     demo.titulo("Hay lider nuevo, y la epoca SUBIO")
-    vista = demo.dfsha("cluster")
-    print("    " + "\n    ".join(vista.stdout.strip().splitlines()[-6:]))
+    demo.nota(f"esperando a que el lease venza y otra instancia lo tome (hasta {LIMITE_RELEVO:.0f}s)")
+    despues = esperar(
+        lambda: (lid := api.leadership()).leader_id not in (None, lider_antes) and lid,
+        LIMITE_RELEVO,
+        cada_s=0.5,
+    )
+    relevo_s = time.monotonic() - inicio
+    print("    " + "\n    ".join(demo.dfsha("cluster").stdout.strip().splitlines()[-6:]))
 
-    despues = leer_liderazgo(demo)
-    if despues is None or despues.leader_id is None:
-        demo.mal("nadie tomo el lease tras la caida")
+    if not despues:
+        demo.mal(f"nadie tomo el lease en {LIMITE_RELEVO:.0f}s tras la caida")
+        demo.correr("docker", "start", victima)
         return demo.terminar("")
 
-    demo.afirmar(
-        despues.leader_id != lider_antes,
-        f"el lease cambio de manos en {time.monotonic() - inicio:.1f} s "
-        f"({lider_antes[:8]} -> {despues.leader_id[:8]})",
-        "el lider sigue siendo el mismo identificador",
+    demo.ok(
+        f"el lease cambio de manos en {relevo_s:.1f} s "
+        f"({lider_antes[:8]} -> {despues.leader_id[:8]})"
     )
     demo.afirmar(
         despues.epoch > epoca_antes,
@@ -161,6 +187,18 @@ def main() -> int:
     # --- 7. Devolver la instancia ------------------------------------------
     demo.titulo(f"Se vuelve a levantar {victima}")
     demo.correr("docker", "start", victima)
+    sano = esperar(
+        lambda: demo.correr(
+            "docker", "inspect", "-f", "{{.State.Health.Status}}", victima, mostrar=False
+        ).stdout.strip()
+        == "healthy",
+        90,
+        cada_s=2,
+    )
+    if sano:
+        demo.ok(f"{victima} vuelve a estar healthy")
+    else:
+        demo.aviso(f"{victima} no llego a healthy en 90 s; mira `docker compose ps`")
     demo.nota(
         "al volver NO recupera el mando: el lease es de otro y sigue vivo. Y si lo "
         "recuperase mas adelante, seria con una epoca NUEVA, nunca con la que tenia"

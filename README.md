@@ -1038,8 +1038,10 @@ disponibilidad— con su grupo de seguridad propio. Los pasos exactos, las regla
 qué cambia en cada instancia están en **[`deploy/README.md`](deploy/README.md)**.
 
 > **Sin ejecutar todavía.** El material está escrito y revisado, pero nadie lo ha corrido
-> en una cuenta de AWS. El despliegue local con `docker compose` sí está verificado de
-> punta a punta.
+> en una cuenta de AWS. El despliegue local con `docker compose` sí está verificado:
+> arranque de los diez servicios, clúster 4/4, liderazgo y un `put` de 50 MB con R=3. Lo
+> que falta validar en Docker —RF3, TLS de cliente y una pasada completa de los guiones
+> de demostración— está listado en CLAUDE.md, «Estado de la validacion en Docker».
 
 ## Alcance de esta etapa
 

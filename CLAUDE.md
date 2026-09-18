@@ -802,7 +802,7 @@ aparece un `verify=<ruta>` junto a un `cert=` en algun sitio nuevo, es este fall
 
 #### El patron, que es lo que va al informe
 
-Los **siete** fallos serios de la Etapa 3 de esta tabla han sido el mismo tipo de cosa:
+Los **ocho** fallos serios de la Etapa 3 de esta tabla han sido el mismo tipo de cosa:
 **algo que aparenta estar puesto y no lo esta**, y ninguno se detecto leyendo el codigo.
 La tabla crecio a lo largo de la etapa; las tres primeras filas son las del codigo del
 Bloque B y C, que es donde se reconocio el patron.
@@ -816,6 +816,7 @@ Bloque B y C, que es donde se reconocio el patron.
 | El README del arranque rapido | Los comandos levantaban el cluster | Generaba un secreto que ya no se lee y **no mencionaba los certificados** | Actualizando la documentacion, no usandola |
 | El punto de entrada (C2) | 529 pruebas en verde decian que el servicio estaba bien | `__main__.py` **no compilaba**: ninguna prueba lo importaba | Levantando el stack |
 | `CAPACITY_BYTES=` vacia (AWS, desde la Etapa 2) | Seguir el ejemplo de despliegue levantaba el DataNode | El DataNode **no arrancaba**; el compose local lo tapaba con un default | Ejecutando el punto de entrada, no compilandolo |
+| Los guiones de demostracion (C2) | Cuatro guiones listos para grabar | Ninguno se habia ejecutado; dos **no arrancaban en Windows** y un tercero no mandaba la cadena del pipeline | Ejecutandolos en Windows, donde se graban |
 
 **El cuarto (`details`) es distinto de los tres primeros, y esa diferencia es lo que va
 al informe.** Los tres primeros se manifestaban como un **fallo**: un 409, una conexion cerrada, una descarga
@@ -851,15 +852,15 @@ codigo hasta las pruebas y la documentacion**.
 | **Codigo** | el direccionamiento, `cert=` de httpx, `blocks.size` | 3 |
 | **Cliente** | los `details` descartados desde la Etapa 1 | 1 |
 | **Documentacion** | el arranque rapido con un secreto muerto y sin los certificados | 1 |
-| **Arranque** | el `__main__.py` que no compilaba, y el `.env` vacio que tumbaba el DataNode en AWS | 2 |
+| **Arranque** | el `__main__.py` que no compilaba, el `.env` vacio que tumbaba el DataNode en AWS, y los guiones de demostracion que no arrancaban en Windows | 3 |
 | **Pruebas** | tres que pasaban por un camino distinto del que su nombre anunciaba | 3 |
 
-**Diez casos en cinco capas.** Conviene contarlos bien, porque la cifra se cita: las
-**siete** filas de la tabla de fallos de arriba cubren las cuatro primeras capas, y la
+**Once casos en cinco capas.** Conviene contarlos bien, porque la cifra se cita: las
+**ocho** filas de la tabla de fallos de arriba cubren las cuatro primeras capas, y la
 quinta —las **tres** pruebas que no probaban— esta en la seccion «Verificacion por
-mutacion», no en esa tabla. Decir «siete casos en cinco capas» mezclaria las dos cuentas.
+mutacion», no en esa tabla. Decir «ocho casos en cinco capas» mezclaria las dos cuentas.
 
-Diez casos en cinco capas distintas no es un descuido puntual: es un **modo de fallo del
+Once casos en cinco capas distintas no es un descuido puntual: es un **modo de fallo del
 proyecto**. Y tiene una causa comun que conviene nombrar: en todos, **algo dejo de ser
 verdad y lo que lo afirmaba no se entero**, porque nada los ataba. El codigo no comprueba
 que el README sea cierto, una prueba no comprueba que su nombre describa lo que hace, y un
@@ -888,6 +889,15 @@ responde».
 | Direccionamiento | `409 no alcanzan el quorum de escritura (W=2)` | Capacidad o carga del cluster | Red: una URL valida solo desde el host |
 | `cert=` de httpx | «Server disconnected without sending a response» | Un fallo del **servidor** | Un fallo del **cliente**, que no presento su certificado |
 | `blocks.size` | «ninguna de las 1 replicas pudo servir el bloque» | **Disponibilidad**: no hay copias vivas | **Tamanos**: la unica copia estaba bien y se rechazaba |
+
+Y un cuarto, de los guiones de demostracion, que anade algo que los tres de arriba no
+tienen: **una explicacion falsa que encajaba con todo**. `permisos_y_token` fallo con el
+mismo `409 no alcanzan el quorum de escritura (W=2)` que el direccionamiento, y coincidio
+con haberlo lanzado segundos despues del `up`, con DataNodes aun arrancando. La causa real
+era que el guion subia el bloque sin la cabecera del pipeline. Un sintoma con **dos causas
+plausibles** se cierra con la primera que aparece, y la prueba que parecia confirmarla —un
+`put` a mano que si funcionaba— recorria un camino distinto del del guion. Ver «Los
+guiones de demostracion» mas abajo.
 
 El tercero es el ejemplo mas limpio. El relevo de replicas del Bloque B —que es correcto y
 hace exactamente lo que debe— captura el `StorageError`, prueba la siguiente replica,
@@ -1672,6 +1682,77 @@ Dos lecciones, y la segunda es la nueva:
    prueba nueva cubre el primero para siempre; el segundo lo cubre su propia prueba, pero
    el patron —el camino local enmascara el de despliegue— es el mismo del
    direccionamiento del Bloque B, y el remedio tambien: ejecutar lo que se va a desplegar.
+
+### Los guiones de demostracion: arrancar en Linux no es arrancar en Windows
+
+**Caso nuevo de la lista del informe.** Los cuatro guiones de `scripts/demo/` estaban
+entre los ocho ficheros de `scripts/` que ninguna prueba importaba (ver la tabla de
+arriba), y **ninguno se habia ejecutado nunca** cuando se fueron a grabar. Se graban en
+Windows. Al primer intento:
+
+| Guion | Sintoma | Causa |
+|---|---|---|
+| `cifrado_en_reposo` | `FileNotFoundError: [WinError 2]` | El control positivo llamaba a `grep` **en el host**, y Windows no lo tiene |
+| `replicacion_y_caida` | «no se pudo generar el archivo de prueba» | Invocaba `gen_testfile.py destino 8M`; el script pide `--size 8MB` |
+| `permisos_y_token` | `409 no alcanzan el quorum de escritura (W=2)` | Subia el bloque a mano **sin `X-DFSha-Pipeline`**: una copia de tres |
+
+Los dos primeros son invocaciones que nunca se ejecutaron: compilaban, y `test_todo_compila`
+no puede ver un argumento que el otro script no acepta ni un ejecutable que el host no
+tiene. **La leccion que anade: arrancar en Linux no es arrancar en Windows**, igual que la
+del `__main__.py` fue que compilar no es arrancar.
+
+**El tercero se atribuyo primero a otra causa**, y es el ejemplo mas limpio de «el sintoma
+apunta a otro sitio» (ver esa seccion): el guion se lanzo segundos despues del `up`, con
+DataNodes aun en `health: starting`, y eso explicaba el 409 de forma perfectamente
+plausible. Un `put` a mano despues funciono, lo que parecia confirmarlo —pero el `put` del
+CLI **si** manda la cadena—. La causa real solo aparecio al revisar el guion linea a linea
+buscando fallos «del mismo tipo que los otros dos».
+
+Revisados con esa lupa, los cuatro tenian mas fallos que no habian llegado a verse, y todos
+del mismo tipo: **comprobaciones que podian dar el resultado bueno por accidente** —justo lo
+que el control positivo de cada guion existe para impedir—.
+
+- `cifrado_en_reposo` buscaba solo en `data-node-1` (con R=3 y cuatro nodos, uno de cada
+  cuatro bloques no esta ahi) y trataba el codigo 2 de `grep` —error— como «no
+  encontrado». Un `--data-dir` mal escrito daba el criterio 11 por cumplido.
+- `replicacion_y_caida` comprobaba DEAD un instante despues de parar el nodo, cuando DEAD
+  llega a los 30 s: habria fallado siempre. Ahora espera cada transicion con plazo, y
+  comprueba la reposicion de verdad en vez de pedir que se mire a mano.
+- `failover_del_lider` identificaba al lider buscando su id en las ultimas 400 lineas de
+  log, que con el stack en marcha un rato ya no lo contienen, y el sucesor de un relevo
+  anterior lo registra como `previous_leader`. Si no lo encontraba, **mataba a
+  `control-node-1` y seguia** con un aviso: la demostracion sin su control positivo. Ahora
+  pregunta `is_self` a cada instancia desde dentro de su contenedor, y si no identifica al
+  lider, para.
+- `failover_del_lider` y `permisos_y_token` **no tenian parser de argumentos**, asi que
+  `--help` ejecutaba la demostracion entera, parada de contenedores incluida. Se descubrio
+  asi, contra el stack de un integrante.
+
+Todos esperan ahora al cluster antes de empezar (`_comun.esperar_cluster`: al menos R
+DataNodes ALIVE, con reintento) y siguen las reglas de `_comun.py`: en el host solo Python
+y `docker`, rutas ancladas a la raiz del repositorio, subprocesos en UTF-8.
+
+### Estado de la validacion en Docker
+
+*Para no volver a escribir «sin validar» de lo que si lo esta, ni al reves.*
+
+**Validado a mano** tras el arreglo del `__main__.py`, con `docker compose up --build -d`:
+
+- Los diez servicios levantan y quedan `healthy`, los tres ControlNodes con `python -m`.
+- `dfsha cluster`: 4/4 ALIVE en cuatro dominios, liderazgo en epoca 8, el balanceador
+  repartiendo entre instancias.
+- `dfsha put` de 50 MB con bloques de 1 MB: commit correcto, `FULLY_REPLICATED`.
+
+**Con evidencia parcial**, por una ejecucion no planeada de los guiones corregidos (la del
+`--help` de arriba). No se vio su salida; lo que sigue sale de los logs:
+
+- `failover_del_lider`: el lease paso a `control-node-3` y la epoca subio de 8 a 9.
+- `permisos_y_token`: dos commits con `replication.quorum_met`, y el DataNode rechazo los
+  dos intentos de Carla por el motivo correcto —«falta el token de bloque» y «el token es
+  para otro bloque»—. Es la primera evidencia en Docker del **token de bloque**.
+
+**Sin validar en Docker**: una pasada completa y vista de los cuatro guiones corregidos, el
+**RF3** (`lock`, `read` por rango, `append`) y **C2** (TLS de cliente).
 
 ### Intermitente conocido: `test_los_bloques_son_inmutables`
 

@@ -4,6 +4,12 @@ Cuatro escenarios de la Etapa 3, pensados para grabarse. Cada uno narra lo que h
 imprime los comandos que ejecuta y **comprueba el resultado**: si algo no sale como debe,
 termina en rojo y con código de salida distinto de cero.
 
+**Funcionan en Windows**, que es donde se graban: en el host solo usan Python y `docker`
+(el `grep` y el `find` corren dentro de los contenedores), y se pueden lanzar desde
+cualquier directorio. **Esperan solos a que el clúster esté listo** —al menos R DataNodes
+ALIVE— antes de empezar, así que lanzarlos justo después del `up` ya no da un 409 que
+parezca del sistema.
+
 En el orden recomendado, que se explica más abajo:
 
 ```bash
@@ -25,17 +31,11 @@ sale mal en los dos últimos ya tienes grabado lo que no depende de ellos.
 | 3 | `replicacion_y_caida` | **para y levanta un DataNode** | puede dejar bloques con **4 copias** |
 | 4 | `failover_del_lider` | **para y levanta un ControlNode** | la época sube de forma permanente |
 
-### Entre el 3 y el 4: espera a que el nodo vuelva
+### Entre el 3 y el 4: el nodo vuelve solo
 
-`replicacion_y_caida` levanta el DataNode al terminar, pero **volver no es instantáneo**:
-el nodo tiene que registrarse otra vez y mandar un block report completo. Antes de seguir:
-
-```bash
-dfsha cluster       # los cuatro DataNodes tienen que salir ALIVE
-```
-
-Suele tardar menos de diez segundos. Si sigues sin esperar, el guion siguiente puede
-encontrarse un clúster con un nodo DEAD y la lectura sería más confusa de lo necesario.
+`replicacion_y_caida` levanta el DataNode al terminar y **espera** a que los cuatro vuelvan
+a estar ALIVE (hasta 90 s). Si termina con un aviso de que no volvió, mira `dfsha cluster`
+antes de seguir.
 
 ### Después del 3: cuatro copias en algunos bloques
 
@@ -80,10 +80,12 @@ dfsha register <usuario> && dfsha login <usuario>
 ```
 
 Para el de re-replicación conviene bajar la espera de gracia, que por defecto son cinco
-minutos:
+minutos. El guion espera la reposición hasta 120 s; con la gracia por defecto termina con
+un aviso (no en rojo), o pásale `--espera-reposicion 400`.
 
 ```bash
-DFSHA_REREPLICATION_GRACE_MS=30000 docker compose up -d
+DFSHA_REREPLICATION_GRACE_MS=30000 docker compose up -d        # bash
+$env:DFSHA_REREPLICATION_GRACE_MS=30000; docker compose up -d  # PowerShell
 ```
 
 ## La regla que siguen los cuatro: control positivo junto al negativo
@@ -94,7 +96,7 @@ accidente:
 
 | Guion | Lo que podria pasar por accidente | El control que lo descarta |
 |---|---|---|
-| `cifrado_en_reposo` | un `grep` mal escrito no encuentra nada en ningún sitio | el **mismo** `grep` contra el fichero local, donde sí tiene que encontrar |
+| `cifrado_en_reposo` | un `grep` mal escrito no encuentra nada; o se busca en un nodo **sin** el bloque; o `grep` falla y se lee como «no encontrado» | el **mismo** `grep`, en cada contenedor, sobre la frase en claro; se busca solo en los nodos que **tienen** el `.blk`; y solo el código 1 de `grep` cuenta como «no encontrado» |
 | `replicacion_y_caida` | matar un nodo que **no tenía copias** de ese archivo | se mira dónde están las copias y se mata a uno que **sí** tiene |
 | `failover_del_lider` | matar una instancia que **no era la líder** (2 de 3 no lo son) | se pregunta quién sostiene el lease y se mata a ése |
 | `permisos_y_token` | un DataNode que **rechaza a todo el mundo** devuelve 403 igual | Ana **sí** lee su bloque, y Beto **sí** lee lo compartido |
