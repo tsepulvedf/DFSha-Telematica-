@@ -152,7 +152,9 @@ exit
 
 ```bash
 ssh -i <tu-clave.pem> ubuntu@<IP_PUBLICA>
-git clone https://github.com/tsepulvedf/DFSha-Telematica-.git
+# --branch main: sin ella se clona la rama por defecto de GitHub, que fue etapa-1
+# hasta el hito 3 y habria desplegado la primera etapa en las seis instancias.
+git clone --branch main https://github.com/tsepulvedf/DFSha-Telematica-.git
 cd DFSha-Telematica-
 ```
 

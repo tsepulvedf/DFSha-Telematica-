@@ -59,7 +59,9 @@ Es a propósito: los secretos no tienen valor por defecto en el código, porque 
 defecto en un repositorio público es un hallazgo de seguridad.
 
 ```bash
-git clone https://github.com/tsepulvedf/DFSha-Telematica-.git
+# --branch main: la rama por defecto de GitHub fue etapa-1 hasta el hito 3, y sin esto
+# se obtenia el codigo de la primera etapa. Ver «La rama por defecto» en CLAUDE.md.
+git clone --branch main https://github.com/tsepulvedf/DFSha-Telematica-.git
 cd DFSha-Telematica-
 ```
 
