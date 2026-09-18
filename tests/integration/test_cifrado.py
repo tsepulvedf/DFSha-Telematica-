@@ -284,3 +284,95 @@ def test_los_archivos_sin_cifrar_de_etapas_anteriores_se_siguen_bajando(
     destino = tmp_path / "viejo-bajado.bin"
     download_blocks(destino, lectura.blocks, parallel=1)
     assert destino.read_bytes() == claro
+
+
+# --- El camino REAL del cliente -----------------------------------------------
+#
+# Las pruebas de arriba reimplementan los pasos de `dfsha put` en `_subir_cifrado`, y es
+# la PRUEBA la que decide cifrar. La decision que toma el cliente —cifrar si la sesion
+# tiene clave, y antes, si no la tenia, subir en claro sin avisar— no la recorria ninguna.
+# Por esa rama subio en claro todo usuario anterior a la migracion 0006, con estas pruebas
+# en verde. Lo encontro el guion `cifrado_en_reposo.py`, no la suite.
+#
+# Estas dos pasan por el CLI entero: login, put, y el `.blk` en disco.
+
+
+def _cli(cluster, tmp_path, monkeypatch):
+    from typer.testing import CliRunner
+
+    from dfsha.client.cli import app
+
+    casa = tmp_path / "casa"
+    casa.mkdir()
+    monkeypatch.setenv("DFSHA_HOME", str(casa))
+    monkeypatch.setenv("DFSHA_CONTROL_URL", cluster.control_url)
+    runner = CliRunner()
+    return lambda *args: runner.invoke(app, list(args)), casa
+
+
+def _blks_con_la_marca(cluster: Cluster) -> list[str]:
+    return [
+        blk.name
+        for blk in (cluster.nodes[0].data_dir / "blocks").rglob("*.blk")
+        if MARCA in blk.read_bytes()
+    ]
+
+
+def test_el_put_del_CLI_cifra_lo_que_queda_en_disco(cluster, tmp_path, monkeypatch) -> None:
+    """Criterio 11 por el camino que usa una persona, con un archivo como el del guion.
+
+    62 bytes, un bloque incompleto: el mismo caso que destapo el fallo en Docker.
+    """
+    from dfsha.client.session import SessionStore
+
+    cli, casa = _cli(cluster, tmp_path, monkeypatch)
+    assert cli("register", "cli-cifra", "--password", CONTRASENA).exit_code == 0
+    assert cli("login", "cli-cifra", "--password", CONTRASENA).exit_code == 0
+
+    local = tmp_path / "claro.txt"
+    local.write_bytes(MARCA + b"-" * (61 - len(MARCA)) + b"\n")
+    assert local.stat().st_size == 62
+
+    resultado = cli("put", str(local), "/claro.txt")
+    assert resultado.exit_code == 0, resultado.output
+
+    api = ControlApi(SessionStore(casa).load(cluster.control_url))
+    plan = api.open_file("/claro.txt")
+    assert plan.wrapped_key, "el put del CLI confirmo el archivo SIN clave envuelta"
+
+    blk = _blk(cluster, plan.blocks[0].block_id)
+    assert MARCA not in blk.read_bytes(), "el put del CLI dejo el texto claro en disco"
+    assert blk.stat().st_size == 62 + TAG_BYTES
+
+
+def test_un_usuario_sin_sal_no_sube_en_claro(cluster, tmp_path, monkeypatch) -> None:
+    """El estado exacto que dejaba la 0006 en un usuario anterior: `kdf_salt` vacia.
+
+    Antes, el login no derivaba clave y el put subia en claro con codigo 0. Ahora el put se
+    niega, no confirma nada, y no deja la frase en ningun disco.
+    """
+    from sqlalchemy import text
+
+    from dfsha.control_node.repositories.database import build_engine
+
+    cli, _ = _cli(cluster, tmp_path, monkeypatch)
+    assert cli("register", "sin-sal", "--password", CONTRASENA).exit_code == 0
+    with build_engine(cluster.settings.db_url).begin() as conexion:
+        conexion.execute(text("UPDATE users SET kdf_salt = '' WHERE username = 'sin-sal'"))
+
+    login = cli("login", "sin-sal", "--password", CONTRASENA)
+    assert login.exit_code == 0
+    assert "sal de cifrado" in login.output, "el login no avisa de que no podra cifrar"
+
+    antes = set(_blks_con_la_marca(cluster))
+    local = tmp_path / "claro.txt"
+    local.write_bytes(MARCA + b"\n")
+
+    resultado = cli("put", str(local), "/claro.txt")
+
+    assert resultado.exit_code != 0, "el put subio sin clave de cifrado"
+    # Rich parte las lineas por el ancho: se compara sin saltos.
+    assert "no sube archivos en claro" in " ".join(resultado.output.split())
+    assert set(_blks_con_la_marca(cluster)) == antes, "quedo texto claro en disco"
+    assert cli("ls", "/").output.count("claro.txt") == 0
+

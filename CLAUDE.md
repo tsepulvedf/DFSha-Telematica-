@@ -303,7 +303,11 @@ Si no caen, la prueba no cubre lo que su nombre anuncia.
 
 Lo automatiza `scripts/verificar_pruebas.py`: aplica una mutacion, corre las pruebas
 correspondientes, y **restaura el fichero en un `finally`** pase lo que pase. Diez
-mutaciones sobre las cuatro protecciones del patron de la etapa.
+mutaciones sobre las cuatro protecciones del patron de la etapa, y una undecima sobre el
+cifrado: devolver el `put` a la rama que subia en claro sin clave (ver «El agujero de la
+0006»). Esa se anadio **despues** de que el fallo apareciera, y demostro que las ocho
+pruebas de cifrado anteriores seguian en verde con el agujero abierto. `--solo N` corre
+una sola.
 
 ### El hallazgo: tres pruebas pasaban por el camino equivocado
 
@@ -356,9 +360,16 @@ tamano que cada mitad interpretaba a su manera, unos `details` que el cliente ti
 Las pruebas que no prueban son **el mismo fallo aplicado a la verificacion**. Y la
 herramienta que lo detecta podria tenerlo tambien, por eso el aviso de arriba.
 
+Y tenia uno de otro tipo, que no se vio hasta anadirle la mutacion 11: la raiz del
+repositorio y el interprete estaban **escritos a mano** con la ruta de la maquina donde se
+escribio. En cualquier otra no arrancaba. Ahora salen de `__file__` y `sys.executable`.
+Fallaba de forma ruidosa, no silenciosa, pero sigue siendo el mismo aviso: **la
+herramienta que verifica tambien hay que verificarla, y eso incluye ejecutarla donde la va
+a usar otro**.
+
 ### Coste y limite
 
-Diez mutaciones tardan unos minutos porque varias arrastran pruebas de integracion. **No
+Once mutaciones tardan unos minutos porque varias arrastran pruebas de integracion. **No
 esta en el CI**: se corre a mano al tocar una de las cuatro protecciones, que es cuando
 importa. Meterlo en cada push multiplicaria el tiempo de la suite por el numero de
 mutaciones a cambio de detectar algo que solo cambia cuando alguien edita esos ficheros.
@@ -802,7 +813,7 @@ aparece un `verify=<ruta>` junto a un `cert=` en algun sitio nuevo, es este fall
 
 #### El patron, que es lo que va al informe
 
-Los **ocho** fallos serios de la Etapa 3 de esta tabla han sido el mismo tipo de cosa:
+Los **diez** fallos serios de la Etapa 3 de esta tabla han sido el mismo tipo de cosa:
 **algo que aparenta estar puesto y no lo esta**, y ninguno se detecto leyendo el codigo.
 La tabla crecio a lo largo de la etapa; las tres primeras filas son las del codigo del
 Bloque B y C, que es donde se reconocio el patron.
@@ -817,6 +828,8 @@ Bloque B y C, que es donde se reconocio el patron.
 | El punto de entrada (C2) | 529 pruebas en verde decian que el servicio estaba bien | `__main__.py` **no compilaba**: ninguna prueba lo importaba | Levantando el stack |
 | `CAPACITY_BYTES=` vacia (AWS, desde la Etapa 2) | Seguir el ejemplo de despliegue levantaba el DataNode | El DataNode **no arrancaba**; el compose local lo tapaba con un default | Ejecutando el punto de entrada, no compilandolo |
 | Los guiones de demostracion (C2) | Cuatro guiones listos para grabar | Ninguno se habia ejecutado; dos **no arrancaban en Windows** y un tercero no mandaba la cadena del pipeline | Ejecutandolos en Windows, donde se graban |
+| El cifrado de los usuarios anteriores a la 0006 | Todo archivo se cifraba en el cliente; diez pruebas de cifrado en verde | Sin sal no habia clave, y el `put` **subia en claro sin avisar**. Ningun archivo de la base de desarrollo se cifro nunca | El guion `cifrado_en_reposo`, con sus controles ya fiables, encontro la frase en un `.blk` |
+| `verificar_pruebas.py` | La herramienta que verifica las pruebas | Tenia la raiz del repositorio **escrita a mano** (`F:/DFSha telematica`) y el interprete del venv de esa maquina: solo corria en ella | Leyendo su codigo al anadirle la mutacion 11 |
 
 **El cuarto (`details`) es distinto de los tres primeros, y esa diferencia es lo que va
 al informe.** Los tres primeros se manifestaban como un **fallo**: un 409, una conexion cerrada, una descarga
@@ -844,7 +857,7 @@ error sobre variables que el propio README no nombra.
 Nadie lo detecto porque **a la documentacion no se le corren pruebas**, y quien ya tiene el
 `.env` hecho no vuelve a leer el arranque rapido. Se vio al actualizarla, no al usarla.
 
-Y esa es la razon de que los cinco casos vayan juntos al informe: **el rango va desde el
+Y esa es la razon de que todos los casos vayan juntos al informe: **el rango va desde el
 codigo hasta las pruebas y la documentacion**.
 
 | Donde | Casos | Cuantos |
@@ -852,15 +865,30 @@ codigo hasta las pruebas y la documentacion**.
 | **Codigo** | el direccionamiento, `cert=` de httpx, `blocks.size` | 3 |
 | **Cliente** | los `details` descartados desde la Etapa 1 | 1 |
 | **Documentacion** | el arranque rapido con un secreto muerto y sin los certificados | 1 |
-| **Arranque** | el `__main__.py` que no compilaba, el `.env` vacio que tumbaba el DataNode en AWS, y los guiones de demostracion que no arrancaban en Windows | 3 |
-| **Pruebas** | tres que pasaban por un camino distinto del que su nombre anunciaba | 3 |
+| **Arranque** | el `__main__.py` que no compilaba, el `.env` vacio que tumbaba el DataNode en AWS, los guiones de demostracion que no arrancaban en Windows, y `verificar_pruebas.py`, que solo arrancaba en la maquina donde se escribio | 4 |
+| **Migracion** | la 0006, que dejo sin sal a los usuarios existentes y con ellos el cifrado desactivado en silencio | 1 |
+| **Pruebas** | tres que pasaban por un camino distinto del que su nombre anunciaba, y la del append «con cifrado» que no comprobaba el cifrado | 4 |
 
-**Once casos en cinco capas.** Conviene contarlos bien, porque la cifra se cita: las
-**ocho** filas de la tabla de fallos de arriba cubren las cuatro primeras capas, y la
-quinta —las **tres** pruebas que no probaban— esta en la seccion «Verificacion por
-mutacion», no en esa tabla. Decir «ocho casos en cinco capas» mezclaria las dos cuentas.
+**Catorce casos en seis capas.** Conviene contarlos bien, porque la cifra se cita: las
+**diez** filas de la tabla de fallos de arriba cubren las cinco primeras capas, y la
+sexta —las **cuatro** pruebas que no probaban— no esta en esa tabla: tres en la seccion
+«Verificacion por mutacion» y la cuarta en «El agujero de la 0006». Decir «diez casos en
+seis capas» mezclaria las dos cuentas.
 
-Once casos en cinco capas distintas no es un descuido puntual: es un **modo de fallo del
+Que se cuenta y que no, para poder defender la cifra: el agujero del cifrado es **un** caso,
+aunque lo arreglen tres capas. `test_criterio_11_el_bloque_en_disco_no_es_el_texto_claro`
+**no** se cuenta como prueba que no prueba: comprueba de verdad lo que dice, solo que sobre
+una subida que hace ella misma; su limite es de alcance, no de nombre. La del append si,
+porque prometia «con cifrado» y su comprobacion pasaba igual sin el.
+
+`verificar_pruebas.py` **si** se cuenta, con un matiz: en otra maquina habria fallado
+de forma **ruidosa** —un directorio que no existe—, no silenciosa. No es de los que
+aparentan estar puestos, es de los que **funcionan solo donde se escribieron**, la misma
+familia que los guiones que no arrancaban en Windows. Va en la lista porque es la
+herramienta que existe para detectar pruebas que no prueban, y la seccion de mutacion ya
+advertia que ella misma podia tener el defecto que busca.
+
+Catorce casos en seis capas distintas no es un descuido puntual: es un **modo de fallo del
 proyecto**. Y tiene una causa comun que conviene nombrar: en todos, **algo dejo de ser
 verdad y lo que lo afirmaba no se entero**, porque nada los ataba. El codigo no comprueba
 que el README sea cierto, una prueba no comprueba que su nombre describa lo que hace, y un
@@ -1277,6 +1305,85 @@ maestra cambiaria y las envolturas existentes dejarian de abrirse. Re-envolverla
 tener la contrasena vieja y la nueva a la vez, es decir, hacerlo **durante** el cambio y
 desde el cliente. No esta implementado, y el CLI lo dice al fallar en vez de dejar un
 archivo ilegible sin explicacion.
+
+#### El agujero de la 0006: el cifrado que no se aplicaba, con todas las pruebas en verde
+
+**El fallo mas grave de la etapa**, y va al informe entero. No es configuracion que
+aparenta estar puesta: es **una garantia de seguridad que el sistema decia ofrecer y no
+ofrecia**, con 625 pruebas en verde, incluidas las diez de cifrado.
+
+**Que paso.** La migracion 0006 anadio `users.kdf_salt` con `server_default=""` y no relleno
+las filas existentes. Un usuario sin sal no recibe sal en el login, el cliente no deriva
+clave maestra, y el `put` tenia esta rama:
+
+```python
+clave_archivo = new_file_key() if maestra else None   # sin clave: se sube EN CLARO
+```
+
+Pensada para las sesiones de la Etapa 2, **subia el archivo en claro, con codigo de salida
+0 y sin una sola linea de aviso**. Todo usuario creado antes del Bloque C tomaba esa rama
+para siempre. En la base del compose de desarrollo, consultada despues: **ningun archivo
+se habia cifrado nunca**, con el criterio 11 dado por cumplido.
+
+**Como se vio.** El guion `cifrado_en_reposo.py`, en su primera pasada completa, encontro la
+frase en claro dentro de un `.blk`. Y lo encontro **porque sus controles eran fiables**: los
+controles positivos habian pasado, habia localizado el bloque en los tres nodos que lo
+tenian, y solo aceptaba el codigo 1 de `grep` como «no encontrado». Sin la revision de los
+guiones de la misma sesion, ese resultado se habria podido atribuir al guion.
+
+**El «no encontrado» que dio por bueno lo contrario durante dos dias.** El dia anterior se
+hizo el mismo `grep` a mano, con un archivo equivalente, y salio NO ENCONTRADO. Al ver el
+fallo, la primera hipotesis fue «algo cambio entre ayer y hoy», y **era falsa**: consultada
+la base, ningun archivo se habia cifrado nunca, asi que aquel resultado fue un **falso
+negativo**. Lo mas probable, que se busco en un nodo que no tenia el bloque: con R=3 y
+cuatro nodos pasa con uno de cada cuatro bloques.
+
+Esto es lo que va al informe, con estas palabras: **un «no encontrado» sin control positivo
+no es evidencia de nada, y aun asi se lee como evidencia de lo que uno espera**. Durante dos
+dias, una comprobacion manual certifico que los bloques estaban cifrados cuando ninguno lo
+estaba. Lo que convierte ese «no encontrado» en evidencia es exactamente lo que se anadio al
+guion: comprobar antes que la busqueda **encuentra** la frase cuando esta, y que se busca en
+un nodo que **tiene** el bloque. Con esos dos controles, el guion no pudo equivocarse igual,
+y por eso su «encontrado» se creyo a la primera en vez de achacarse al guion.
+
+Es tambien el mejor argumento a favor de la regla de `_comun.py` —control positivo junto al
+negativo—, que al escribirla parecia un exceso de celo para una demostracion.
+
+**Por que no lo vieron las pruebas.** Dos motivos independientes; bastaba con uno:
+
+1. **Las pruebas de cifrado no pasan por el `put` del cliente.** `_subir_cifrado` en
+   `test_cifrado.py` reimplementa «lo que hace `dfsha put`», y es la **prueba** la que
+   decide cifrar. La decision real del cliente no la recorria ninguna. Lo demuestra la
+   mutacion 11 de `verificar_pruebas.py`: devolver el cliente a la rama vieja deja en
+   verde las ocho pruebas de cifrado anteriores, y solo cae la nueva.
+2. **Todas crean sus usuarios en el momento**, y un usuario recien registrado siempre tiene
+   sal. El estado que deja una migracion sobre **filas existentes** no lo montaba nadie:
+   `test_migracion_deja_el_mismo_esquema_que_los_modelos` compara el esquema, no los datos.
+
+Y una tercera prueba del mismo tipo: `test_el_append_por_el_CLI_con_cifrado_conserva_el_
+contenido` si pasa por el CLI, pero solo comparaba la ida y vuelta, que da igual con
+cifrado que sin el. Su nombre prometia algo que no comprobaba. Ahora mira `wrapped_key`.
+
+**El arreglo, en tres capas**, porque cada una tapa un modo distinto de volver a caer:
+
+| Capa | Que | Lo fija |
+|---|---|---|
+| Datos | La migracion **0008** da una sal propia a cada usuario que no la tenga | `test_la_0008_da_sal_a_los_usuarios_que_la_0006_dejo_sin_ella` (vista caer sin la 0008) |
+| Cliente | `put` **se niega** a subir sin clave. «Sin cifrar» sigue siendo un estado legible, pero ya no algo que el cliente produzca. El login avisa si no hay sal | `test_un_usuario_sin_sal_no_sube_en_claro` (vista caer con la mutacion 11) |
+| Pruebas | El criterio 11 comprobado por el **`put` real del CLI**, mirando el `.blk` | `test_el_put_del_CLI_cifra_lo_que_queda_en_disco` |
+
+La segunda capa es la que importa mas: aunque manana otra migracion vuelva a dejar a
+alguien sin sal, el sintoma sera un error ruidoso en el `put` y no datos en claro.
+
+**Lo que NO arregla**: los archivos que ya se subieron en claro **siguen en claro** en disco.
+Re-cifrarlos exige la clave, que solo existe en el cliente; hay que volver a subirlos.
+
+**La leccion**, con estas palabras: **una garantia de seguridad con una rama que la
+desactiva en silencio no es una garantia**. La rama era razonable —compatibilidad con la
+Etapa 2—, y el defecto no era su existencia sino que **degradaba sin avisar**. Es el mismo
+fallo que los `details` descartados, en la peor capa posible: alli se perdia un dato de un
+mensaje; aqui, la confidencialidad de todos los archivos de un usuario. Y la otra mitad:
+**una prueba que reimplementa el camino que dice probar prueba la reimplementacion**.
 
 ### El balanceador: nivel 7 para el cliente, nivel 4 para todo lo que lleva mTLS
 
@@ -1743,16 +1850,22 @@ y `docker`, rutas ancladas a la raiz del repositorio, subprocesos en UTF-8.
   repartiendo entre instancias.
 - `dfsha put` de 50 MB con bloques de 1 MB: commit correcto, `FULLY_REPLICATED`.
 
-**Con evidencia parcial**, por una ejecucion no planeada de los guiones corregidos (la del
-`--help` de arriba). No se vio su salida; lo que sigue sale de los logs:
+**Validado con los guiones de demostracion**, pasada completa en Windows (17/09):
 
-- `failover_del_lider`: el lease paso a `control-node-3` y la epoca subio de 8 a 9.
-- `permisos_y_token`: dos commits con `replication.quorum_met`, y el DataNode rechazo los
-  dos intentos de Carla por el motivo correcto —«falta el token de bloque» y «el token es
-  para otro bloque»—. Es la primera evidencia en Docker del **token de bloque**.
+- `permisos_y_token`: **pasa entero**. Es la validacion en Docker del **token de bloque**:
+  Carla recibe 403 sin token y 403 con un token legitimo de su propio bloque, porque el
+  `block_id` va firmado dentro. Los ocho pasos con sus controles positivos.
+- `replicacion_y_caida`: **pasa**. 24 `.blk` para 8 bloques, lectura identica con un nodo
+  caido, DEAD, UNDER_REPLICATED y vuelta a FULLY_REPLICATED tras la gracia.
+- `failover_del_lider`: **pasa**. Lider real identificado por `is_self`, el cluster sigue
+  sirviendo, relevo en 7,4 s y epoca de 10 a 11.
+- `cifrado_en_reposo`: **FALLO, y con razon**. Encontro el texto claro en un `.blk`: el
+  agujero de la 0006, ver «El agujero de la 0006» en la seccion de cifrado. Arreglado en
+  codigo (migracion 0008, `put` que se niega sin clave), **pendiente de volver a pasar el
+  guion** con el stack reconstruido y un `dfsha login` nuevo.
 
-**Sin validar en Docker**: una pasada completa y vista de los cuatro guiones corregidos, el
-**RF3** (`lock`, `read` por rango, `append`) y **C2** (TLS de cliente).
+**Sin validar en Docker**: el guion de cifrado tras el arreglo, el **RF3** (`lock`, `read`
+por rango, `append`) y **C2** (TLS de cliente).
 
 ### Intermitente conocido: `test_los_bloques_son_inmutables`
 
@@ -1834,7 +1947,8 @@ OpenTelemetry ni exportadores de métricas. Logs JSON y nada más.
 ```
 users(id, username UNIQUE, password_hash, kdf_salt, created_at)
     kdf_salt: sal del KDF del CLIENTE. NO es secreta y viaja en el login; su
-    trabajo es que dos usuarios con la misma contrasena tengan claves distintas
+    trabajo es que dos usuarios con la misma contrasena tengan claves distintas.
+    NUNCA vacia desde la migracion 0008: vacia, el cliente subia EN CLARO
 
 directories(id, parent_id NULL, name, owner_id, created_at, deleted_at NULL)
     UNIQUE(parent_id, name) solo sobre filas con deleted_at NULL

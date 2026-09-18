@@ -83,7 +83,8 @@ class UserRow(Base):
     #: no se puedan precalcular tablas contra todo el sistema a la vez. Por eso se puede
     #: devolver en el login sin comprometer nada.
     #:
-    #: Vacia en un usuario de las Etapas 1 y 2: sus archivos no estaban cifrados.
+    #: Nunca vacia desde la migracion 0008. Antes lo estaba en todo usuario anterior al
+    #: Bloque C, y eso hacia que el cliente subiera sus archivos EN CLARO sin avisar.
     kdf_salt: Mapped[str] = mapped_column(String(64), nullable=False, default="")
     created_at: Mapped[datetime] = mapped_column(UtcDateTime, nullable=False)
 

@@ -127,3 +127,39 @@ def test_una_base_sin_migrar_no_arranca(monkeypatch: pytest.MonkeyPatch, tmp_pat
     # justo cuando nadie tiene tiempo de ir a buscarlo a la documentacion.
     assert "alembic upgrade head" in str(exc.value)
     assert "alembic stamp" in str(exc.value)
+
+
+def test_la_0008_da_sal_a_los_usuarios_que_la_0006_dejo_sin_ella(db_url: str) -> None:
+    """El estado de DATOS que deja una migracion, no solo el esquema.
+
+    La 0006 anadio `kdf_salt` vacia a los usuarios existentes, y un usuario sin sal subia
+    sus archivos EN CLARO sin que nada lo dijera. Ninguna prueba lo vio porque todas
+    registran usuarios nuevos, que siempre tienen sal: el estado que produce migrar una
+    base con filas no lo montaba nadie. Esta lo monta.
+    """
+    from sqlalchemy import text
+
+    config = _config(db_url)
+    command.upgrade(config, "0007")
+
+    engine = create_engine(db_url, future=True)
+    with engine.begin() as conexion:
+        for nombre, sal in (("viejo-1", ""), ("viejo-2", ""), ("nuevo", "ab" * 16)):
+            conexion.execute(
+                text(
+                    "INSERT INTO users (id, username, password_hash, kdf_salt, created_at) "
+                    "VALUES (:id, :nombre, 'x', :sal, '2026-09-16 06:02:24')"
+                ),
+                {"id": f"id-{nombre}", "nombre": nombre, "sal": sal},
+            )
+
+    command.upgrade(config, "head")
+
+    with engine.connect() as conexion:
+        sales = dict(conexion.execute(text("SELECT username, kdf_salt FROM users")).all())
+
+    assert sales["viejo-1"] and sales["viejo-2"], "quedan usuarios sin sal tras migrar"
+    assert len(bytes.fromhex(sales["viejo-1"])) == 16
+    assert sales["viejo-1"] != sales["viejo-2"], "la sal tiene que ser distinta por usuario"
+    assert sales["nuevo"] == "ab" * 16, "la migracion no debe tocar una sal que ya existe"
+

@@ -576,6 +576,14 @@ def test_el_append_por_el_CLI_con_cifrado_conserva_el_contenido(
 
     assert bajado.read_bytes() == b"linea uno\nlinea dos\n"
 
+    # El nombre dice «con cifrado», y la ida y vuelta de arriba pasa igual sin cifrar:
+    # el cliente cifra y descifra. Lo que distingue los dos casos es el metadato.
+    from dfsha.client.api import ControlApi
+    from dfsha.client.session import SessionStore
+
+    api = ControlApi(SessionStore(casa).load(cluster.control_url))
+    assert api.open_file("/cli.txt").wrapped_key, "el append dejo el archivo sin cifrar"
+
 
 def test_read_por_rango_desde_el_CLI(cluster, tmp_path, monkeypatch) -> None:
     from typer.testing import CliRunner

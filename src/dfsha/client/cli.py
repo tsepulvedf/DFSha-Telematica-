@@ -191,6 +191,14 @@ def login(
             "[dim]la clave no se guardo: se pedira la contrasena en cada put y get"
             "[/dim]"
         )
+    else:
+        # Antes esto no decia nada, y la sesion quedaba sin cifrado sin que nadie lo
+        # supiera. Ahora `put` se niega, y aqui se avisa de por que antes de que ocurra.
+        console.print(
+            "[yellow]aviso[/yellow] el servidor no devolvio sal de cifrado para este "
+            "usuario: no podras subir archivos hasta que el ControlNode aplique la "
+            "migracion 0008"
+        )
 
 
 @app.command()
@@ -675,7 +683,23 @@ def put(
     # servidor es la envoltura. Una clave por archivo y no una por usuario: compartir un
     # archivo puede llegar a ser entregar su clave sin dar acceso a todo lo demas.
     maestra = _clave_maestra(sesion)
-    clave_archivo = new_file_key() if maestra else None
+    if maestra is None:
+        # **Nunca se sube en claro.** Esta rama subia el archivo SIN cifrar y sin decir
+        # nada, y era la que tomaba cualquier usuario anterior a la migracion 0006: su sal
+        # estaba vacia, el login no derivaba clave, y el criterio 11 dejaba de cumplirse en
+        # silencio. «Archivo sin cifrar» sigue siendo un estado LEGIBLE —los de las Etapas
+        # 1 y 2 se bajan igual—, pero ya no es algo que este cliente produzca.
+        console.print(
+            "[red]error[/red] esta sesion no tiene clave de cifrado, y el cliente no sube "
+            "archivos en claro"
+        )
+        console.print(
+            "[dim]vuelve a iniciar sesion con `dfsha login`. Si el error se repite, tu "
+            "usuario no tiene sal de cifrado: el ControlNode necesita la migracion 0008 "
+            "(`docker compose up` la aplica con el servicio migrate)[/dim]"
+        )
+        raise typer.Exit(code=1)
+    clave_archivo = new_file_key()
 
     try:
         # El sobrecoste del cifrado viaja en la creacion, no en el commit: el ControlNode

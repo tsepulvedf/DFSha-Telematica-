@@ -43,8 +43,10 @@ import sys
 import tempfile
 from pathlib import Path
 
-RAIZ = Path("F:/DFSha telematica")
-PY = str(RAIZ / ".venv/Scripts/python.exe")
+# Relativas al propio script: con la ruta de una maquina concreta escrita a mano, esta
+# herramienta solo corria en esa maquina.
+RAIZ = Path(__file__).resolve().parents[1]
+PY = sys.executable
 
 # (nombre, fichero, texto viejo, texto nuevo, pruebas que DEBEN caer)
 MUTACIONES = [
@@ -141,14 +143,46 @@ MUTACIONES = [
         """    if False:""",
         ["tests/integration/test_rf3.py"],
     ),
+    (
+        "11. Cifrado: el put del CLI vuelve a subir en claro si la sesion no tiene clave",
+        "src/dfsha/client/cli.py",
+        # Se sustituye la negativa ENTERA por la linea que habia antes. Con solo quitar el
+        # `if`, `wrap_file_key` reventaria sin clave y el put fallaria igual: la prueba del
+        # usuario sin sal seguiria en verde por un motivo distinto del que anuncia.
+        """    if maestra is None:
+        # **Nunca se sube en claro.** Esta rama subia el archivo SIN cifrar y sin decir
+        # nada, y era la que tomaba cualquier usuario anterior a la migracion 0006: su sal
+        # estaba vacia, el login no derivaba clave, y el criterio 11 dejaba de cumplirse en
+        # silencio. «Archivo sin cifrar» sigue siendo un estado LEGIBLE —los de las Etapas
+        # 1 y 2 se bajan igual—, pero ya no es algo que este cliente produzca.
+        console.print(
+            "[red]error[/red] esta sesion no tiene clave de cifrado, y el cliente no sube "
+            "archivos en claro"
+        )
+        console.print(
+            "[dim]vuelve a iniciar sesion con `dfsha login`. Si el error se repite, tu "
+            "usuario no tiene sal de cifrado: el ControlNode necesita la migracion 0008 "
+            "(`docker compose up` la aplica con el servicio migrate)[/dim]"
+        )
+        raise typer.Exit(code=1)
+    clave_archivo = new_file_key()
+""",
+        """    clave_archivo = new_file_key() if maestra else None
+""",
+        ["tests/integration/test_cifrado.py"],
+    ),
 ]
 
 
 def main() -> int:
+    # `--solo 11` corre solo las mutaciones cuyo nombre empieza por ese texto.
+    solo = sys.argv[sys.argv.index("--solo") + 1] if "--solo" in sys.argv else None
     respaldo = Path(tempfile.mkdtemp(prefix="mutaciones-"))
     resultados = []
 
     for nombre, rel, viejo, nuevo, pruebas in MUTACIONES:
+        if solo and not nombre.startswith(solo):
+            continue
         destino = RAIZ / rel
         copia = respaldo / rel.replace("/", "__")
         shutil.copy2(destino, copia)
