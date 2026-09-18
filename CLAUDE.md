@@ -812,6 +812,8 @@ aparenta estar puesto y no lo esta**, y ninguno se detecto leyendo el codigo.
 | `blocks.size` vs `files.size` (Bloque C) | El metadato describia el bloque almacenado | Describia el **claro**, y en disco habia 16 bytes mas | Una prueba de ida y vuelta, no de inspeccion |
 | `details` del error (desde la Etapa 1) | El cliente imprimia los datos del error | Los **descartaba**; la rama que los imprime no se ejecuto nunca | Una prueba que necesitaba uno de esos datos |
 | El README del arranque rapido | Los comandos levantaban el cluster | Generaba un secreto que ya no se lee y **no mencionaba los certificados** | Actualizando la documentacion, no usandola |
+| El punto de entrada (C2) | 529 pruebas en verde decian que el servicio estaba bien | `__main__.py` **no compilaba**: ninguna prueba lo importaba | Levantando el stack |
+| `CAPACITY_BYTES=` vacia (AWS, desde la Etapa 2) | Seguir el ejemplo de despliegue levantaba el DataNode | El DataNode **no arrancaba**; el compose local lo tapaba con un default | Ejecutando el punto de entrada, no compilandolo |
 
 **El cuarto es distinto de los otros tres, y esa diferencia es lo que va al informe.** Los
 tres primeros se manifestaban como un **fallo**: un 409, una conexion cerrada, una descarga
@@ -848,8 +850,9 @@ codigo hasta las pruebas y la documentacion**.
 | **Cliente** | los `details` descartados desde la Etapa 1 |
 | **Pruebas** | tres que pasaban por un camino distinto del que su nombre anunciaba |
 | **Documentacion** | el arranque rapido con un secreto muerto y sin los certificados |
+| **Arranque** | el `__main__.py` que no compilaba, y el `.env` vacio que tumbaba el DataNode en AWS |
 
-Cinco casos en cuatro capas distintas no es un descuido puntual: es un **modo de fallo del
+Siete casos en cinco capas distintas no es un descuido puntual: es un **modo de fallo del
 proyecto**. Y tiene una causa comun que conviene nombrar: en todos, **algo dejo de ser
 verdad y lo que lo afirmaba no se entero**, porque nada los ataba. El codigo no comprueba
 que el README sea cierto, una prueba no comprueba que su nombre describa lo que hace, y un
@@ -1604,6 +1607,64 @@ Es una variante del patron de la Etapa 3: **algo que aparenta estar puesto y no 
 esta vez del lado del cliente y sin fallo que lo delate. Lo fija
 `TestDetallesDelError` en `tests/integration/test_transfer.py`, que lo comprueba sobre dos
 errores que **no** son el del lock, para que no se vuelva a colar por un camino distinto.
+
+### El punto de entrada no compilaba, con 529 pruebas en verde
+
+**El caso mas literal del patron de la etapa**, y se vio levantando el stack, no en la
+suite: los dos `__main__.py` de C2 tenian un f-string sin cerrar —un `\n` de la plantilla
+que se convirtio en un salto de linea real— y los tres ControlNodes entraron en bucle de
+reinicio. **Ninguna prueba importaba esos modulos.** Las pruebas arrancan la app llamando
+a `create_app()`; el camino que usa Docker, `python -m dfsha.control_node`, no lo recorria
+nadie.
+
+**El codigo que menos se ejercita es justo el que decide si el servicio existe.**
+
+Medido, no supuesto —recolectando la suite y mirando `sys.modules`—:
+
+| Donde | Sin cubrir por ninguna prueba |
+|---|---|
+| `src/` (82 modulos) | **2**: exactamente los dos `__main__.py` |
+| `scripts/` (10 ficheros) | **8**, incluidos los cuatro guiones de demostracion que se iban a grabar |
+
+`tests/unit/test_todo_compila.py` cierra el hueco en dos niveles: **importa** los dos
+puntos de entrada —mas fuerte que compilar: atrapa tambien un `import` roto— y **compila
+todo `.py` de `src/` y `scripts/`**, lo importe alguien o no. Recorre el arbol en vez de
+usar una lista, porque una lista envejeceria igual que envejecio la cobertura: el modulo
+que alguien anada despues no estaria en ella y no fallaria nada. Y lleva su propio control
+positivo, porque un recorrido roto la parametrizaria con cero ficheros y pasaria en verde
+sin comprobar nada. Se vio caer contra el codigo roto antes de darla por buena.
+
+**Es el suelo y no el techo**: garantiza que nada llega roto por algo que Python detecta
+sin ejecutarlo, no que funcione.
+
+#### Y ejecutar el punto de entrada destapo otro fallo, que compilar no habria visto
+
+Arrancando el DataNode por `python -m` —en vez de solo compilarlo— aparecio esto:
+
+    DFSHA_DATANODE_CAPACITY_BYTES: Input should be a valid integer
+
+`deploy/.env.datanode.example` recomienda dejarla **vacia** («se deduce del disco»), y el
+compose de AWS pasa el `.env` tal cual con `env_file`. La cadena `""` llegaba a un campo
+`int | None` y **el DataNode no arrancaba siguiendo nuestras propias instrucciones**. En el
+compose local no se veia porque le pone un default con `${...:-10737418240}`. El despliegue
+de AWS llevaba asi **desde la Etapa 2** —el ejemplo y el `env_file` son de entonces—, y
+nadie lo supo porque nunca se ha ejecutado.
+
+Y no era solo ese campo: **cualquiera de los 26 numericos o booleanos** escrito como
+`VAR=` rompia igual. El arreglo es general, `env_ignore_empty=True` en los dos
+`SettingsConfigDict`, con la regla que lo justifica: **en un `.env`, dejar una linea vacia
+significa «no la he configurado», nunca «vale cadena vacia»**. Lo fija
+`test_una_variable_VACIA_cuenta_como_no_puesta`, que cae sin el arreglo.
+
+Dos lecciones, y la segunda es la nueva:
+
+1. Lo que se ejecuta en produccion y no en las pruebas **es por definicion lo que esta sin
+   probar**, por mucho verde que haya alrededor.
+2. **Compilar no es arrancar.** El primer fallo lo habria atrapado un `py_compile`; el
+   segundo solo aparecio al ejecutar el proceso con una configuracion realista. La
+   prueba nueva cubre el primero para siempre; el segundo lo cubre su propia prueba, pero
+   el patron —el camino local enmascara el de despliegue— es el mismo del
+   direccionamiento del Bloque B, y el remedio tambien: ejecutar lo que se va a desplegar.
 
 ### Intermitente conocido: `test_los_bloques_son_inmutables`
 

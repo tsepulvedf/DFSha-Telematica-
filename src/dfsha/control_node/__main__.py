@@ -19,8 +19,10 @@ def main() -> int:
     try:
         tls = ClientTls.from_settings(ajustes.client_tls_cert, ajustes.client_tls_key)
     except ValueError as error:
-        print(f"ControlNode: configuracion de TLS de cliente invalida.
-  - {error}", file=sys.stderr)
+        print(
+            f"ControlNode: configuracion de TLS de cliente invalida.\n  - {error}",
+            file=sys.stderr,
+        )
         return 2
 
     run("dfsha.control_node.main:create_app", host="0.0.0.0", port=8000, tls=tls)

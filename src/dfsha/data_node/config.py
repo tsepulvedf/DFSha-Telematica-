@@ -20,6 +20,18 @@ class DataNodeSettings(BaseSettings):
         env_file=".env",
         env_file_encoding="utf-8",
         extra="ignore",
+        # Una variable VACIA cuenta como NO PUESTA, y se usa el default.
+        #
+        # Sin esto, `DFSHA_DATANODE_CAPACITY_BYTES=` —que es exactamente lo que
+        # recomiendan nuestros propios ejemplos, "vacio = se deduce del disco"— llegaba
+        # como la cadena "" a un campo `int | None` y el servicio NO ARRANCABA. En el
+        # compose local no se veia porque le pone un default con `${...:-...}`; en el
+        # despliegue de AWS, que pasa el .env tal cual con `env_file`, si.
+        #
+        # Y no era solo ese campo: cualquiera de los numericos o booleanos escrito como
+        # `VAR=` rompia igual. La regla general es la correcta: en un .env, dejar una
+        # linea vacia significa "no la he configurado", nunca "vale cadena vacia".
+        env_ignore_empty=True,
     )
 
     data_dir: str = "/var/lib/dfsha"
