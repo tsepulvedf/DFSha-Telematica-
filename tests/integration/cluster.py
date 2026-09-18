@@ -17,10 +17,13 @@ from pathlib import Path
 import httpx
 import uvicorn
 
+from dfsha.common.serve import ClientTls
+from dfsha.common.tls import ca_only_context
 from dfsha.control_node.config import ControlNodeSettings
 from dfsha.control_node.main import create_app as create_control_app
 from dfsha.data_node.config import DataNodeSettings
 from dfsha.data_node.main import create_app as create_data_app
+from tests.certs import material
 
 __all__ = ["Cluster", "DataNodeHandle", "start_cluster", "MB"]
 
@@ -35,10 +38,26 @@ def puerto_libre() -> int:
         return s.getsockname()[1]
 
 
+def _verify(url: str):
+    """Como verificar `url` desde las pruebas: la CA de pruebas si es https."""
+    return ca_only_context(material("data").ca_cert) if url.startswith("https://") else True
+
+
+def _tls_cliente(rol: str) -> dict:
+    """Los mismos kwargs de uvicorn que usa `python -m` con C2 encendido."""
+    m = material(rol)
+    return ClientTls(str(m.cert), str(m.key)).uvicorn_kwargs()
+
+
 class _ServidorEnHilo:
-    def __init__(self, app, port: int) -> None:
+    def __init__(self, app, port: int, ssl_kwargs: dict | None = None) -> None:
         config = uvicorn.Config(
-            app, host="127.0.0.1", port=port, log_level="warning", access_log=False
+            app,
+            host="127.0.0.1",
+            port=port,
+            log_level="warning",
+            access_log=False,
+            **(ssl_kwargs or {}),
         )
         self.server = uvicorn.Server(config)
         self.hilo = threading.Thread(target=self.server.run, daemon=True)
@@ -62,9 +81,13 @@ class DataNodeHandle:
     fault_domain: str
     settings: DataNodeSettings
     _servidor: _ServidorEnHilo | None = None
+    #: TLS de cliente (C2) en el puerto que sirve al cliente y a los pares.
+    ssl_kwargs: dict | None = None
 
     def health(self, timeout: float = 5) -> dict:
-        return httpx.get(f"{self.url}/health", timeout=timeout).json()
+        return httpx.get(
+            f"{self.url}/health", timeout=timeout, verify=_verify(self.url)
+        ).json()
 
     @property
     def data_node_id(self) -> str:
@@ -78,7 +101,9 @@ class DataNodeHandle:
         mismo `boot_id` y el ControlNode lo trata como reincorporacion."""
         if self._servidor is not None:
             return
-        self._servidor = _ServidorEnHilo(create_data_app(self.settings), self.port)
+        self._servidor = _ServidorEnHilo(
+            create_data_app(self.settings), self.port, self.ssl_kwargs
+        )
         self._servidor.start()
         _esperar(f"{self.url}/health")
 
@@ -104,7 +129,8 @@ class Cluster:
     control_url: str
     control_grpc_port: int
     nodes: list[DataNodeHandle]
-    internal_secret: str = SECRETO_INTERNO
+    #: Plano interno, en su propio puerto y con TLS mutuo.
+    control_internal_url: str = ""
     _control: _ServidorEnHilo | None = None
     settings: ControlNodeSettings | None = None
 
@@ -124,9 +150,36 @@ class Cluster:
 
     # --- Cluster -----------------------------------------------------------
 
-    @property
-    def internal_headers(self) -> dict[str, str]:
-        return {"X-DFSha-Internal-Secret": self.internal_secret}
+    def internal_client(self, rol: str = "client") -> httpx.Client:
+        """Cliente del plano interno con certificado, como lo usaria el recolector.
+
+        El secreto compartido de las etapas anteriores ya no existe: quien no presente un
+        certificado de la CA no llega ni a enviar la peticion.
+        """
+        tls = material(rol)
+        return httpx.Client(
+            base_url=self.control_internal_url,
+            verify=tls.httpx_verify(),
+            timeout=30,
+        )
+
+    def uow_factory(self):
+        """Acceso al metadato del ControlNode desde una prueba.
+
+        Solo para montar escenarios que por el camino normal costarian minutos de reloj
+        (por ejemplo, llegar a un bloque sub-replicado sin esperar a que muera un nodo).
+        Lo que se COMPRUEBA se sigue comprobando por la API.
+        """
+        from dfsha.control_node.repositories.database import (
+            build_engine,
+            build_session_factory,
+        )
+        from dfsha.control_node.repositories.sql import SqlUnitOfWork
+
+        assert self.settings is not None
+        engine = build_engine(self.settings.db_url)
+        factory = build_session_factory(engine)
+        return lambda: SqlUnitOfWork(factory)
 
     def node(self, name: str) -> DataNodeHandle:
         for nodo in self.nodes:
@@ -140,6 +193,7 @@ class Cluster:
             f"{self.control_url}/api/v1/cluster/status",
             headers={"Authorization": f"Bearer {token}"},
             timeout=timeout,
+            verify=_verify(self.control_url),
         )
         respuesta.raise_for_status()
         return respuesta.json()
@@ -170,7 +224,7 @@ def _esperar(url: str, timeout: float = 30.0) -> None:
     ultimo: Exception | None = None
     while time.time() < limite:
         try:
-            if httpx.get(url, timeout=2).status_code == 200:
+            if httpx.get(url, timeout=2, verify=_verify(url)).status_code == 200:
                 return
         except Exception as exc:
             ultimo = exc
@@ -185,29 +239,63 @@ def start_cluster(
     data_nodes: int = 1,
     fault_domains: list[str] | None = None,
     capacities: list[int] | None = None,
+    replication_factor: int = 1,
+    write_quorum: int = 1,
+    advertise_muerta: bool = False,
+    tls_cliente: bool = False,
     **control_overrides,
 ) -> Cluster:
     """Levanta el ControlNode y `data_nodes` DataNodes.
 
     `fault_domains` y `capacities` permiten construir los escenarios de la Etapa 2: dos
     zonas, o un nodo con menos capacidad que el resto.
+
+    `advertise_muerta=True` da a cada nodo una direccion de cliente que **no responde**,
+    dejando la real solo como direccion de par. Es la inversion del escenario de Docker:
+    alli la de cliente funciona desde fuera y no desde dentro; aqui no funciona desde
+    ningun sitio. En los dos casos, cualquier camino nodo-a-nodo que use la direccion de
+    cliente falla, que es justo lo que hay que poder detectar. Ver
+    `test_addressing.py`.
+
+    `replication_factor` y `write_quorum` se fijan aqui en 1 y NO se dejan al default del
+    codigo, que desde la Etapa 3 es R=3 y W=2. El motivo es que las pruebas de las etapas
+    anteriores describen el comportamiento con una replica por bloque: dejarlas heredar
+    R=3 no las haria mejores, las haria medir otra cosa. Las pruebas de replicacion piden
+    R=3 explicitamente, que es como debe ser: quien necesita tres nodos, los levanta.
+
+    `tls_cliente=True` enciende C2 en el ControlNode y en TODOS los DataNodes, con el
+    mismo `ClientTls` que usa `python -m`. Las direcciones pasan a `https://`, tambien la
+    de par, asi que el pipeline y la re-replicacion viajan por TLS verificando la CA.
+    Las pruebas de C2 anteriores levantaban un solo servidor suelto y no recorrian ese
+    camino, que es por donde se colaba el fallo. Ver `test_tls_cliente.py`.
     """
+    esquema = "https" if tls_cliente else "http"
     puerto_control = puerto_libre()
     puerto_grpc = puerto_libre()
-    control_url = f"http://127.0.0.1:{puerto_control}"
+    puerto_interno = puerto_libre()
+    control_url = f"{esquema}://127.0.0.1:{puerto_control}"
 
     control_settings = ControlNodeSettings(
         db_url=f"sqlite:///{(tmp_path / 'dfsha.db').as_posix()}",
         jwt_secret=SECRETO_JWT,
-        internal_secret=SECRETO_INTERNO,
+        tls_ca_cert=str(material("control").ca_cert),
+        tls_cert=str(material("control").cert),
+        tls_key=str(material("control").key),
+        internal_port=puerto_interno,
         block_size=block_size,
         write_ttl_seconds=write_ttl_seconds,
         log_level="WARNING",
         grpc_port=puerto_grpc,
+        replication_factor=replication_factor,
+        write_quorum=write_quorum,
         **control_overrides,
     )
 
-    control = _ServidorEnHilo(create_control_app(control_settings), puerto_control)
+    control = _ServidorEnHilo(
+        create_control_app(control_settings),
+        puerto_control,
+        _tls_cliente("control") if tls_cliente else None,
+    )
     control.start()
     _esperar(f"{control_url}/health")
 
@@ -217,15 +305,22 @@ def start_cluster(
     handles: list[DataNodeHandle] = []
     for indice in range(data_nodes):
         puerto = puerto_libre()
-        url = f"http://127.0.0.1:{puerto}"
+        url = f"{esquema}://127.0.0.1:{puerto}"
         data_dir = tmp_path / f"datanode-{indice + 1}"
+        # Con `advertise_muerta`, la direccion de cliente apunta a un puerto que nadie
+        # escucha: si algun camino nodo-a-nodo la usara, se veria enseguida.
+        anunciada = f"{esquema}://127.0.0.1:{puerto_libre()}" if advertise_muerta else url
         settings = DataNodeSettings(
             data_dir=str(data_dir),
             control_url=control_url,
             control_grpc_url=f"127.0.0.1:{puerto_grpc}",
-            datanode_advertise_url=url,
+            datanode_advertise_url=anunciada,
+            datanode_peer_url=url if advertise_muerta else "",
             datanode_fault_domain=dominios[indice],
-            internal_secret=SECRETO_INTERNO,
+            control_internal_url=f"https://127.0.0.1:{puerto_interno}",
+            tls_ca_cert=str(material("data").ca_cert),
+            tls_cert=str(material("data").cert),
+            tls_key=str(material("data").key),
             datanode_capacity_bytes=capacidades[indice],
             log_level="WARNING",
             register_retry_seconds=0.1,
@@ -238,6 +333,7 @@ def start_cluster(
             data_dir=data_dir,
             fault_domain=dominios[indice],
             settings=settings,
+            ssl_kwargs=_tls_cliente("data") if tls_cliente else None,
         )
         handle.start()
         handles.append(handle)
@@ -245,6 +341,7 @@ def start_cluster(
     cluster = Cluster(
         control_url=control_url,
         control_grpc_port=puerto_grpc,
+        control_internal_url=f"https://127.0.0.1:{puerto_interno}",
         nodes=handles,
         _control=control,
         settings=control_settings,

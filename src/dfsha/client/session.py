@@ -11,7 +11,8 @@ from __future__ import annotations
 import json
 import os
 import stat
-from dataclasses import dataclass
+import uuid
+from dataclasses import dataclass, field
 from pathlib import Path
 
 from dfsha.common.errors import AuthenticationError
@@ -28,6 +29,40 @@ class Session:
     token: str | None = None
     username: str | None = None
     cwd: str = "/"
+    #: LSN del WAL de PostgreSQL de la ultima escritura de ESTE cliente.
+    #:
+    #: Se guarda en disco y no en memoria porque cada invocacion de `dfsha` es un
+    #: proceso nuevo: sin persistirlo, un `mkdir /a` seguido de un `ls /` en la linea
+    #: siguiente no tendria forma de saber que hay una escritura que la replica quiza
+    #: no ha reproducido, que es justo el caso que esto existe para cubrir.
+    last_write_lsn: str | None = None
+    #: Clave maestra del usuario, en hexadecimal. **Aqui esta el limite reconocido del
+    #: modelo de cifrado**, y conviene enunciarlo con precision:
+    #:
+    #:   el modelo es «EL SERVIDOR nunca ve la clave», no «la clave nunca toca el disco».
+    #:
+    #: Guardarla permite que `put` y `get` funcionen sin pedir la contrasena en cada
+    #: invocacion, que es lo que haria inservibles los scripts y las pruebas. Sigue
+    #: siendo mas fuerte que cifrar en el servidor: quien controla el ControlNode y los
+    #: DataNodes no puede leer nada, ni con el metadato entero y todos los bloques.
+    #:
+    #: Quien no quiera esto tiene `dfsha login --ask-password`, que no la guarda y la
+    #: pide en cada operacion.
+    master_key: str | None = None
+    #: Identificador de ESTA sesion, para el RF3. El titular de un lock es una sesion y no
+    #: una persona: Ana desde dos maquinas tiene que poder excluirse a si misma, o el lock
+    #: no excluiria nada entre sus propios procesos. Se genera la primera vez y se
+    #: conserva, porque cada invocacion de `dfsha` es un proceso nuevo y uno aleatorio por
+    #: proceso haria que `dfsha lock` y el `dfsha append` siguiente fueran dos titulares
+    #: distintos.
+    holder_id: str = field(default_factory=lambda: uuid.uuid4().hex)
+    #: Epoca del lock vigente por `file_id`. Es la mitad del par de aislamiento; la otra
+    #: es `holder_id`. Se reenvia en cada escritura y el ControlNode la verifica DENTRO de
+    #: la transaccion que escribe.
+    locks: dict[str, int] = field(default_factory=dict)
+    #: Sal con la que se derivo la clave maestra. Hace falta para volver a derivarla con
+    #: `--ask-password`: con otra sal saldria otra clave y no abriria nada.
+    kdf_salt: str = ""
     #: De donde salio (o saldria) esta sesion. Solo sirve para poder decirlo en los
     #: mensajes de error: saber que fichero se miro ahorra la mitad del diagnostico
     #: cuando la sesion no persiste, por ejemplo dentro de un contenedor.
@@ -69,10 +104,23 @@ class SessionStore:
             ) from exc
 
         return Session(
-            control_url=datos.get("control_url", control_url),
+            # `DFSHA_CONTROL_URL` explicita GANA a la guardada. Antes era al reves, y la
+            # variable dejaba de tener efecto en cuanto existia una sesion: al encender el
+            # TLS de cliente, exportar `https://...` no cambiaba nada y el CLI seguia
+            # hablando `http://` contra un servidor que ya solo aceptaba TLS. Como `login`
+            # tambien parte de aqui, ni volver a iniciar sesion lo arreglaba.
+            control_url=(
+                os.environ.get("DFSHA_CONTROL_URL", "").strip()
+                or datos.get("control_url", control_url)
+            ),
             token=datos.get("token"),
             username=datos.get("username"),
             cwd=datos.get("cwd", "/"),
+            last_write_lsn=datos.get("last_write_lsn"),
+            master_key=datos.get("master_key"),
+            holder_id=datos.get("holder_id") or uuid.uuid4().hex,
+            locks=dict(datos.get("locks") or {}),
+            kdf_salt=datos.get("kdf_salt", ""),
             session_path=str(self.path),
         )
 
@@ -86,6 +134,11 @@ class SessionStore:
                         "token": session.token,
                         "username": session.username,
                         "cwd": session.cwd,
+                        "last_write_lsn": session.last_write_lsn,
+                        "master_key": session.master_key,
+                        "holder_id": session.holder_id,
+                        "locks": session.locks,
+                        "kdf_salt": session.kdf_salt,
                     },
                     indent=2,
                 ),

@@ -20,6 +20,9 @@ from dfsha.control_node.main import create_app
 from dfsha.control_node.repositories.database import build_engine, build_session_factory
 from dfsha.control_node.repositories.sql import SqlUnitOfWork
 
+from dfsha.common.tls import grpc_channel_credentials
+from tests.certs import material
+
 from .conftest import build_settings
 
 MB = 1024 * 1024
@@ -32,7 +35,16 @@ def plano(tmp_path: FsPath):
         tmp_path, suspect_after_ms=300, dead_after_ms=900, membership_interval_ms=50
     )
     with TestClient(create_app(settings)) as client:
-        canal = grpc.insecure_channel(f"127.0.0.1:{settings.grpc_port}")
+        # Canal SEGURO: desde el Bloque C el plano de control exige TLS mutuo, asi que
+        # un canal inseguro ni siquiera completa el handshake. Se usa el certificado de
+        # rol `data`, que es el que presentaria un DataNode de verdad.
+        canal = grpc.secure_channel(
+            f"127.0.0.1:{settings.grpc_port}",
+            grpc_channel_credentials(material("data")),
+            # El certificado se emite para `localhost`, no para `127.0.0.1` a secas en
+            # todos los backends de gRPC; se le dice contra que nombre validar.
+            options=(("grpc.ssl_target_name_override", "localhost"),),
+        )
         grpc.channel_ready_future(canal).result(timeout=10)
         stub = control_pb2_grpc.ControlPlaneStub(canal)
         try:

@@ -15,7 +15,7 @@ from dfsha.control_node.domain.membership import MembershipThresholds, state_for
 from dfsha.control_node.repositories.sql import SqlUnitOfWork
 from dfsha.control_node.tracing import query
 
-__all__ = ["NodeStatus", "cluster_status"]
+__all__ = ["NodeStatus", "ReplicationHealth", "cluster_status", "replication_health"]
 
 
 @dataclass(frozen=True, slots=True)
@@ -76,3 +76,29 @@ def cluster_status(
             )
             for n in nodos
         ]
+
+
+@dataclass(frozen=True, slots=True)
+class ReplicationHealth:
+    """Cuanta replicacion le falta al cluster entero.
+
+    Dos numeros y no uno, porque no todos los huecos cuestan lo mismo: un bloque con dos
+    copias de tres sigue tolerando una caida, y uno con una sola esta a un fallo de
+    desaparecer. Son los dos numeros que ordenan la cola de re-replicacion.
+    """
+
+    under_replicated: int
+    critical: int
+    total_blocks: int
+
+
+@query("cluster.replication_health")
+def replication_health(uow: SqlUnitOfWork, replication_factor: int) -> ReplicationHealth:
+    with uow:
+        cuentas = uow.blocks.live_replica_counts()
+
+    return ReplicationHealth(
+        under_replicated=sum(1 for c in cuentas if c < replication_factor),
+        critical=sum(1 for c in cuentas if c == 1),
+        total_blocks=len(cuentas),
+    )

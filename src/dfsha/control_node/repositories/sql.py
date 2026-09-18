@@ -14,12 +14,16 @@ transaccion: el flush escribe, el commit es el que confirma.
 from __future__ import annotations
 
 import uuid
-from datetime import datetime
+from dataclasses import dataclass
+from datetime import datetime, timedelta
 from typing import Iterable, Sequence
 
 from sqlalchemy import case, delete, func, select, update
 from sqlalchemy.orm import Session
 
+from dfsha.control_node.domain.acl import AclEntry, Permission, PrincipalType
+from dfsha.control_node.domain.filelock import FileLock, LockMode
+from dfsha.control_node.domain.leadership import Lease
 from dfsha.control_node.domain.entities import (
     Block,
     BlockReplica,
@@ -33,7 +37,21 @@ from dfsha.control_node.domain.entities import (
     User,
 )
 
-from .models import BlockReplicaRow, BlockRow, DataNodeRow, DirectoryRow, FileRow, UserRow
+from .models import (
+    FileLockRow,
+    LEADERSHIP_ROW_ID,
+    AclEntryRow,
+    GroupMemberRow,
+    GroupRow,
+    RereplicationTaskRow,
+    BlockReplicaRow,
+    BlockRow,
+    DataNodeRow,
+    DirectoryRow,
+    FileRow,
+    LeadershipRow,
+    UserRow,
+)
 
 __all__ = [
     "new_id",
@@ -42,6 +60,9 @@ __all__ = [
     "SqlFileRepository",
     "SqlBlockRepository",
     "SqlDataNodeRepository",
+    "SqlLeadershipRepository",
+    "SqlRereplicationRepository",
+    "SqlAclRepository",
     "SqlUnitOfWork",
 ]
 
@@ -58,6 +79,7 @@ def _to_user(row: UserRow) -> User:
         id=row.id,
         username=row.username,
         password_hash=row.password_hash,
+        kdf_salt=row.kdf_salt or "",
         created_at=row.created_at,
     )
 
@@ -86,6 +108,8 @@ def _to_file(row: FileRow) -> File:
         committed_at=row.committed_at,
         expires_at=row.expires_at,
         deleted_at=row.deleted_at,
+        wrapped_key=row.wrapped_key or "",
+        key_algo=row.key_algo or "",
     )
 
 
@@ -112,6 +136,7 @@ def _to_data_node(row: DataNodeRow) -> DataNode:
     return DataNode(
         id=row.id,
         advertise_url=row.advertise_url,
+        peer_url=row.peer_url or "",
         capacity_bytes=row.capacity_bytes,
         used_bytes=row.used_bytes,
         state=DataNodeState(row.state),
@@ -145,6 +170,7 @@ class SqlUserRepository:
                 id=user.id,
                 username=user.username,
                 password_hash=user.password_hash,
+                kdf_salt=user.kdf_salt,
                 created_at=user.created_at,
             )
         )
@@ -292,6 +318,8 @@ class SqlFileRepository:
                 created_at=file.created_at,
                 committed_at=file.committed_at,
                 expires_at=file.expires_at,
+                wrapped_key=file.wrapped_key,
+                key_algo=file.key_algo,
                 deleted_at=file.deleted_at,
             )
         )
@@ -348,6 +376,24 @@ class SqlFileRepository:
             )
         )
         return int(total or 0)
+
+    def set_wrapped_key(self, file_id: str, wrapped_key: str, key_algo: str) -> None:
+        """Guarda la clave envuelta del archivo. El ControlNode no puede abrirla."""
+        self._session.execute(
+            update(FileRow)
+            .where(FileRow.id == file_id)
+            .values(wrapped_key=wrapped_key, key_algo=key_algo)
+        )
+
+    def set_size(self, file_id: str, size: int) -> None:
+        """Nuevo tamano CLARO del archivo, tras un append.
+
+        `files.size` son bytes claros y `blocks.size` los almacenados: la suma de los
+        segundos NO es el primero en cuanto hay cifrado. Ver "Cifrado extremo a extremo".
+        """
+        self._session.execute(
+            update(FileRow).where(FileRow.id == file_id).values(size=size)
+        )
 
     def mark_committed(self, file_id: str, committed_at: datetime) -> None:
         self._session.execute(
@@ -432,6 +478,77 @@ class SqlBlockRepository:
             )
         self._session.flush()
 
+    def add_replica(
+        self, block_id: str, data_node_id: str, state: ReplicaState, now: datetime
+    ) -> bool:
+        """Registra una copia planificada en un nodo donde el bloque todavia no estaba.
+
+        Lo usa la re-replicacion. Es la decision 3 de CLAUDE.md aplicada tambien aqui:
+        **el ControlNode elige el destino y REGISTRA la eleccion**. Sin esta fila, el
+        nodo destino copia el bloque y al avisar recibe un 404 ("bloque desconocido en el
+        metadato"), porque `mark_stored` solo sabe actualizar una fila que ya existe; la
+        copia queda en disco como huerfana y la tarea nunca se cierra.
+
+        Idempotente: si la fila ya esta, no se toca.
+        """
+        existe = self._session.get(BlockReplicaRow, (block_id, data_node_id))
+        if existe is not None:
+            return False
+        self._session.add(
+            BlockReplicaRow(
+                block_id=block_id,
+                data_node_id=data_node_id,
+                state=state.value,
+                created_at=now,
+            )
+        )
+        self._session.flush()
+        return True
+
+    def drop_replica(self, block_id: str, data_node_id: str) -> bool:
+        """Quita una copia PLANIFICADA que nunca llego a escribirse.
+
+        Solo borra si sigue en PENDING: una fila STORED es una copia real y borrarla
+        seria perder la pista de bytes que estan en disco.
+        """
+        borradas = self._session.execute(
+            delete(BlockReplicaRow).where(
+                BlockReplicaRow.block_id == block_id,
+                BlockReplicaRow.data_node_id == data_node_id,
+                BlockReplicaRow.state == ReplicaState.PENDING.value,
+            )
+        ).rowcount
+        return borradas > 0
+
+    def detach(self, block_id: str) -> None:
+        """Desliga un bloque de su archivo, dejandolo huerfano para el GC.
+
+        Lo usa el append al reescribir el bloque de cola: el bloque viejo NO se borra —los
+        bloques son inmutables y borrar bytes es cosa del GC— pero deja de formar parte
+        del archivo. Es la decision 1 de la seccion 1 aplicada a un bloque en vez de a un
+        archivo entero: copy-on-write.
+
+        Se hace poniendo el `file_id` a NULL, no borrando la fila: la fila lleva las
+        `block_replicas`, que son las que le dicen al GC en que discos hay que ir a
+        borrar. Borrarla aqui dejaria los bytes en disco sin que nadie supiera donde.
+        """
+        self._session.execute(
+            update(BlockRow).where(BlockRow.block_id == block_id).values(file_id=None)
+        )
+
+    def get_many(self, block_ids: Sequence[str]) -> list[Block]:
+        """Varios bloques por id, en una sola consulta.
+
+        Existe para que empujar N ordenes por el stream no cueste N consultas: el
+        heartbeat pasa por aqui cada 3 s y por cada nodo.
+        """
+        if not block_ids:
+            return []
+        filas = self._session.scalars(
+            select(BlockRow).where(BlockRow.block_id.in_(list(block_ids)))
+        )
+        return [_to_block(fila) for fila in filas]
+
     def list_for_file(self, file_id: str) -> list[Block]:
         rows = self._session.scalars(
             select(BlockRow).where(BlockRow.file_id == file_id).order_by(BlockRow.index)
@@ -473,24 +590,134 @@ class SqlBlockRepository:
         return True
 
     def pending_block_ids(self, file_id: str) -> list[str]:
-        almacenados = (
-            select(BlockReplicaRow.block_id)
+        """Bloques sin NINGUNA replica almacenada. Equivale a `blocks_below_quorum(1)`."""
+        return self.blocks_below_quorum(file_id, quorum=1)
+
+    def blocks_below_quorum(self, file_id: str, quorum: int) -> list[str]:
+        """Bloques del archivo con menos de `quorum` replicas en estado STORED.
+
+        Esta consulta es la que decide si un `commit` pasa, y por eso cuenta replicas en
+        vez de mirar si hay alguna: con W=2 y R=3, un bloque con una sola copia no vale,
+        aunque exista. Y con dos si vale, aunque falte la tercera.
+
+        Un bloque sin ninguna fila de replica tambien sale aqui, porque su cuenta es 0.
+        """
+        almacenadas = (
+            select(
+                BlockReplicaRow.block_id.label("block_id"),
+                func.count().label("copias"),
+            )
             .where(BlockReplicaRow.state == ReplicaState.STORED.value)
-            .scalar_subquery()
+            .group_by(BlockReplicaRow.block_id)
+            .subquery()
         )
         rows = self._session.scalars(
             select(BlockRow.block_id)
-            .where(BlockRow.file_id == file_id, BlockRow.block_id.not_in(almacenados))
+            .outerjoin(almacenadas, almacenadas.c.block_id == BlockRow.block_id)
+            .where(
+                BlockRow.file_id == file_id,
+                func.coalesce(almacenadas.c.copias, 0) < quorum,
+            )
             .order_by(BlockRow.index)
         )
         return list(rows)
 
+    def ids_below_quorum(self, block_ids: Sequence[str], quorum: int) -> list[str]:
+        """Como `blocks_below_quorum` pero sobre una LISTA de bloques, no un archivo.
+
+        La necesita el commit del append: sus bloques nuevos todavia no pertenecen a
+        ningun archivo —nacen con `file_id` NULL y se enganchan al confirmar—, asi que
+        una consulta por `file_id` no los veria.
+        """
+        if not block_ids:
+            return []
+        almacenadas = (
+            select(
+                BlockReplicaRow.block_id.label("block_id"),
+                func.count().label("copias"),
+            )
+            .where(BlockReplicaRow.state == ReplicaState.STORED.value)
+            .group_by(BlockReplicaRow.block_id)
+            .subquery()
+        )
+        rows = self._session.scalars(
+            select(BlockRow.block_id)
+            .outerjoin(almacenadas, almacenadas.c.block_id == BlockRow.block_id)
+            .where(
+                BlockRow.block_id.in_(list(block_ids)),
+                func.coalesce(almacenadas.c.copias, 0) < quorum,
+            )
+            .order_by(BlockRow.index)
+        )
+        return list(rows)
+
+    def attach(self, block_ids: Sequence[str], file_id: str) -> None:
+        """Engancha bloques sueltos a su archivo. El paso final del append.
+
+        Los bloques del append nacen con `file_id` NULL y **su indice definitivo ya
+        puesto**. Engancharlos es una sola escritura, y va en la MISMA transaccion que
+        desligar el bloque de cola viejo: si fueran dos pasos, entre ellos habria un
+        instante con dos bloques en el mismo `(file_id, index)` —lo impide el UNIQUE— o
+        con el archivo sin su cola.
+        """
+        if not block_ids:
+            return
+        self._session.execute(
+            update(BlockRow)
+            .where(BlockRow.block_id.in_(list(block_ids)))
+            .values(file_id=file_id)
+        )
+
+    def stored_replica_counts(self, file_id: str) -> dict[str, int]:
+        """Cuantas copias STORED tiene cada bloque del archivo.
+
+        Alimenta el estado de replicacion que muestra `stat`. Se deriva contando filas,
+        nunca de una columna de estado guardada: una columna asi se queda vieja en cuanto
+        una re-replicacion termina y nadie se acuerda de actualizarla.
+        """
+        filas = self._session.execute(
+            select(BlockRow.block_id, func.count(BlockReplicaRow.block_id))
+            .outerjoin(
+                BlockReplicaRow,
+                (BlockReplicaRow.block_id == BlockRow.block_id)
+                & (BlockReplicaRow.state == ReplicaState.STORED.value),
+            )
+            .where(BlockRow.file_id == file_id)
+            .group_by(BlockRow.block_id)
+        )
+        return {block_id: copias for block_id, copias in filas}
+
+    def live_replica_counts(self) -> list[int]:
+        """Copias STORED de cada bloque de un archivo COMMITTED.
+
+        Solo archivos COMMITTED: los bloques de una reserva en curso todavia se estan
+        subiendo, y contarlos como sub-replicados haria que el numero del cluster
+        parpadeara con cada `put` en vuelo. Los de archivos DELETED son basura del GC, no
+        replicacion que falte.
+        """
+        filas = self._session.execute(
+            select(BlockRow.block_id, func.count(BlockReplicaRow.block_id))
+            .join(FileRow, FileRow.id == BlockRow.file_id)
+            .outerjoin(
+                BlockReplicaRow,
+                (BlockReplicaRow.block_id == BlockRow.block_id)
+                & (BlockReplicaRow.state == ReplicaState.STORED.value),
+            )
+            .where(FileRow.state == FileState.COMMITTED.value)
+            .group_by(BlockRow.block_id)
+        )
+        return [copias for _, copias in filas]
+
     def list_orphans(self, now: datetime) -> list[tuple[Block, list[BlockReplica]]]:
+        # OUTER JOIN y no INNER: el tercer caso de huerfano es un bloque SIN archivo
+        # (`file_id IS NULL`), que un INNER JOIN descartaria. Lo produce el `append` al
+        # reescribir un bloque de cola a medias.
         huerfanos = self._session.scalars(
             select(BlockRow)
-            .join(FileRow, FileRow.id == BlockRow.file_id)
+            .outerjoin(FileRow, FileRow.id == BlockRow.file_id)
             .where(
-                (FileRow.state == FileState.DELETED.value)
+                BlockRow.file_id.is_(None)
+                | (FileRow.state == FileState.DELETED.value)
                 | (
                     (FileRow.state == FileState.WRITING.value)
                     & (FileRow.expires_at.is_not(None))
@@ -604,6 +831,7 @@ class SqlDataNodeRepository:
         fault_domain: str = "",
         boot_id: str = "",
         data_node_id: str | None = None,
+        peer_url: str = "",
     ) -> DataNode:
         """Alta o re-alta de un nodo.
 
@@ -628,6 +856,7 @@ class SqlDataNodeRepository:
             row = DataNodeRow(
                 id=data_node_id or new_id(),
                 advertise_url=advertise_url,
+                peer_url=peer_url,
                 fault_domain=fault_domain,
                 boot_id=boot_id,
                 capacity_bytes=capacity_bytes,
@@ -644,6 +873,7 @@ class SqlDataNodeRepository:
             # redespliega con otra URL anunciada, se le cambia el dominio de falla, o
             # arranca con el disco vacio y otro boot_id.
             row.advertise_url = advertise_url
+            row.peer_url = peer_url
             row.fault_domain = fault_domain
             row.boot_id = boot_id
             row.capacity_bytes = capacity_bytes
@@ -743,6 +973,720 @@ class SqlDataNodeRepository:
         )
 
 
+@dataclass(frozen=True, slots=True)
+class ExpiredTasks:
+    """Lo que dejo una pasada de expiracion."""
+
+    requeued: int
+    gave_up: int
+    #: (block_id, data_node_id) de los destinos que no llegaron a escribir el bloque.
+    abandoned_targets: list[tuple[str, str]]
+
+
+class SqlRereplicationRepository:
+    """La cola de copias pendientes.
+
+    Aqui solo hay consultas y escrituras. Quien decide QUE copiar y ADONDE es
+    `domain/rereplication.py`, que es puro y se prueba sin base de datos.
+    """
+
+    def __init__(self, session: Session) -> None:
+        self._session = session
+
+    # --- Deteccion ---------------------------------------------------------
+
+    def blocks_missing_replicas(self, replication_factor: int) -> list[dict]:
+        """Bloques de archivos COMMITTED con menos de `replication_factor` copias STORED.
+
+        Devuelve TODAS sus filas de replica, no solo las STORED: quien decide necesita
+        saber que nodos las tienen (para no repetir destino), en que dominio estan, y
+        desde cuando llevan pendientes (para la espera de gracia).
+
+        Solo archivos COMMITTED. Los de una reserva en curso se estan subiendo ahora
+        mismo y programar su copia seria correr detras del cliente; los de archivos
+        DELETED son basura del GC, no replicacion que falte.
+        """
+        cortos = (
+            select(BlockRow.block_id)
+            .join(FileRow, FileRow.id == BlockRow.file_id)
+            .outerjoin(
+                BlockReplicaRow,
+                (BlockReplicaRow.block_id == BlockRow.block_id)
+                & (BlockReplicaRow.state == ReplicaState.STORED.value),
+            )
+            .where(FileRow.state == FileState.COMMITTED.value)
+            .group_by(BlockRow.block_id)
+            .having(func.count(BlockReplicaRow.block_id) < replication_factor)
+            .scalar_subquery()
+        )
+
+        filas = self._session.execute(
+            select(
+                BlockRow.block_id,
+                BlockRow.size,
+                BlockRow.checksum_sha256,
+                BlockReplicaRow.data_node_id,
+                BlockReplicaRow.state,
+                BlockReplicaRow.created_at,
+                DataNodeRow.fault_domain,
+                DataNodeRow.last_heartbeat_at,
+                DataNodeRow.advertise_url,
+            )
+            .outerjoin(BlockReplicaRow, BlockReplicaRow.block_id == BlockRow.block_id)
+            .outerjoin(DataNodeRow, DataNodeRow.id == BlockReplicaRow.data_node_id)
+            .where(BlockRow.block_id.in_(cortos))
+            .order_by(BlockRow.block_id)
+        )
+
+        agrupado: dict[str, dict] = {}
+        for fila in filas:
+            entrada = agrupado.setdefault(
+                fila.block_id,
+                {
+                    "block_id": fila.block_id,
+                    "size": fila.size,
+                    "checksum_sha256": fila.checksum_sha256,
+                    "replicas": [],
+                },
+            )
+            if fila.data_node_id is not None:
+                entrada["replicas"].append(
+                    {
+                        "data_node_id": fila.data_node_id,
+                        "state": fila.state,
+                        "created_at": fila.created_at,
+                        "fault_domain": fila.fault_domain or "",
+                        "last_heartbeat_at": fila.last_heartbeat_at,
+                        "advertise_url": fila.advertise_url or "",
+                    }
+                )
+        return list(agrupado.values())
+
+    # --- Cola --------------------------------------------------------------
+
+    def has_active_task(self, block_id: str) -> bool:
+        total = self._session.scalar(
+            select(func.count())
+            .select_from(RereplicationTaskRow)
+            .where(
+                RereplicationTaskRow.block_id == block_id,
+                RereplicationTaskRow.state.in_(("PENDING", "IN_FLIGHT")),
+            )
+        )
+        return (total or 0) > 0
+
+    def enqueue_delete(
+        self, block_id: str, target_node_id: str, now: datetime, expires_at: datetime
+    ) -> str | None:
+        """Encola un borrado dirigido a un nodo concreto.
+
+        Nace ya en IN_FLIGHT porque no hay nada que decidir: el destino lo dice quien
+        encola, que es el GC y ya sabe en que nodos esta el huerfano.
+        """
+        if self.has_active_task(block_id):
+            return None
+        task_id = new_id()
+        self._session.add(
+            RereplicationTaskRow(
+                id=task_id,
+                block_id=block_id,
+                kind="DELETE",
+                state="IN_FLIGHT",
+                target_node_id=target_node_id,
+                replicas_at_schedule=0,
+                created_at=now,
+                dispatched_at=now,
+                expires_at=expires_at,
+                attempts=1,
+            )
+        )
+        self._session.flush()
+        return task_id
+
+    def enqueue(self, block_id: str, replicas_now: int, now: datetime) -> str | None:
+        """Encola una copia. `None` si ya habia una tarea viva para ese bloque.
+
+        La comprobacion previa evita el caso normal, pero quien garantiza la unicidad es
+        el indice unico parcial del esquema: dos lideres solapados durante un relevo
+        pueden pasar los dos por aqui a la vez.
+        """
+        if self.has_active_task(block_id):
+            return None
+        task_id = new_id()
+        self._session.add(
+            RereplicationTaskRow(
+                id=task_id,
+                block_id=block_id,
+                kind="REPLICATE",
+                state="PENDING",
+                replicas_at_schedule=replicas_now,
+                created_at=now,
+                attempts=0,
+            )
+        )
+        self._session.flush()
+        return task_id
+
+    def list_pending(self) -> list[RereplicationTaskRow]:
+        return list(
+            self._session.scalars(
+                select(RereplicationTaskRow)
+                .where(
+                    RereplicationTaskRow.state == "PENDING",
+                    RereplicationTaskRow.kind == "REPLICATE",
+                )
+                .order_by(
+                    RereplicationTaskRow.replicas_at_schedule,
+                    RereplicationTaskRow.block_id,
+                )
+            )
+        )
+
+    def in_flight_by_target(self) -> dict[str, int]:
+        filas = self._session.execute(
+            select(RereplicationTaskRow.target_node_id, func.count())
+            .where(
+                RereplicationTaskRow.state == "IN_FLIGHT",
+                RereplicationTaskRow.target_node_id.is_not(None),
+            )
+            .group_by(RereplicationTaskRow.target_node_id)
+        )
+        return {node_id: n for node_id, n in filas}
+
+    def dispatch(
+        self,
+        task_id: str,
+        source_node_id: str,
+        target_node_id: str,
+        now: datetime,
+        expires_at: datetime,
+    ) -> None:
+        self._session.execute(
+            update(RereplicationTaskRow)
+            .where(RereplicationTaskRow.id == task_id)
+            .values(
+                state="IN_FLIGHT",
+                source_node_id=source_node_id,
+                target_node_id=target_node_id,
+                dispatched_at=now,
+                expires_at=expires_at,
+                attempts=RereplicationTaskRow.attempts + 1,
+            )
+        )
+
+    def orders_for(
+        self, target_node_id: str, now: datetime, resend_after: timedelta
+    ) -> list[RereplicationTaskRow]:
+        """Ordenes que hay que empujarle a este nodo por su stream de heartbeat.
+
+        `resend_after` evita reenviar la misma orden en cada latido: el nodo late cada
+        3 s y copiar un bloque tarda mas que eso.
+        """
+        limite = now - resend_after
+        return list(
+            self._session.scalars(
+                select(RereplicationTaskRow).where(
+                    RereplicationTaskRow.target_node_id == target_node_id,
+                    RereplicationTaskRow.state == "IN_FLIGHT",
+                    (RereplicationTaskRow.sent_at.is_(None))
+                    | (RereplicationTaskRow.sent_at < limite),
+                )
+            )
+        )
+
+    def mark_sent(self, task_ids: Sequence[str], now: datetime) -> None:
+        if not task_ids:
+            return
+        self._session.execute(
+            update(RereplicationTaskRow)
+            .where(RereplicationTaskRow.id.in_(list(task_ids)))
+            .values(sent_at=now)
+        )
+
+    def complete(self, block_id: str, target_node_id: str) -> int:
+        """Cierra la tarea cuando el destino confirma que ya tiene el bloque.
+
+        La confirmacion llega por el camino de siempre (el aviso de bloque almacenado, o
+        el block report), no por un mensaje propio: un camino menos que mantener.
+        """
+        return self._session.execute(
+            update(RereplicationTaskRow)
+            .where(
+                RereplicationTaskRow.block_id == block_id,
+                RereplicationTaskRow.target_node_id == target_node_id,
+                RereplicationTaskRow.state == "IN_FLIGHT",
+            )
+            .values(state="DONE", expires_at=None)
+        ).rowcount
+
+    def expire_stale(self, now: datetime, max_attempts: int) -> "ExpiredTasks":
+        """Devuelve a la cola las copias que el destino no confirmo a tiempo.
+
+        Mismo mecanismo de expiracion que las reservas de escritura de la Etapa 1 y que
+        el lease de liderazgo: quien se cae a mitad no bloquea el recurso para siempre.
+        Pasado `max_attempts` la tarea se marca FAILED en vez de reintentarse
+        eternamente: un bloque que falla una y otra vez es un problema que hay que mirar,
+        no uno que se arregle insistiendo.
+
+        Devuelve tambien los destinos abandonados, para que quien llama pueda quitar la
+        fila PENDING de `block_replicas` que quedo apuntando a un nodo que nunca escribio
+        el bloque. Sin eso, ese nodo seguiria contando como "ya lo tiene" y el proximo
+        despacho lo descartaria como destino para siempre.
+        """
+        vencidas = list(
+            self._session.scalars(
+                select(RereplicationTaskRow).where(
+                    RereplicationTaskRow.state == "IN_FLIGHT",
+                    RereplicationTaskRow.expires_at.is_not(None),
+                    RereplicationTaskRow.expires_at < now,
+                )
+            )
+        )
+        devueltas = rendidas = 0
+        abandonados: list[tuple[str, str]] = []
+        for tarea in vencidas:
+            if tarea.target_node_id:
+                abandonados.append((tarea.block_id, tarea.target_node_id))
+            if tarea.attempts >= max_attempts:
+                tarea.state = "FAILED"
+                tarea.last_error = f"sin confirmar tras {tarea.attempts} intentos"
+                rendidas += 1
+            else:
+                tarea.state = "PENDING"
+                tarea.target_node_id = None
+                tarea.source_node_id = None
+                tarea.sent_at = None
+                tarea.expires_at = None
+                devueltas += 1
+        self._session.flush()
+        return ExpiredTasks(
+            requeued=devueltas, gave_up=rendidas, abandoned_targets=abandonados
+        )
+
+    def counts_by_state(self) -> dict[str, int]:
+        filas = self._session.execute(
+            select(RereplicationTaskRow.state, func.count()).group_by(
+                RereplicationTaskRow.state
+            )
+        )
+        return {estado: n for estado, n in filas}
+
+
+class SqlAclRepository:
+    """Grupos y concesiones. Solo lectura y escritura; quien DECIDE es `domain/acl`."""
+
+    def __init__(self, session: Session) -> None:
+        self._session = session
+
+    # --- Grupos ------------------------------------------------------------
+
+    def create_group(self, name: str, owner_id: str, now: datetime) -> str:
+        group_id = new_id()
+        self._session.add(
+            GroupRow(id=group_id, name=name, owner_id=owner_id, created_at=now)
+        )
+        self._session.flush()
+        return group_id
+
+    def get_group(self, group_id: str) -> GroupRow | None:
+        return self._session.get(GroupRow, group_id)
+
+    def find_group(self, owner_id: str, name: str) -> GroupRow | None:
+        return self._session.scalar(
+            select(GroupRow).where(
+                GroupRow.owner_id == owner_id, GroupRow.name == name
+            )
+        )
+
+    def list_groups(self, owner_id: str) -> list[GroupRow]:
+        return list(
+            self._session.scalars(
+                select(GroupRow)
+                .where(GroupRow.owner_id == owner_id)
+                .order_by(GroupRow.name)
+            )
+        )
+
+    def add_member(self, group_id: str, user_id: str, now: datetime) -> bool:
+        """Idempotente: anadir dos veces al mismo miembro no es un error."""
+        if self._session.get(GroupMemberRow, (group_id, user_id)) is not None:
+            return False
+        self._session.add(
+            GroupMemberRow(group_id=group_id, user_id=user_id, added_at=now)
+        )
+        self._session.flush()
+        return True
+
+    def remove_member(self, group_id: str, user_id: str) -> bool:
+        borradas = self._session.execute(
+            delete(GroupMemberRow).where(
+                GroupMemberRow.group_id == group_id,
+                GroupMemberRow.user_id == user_id,
+            )
+        ).rowcount
+        return borradas > 0
+
+    def list_members(self, group_id: str) -> list[str]:
+        return list(
+            self._session.scalars(
+                select(GroupMemberRow.user_id).where(
+                    GroupMemberRow.group_id == group_id
+                )
+            )
+        )
+
+    def groups_of(self, user_id: str) -> set[str]:
+        """Grupos a los que pertenece. Una sola consulta porque los grupos son PLANOS:
+        con grupos dentro de grupos esto seria un recorrido con deteccion de ciclos."""
+        return set(
+            self._session.scalars(
+                select(GroupMemberRow.group_id).where(
+                    GroupMemberRow.user_id == user_id
+                )
+            )
+        )
+
+    # --- Concesiones -------------------------------------------------------
+
+    def grant(
+        self,
+        directory_id: str,
+        principal_type: int,
+        principal_id: str,
+        permission: int,
+        granted_by: str,
+        now: datetime,
+    ) -> None:
+        """Concede o ACTUALIZA. Nunca acumula dos filas para el mismo principal.
+
+        Es lo que hace que bajar un permiso baje de verdad: como el permiso efectivo es
+        el maximo, dejar la concesion vieja debajo haria que la mas alta siguiera ganando.
+        """
+        existente = self._session.scalar(
+            select(AclEntryRow).where(
+                AclEntryRow.directory_id == directory_id,
+                AclEntryRow.principal_type == principal_type,
+                AclEntryRow.principal_id == principal_id,
+            )
+        )
+        if existente is not None:
+            existente.permission = permission
+            existente.granted_by = granted_by
+            existente.granted_at = now
+        else:
+            self._session.add(
+                AclEntryRow(
+                    id=new_id(),
+                    directory_id=directory_id,
+                    principal_type=principal_type,
+                    principal_id=principal_id,
+                    permission=permission,
+                    granted_by=granted_by,
+                    granted_at=now,
+                )
+            )
+        self._session.flush()
+
+    def revoke(
+        self, directory_id: str, principal_type: int, principal_id: str
+    ) -> bool:
+        borradas = self._session.execute(
+            delete(AclEntryRow).where(
+                AclEntryRow.directory_id == directory_id,
+                AclEntryRow.principal_type == principal_type,
+                AclEntryRow.principal_id == principal_id,
+            )
+        ).rowcount
+        return borradas > 0
+
+    def entries_for(self, directory_ids: Sequence[str]) -> dict[str, list[AclEntry]]:
+        """Todas las concesiones de una cadena de directorios, en UNA consulta.
+
+        Se piden de golpe y no una por nivel porque resolver un permiso recorre la cadena
+        entera: con una consulta por nivel, comprobar un permiso en `/a/b/c/d` costaria
+        cuatro viajes a la base por cada operacion del namespace.
+        """
+        if not directory_ids:
+            return {}
+        filas = self._session.scalars(
+            select(AclEntryRow).where(AclEntryRow.directory_id.in_(list(directory_ids)))
+        )
+        agrupado: dict[str, list[AclEntry]] = {}
+        for fila in filas:
+            agrupado.setdefault(fila.directory_id, []).append(
+                AclEntry(
+                    directory_id=fila.directory_id,
+                    principal_type=PrincipalType(fila.principal_type),
+                    principal_id=fila.principal_id,
+                    permission=Permission(fila.permission),
+                )
+            )
+        return agrupado
+
+    def entries_on(self, directory_id: str) -> list[AclEntryRow]:
+        """Las concesiones puestas EN este directorio, sin heredar. Para `dfsha acl`."""
+        return list(
+            self._session.scalars(
+                select(AclEntryRow).where(AclEntryRow.directory_id == directory_id)
+            )
+        )
+
+    def shared_with(self, user_id: str, group_ids: set[str]) -> list[AclEntryRow]:
+        """Concesiones que alcanzan a este usuario, directas o por sus grupos.
+
+        Es lo que alimenta `/compartido-conmigo`. No se mezcla con su arbol propio: tu
+        espacio es tuyo y lo ajeno esta aparte, que es lo que mantiene el modelo mental
+        limpio cuando alguien te comparte un directorio que se llama igual que uno tuyo.
+        """
+        condiciones = [
+            (AclEntryRow.principal_type == PrincipalType.USER.value)
+            & (AclEntryRow.principal_id == user_id)
+        ]
+        if group_ids:
+            condiciones.append(
+                (AclEntryRow.principal_type == PrincipalType.GROUP.value)
+                & (AclEntryRow.principal_id.in_(list(group_ids)))
+            )
+        from sqlalchemy import or_
+
+        return list(
+            self._session.scalars(
+                select(AclEntryRow).where(or_(*condiciones)).order_by(AclEntryRow.granted_at)
+            )
+        )
+
+
+class SqlFileLockRepository:
+    """Los locks del RF3. Mismo patron que el lease de liderazgo, por el mismo motivo.
+
+    `lock_rows()` no es un `list()` con otro nombre: toma cerrojo sobre las filas del
+    archivo. Leer los locks sin cerrojo y escribir despues deja una ventana por la que
+    dos clientes obtienen el mismo EXCLUSIVE, que es exactamente lo que el lock existe
+    para impedir.
+    """
+
+    def __init__(self, session: Session) -> None:
+        self._session = session
+
+    def lock_rows(self, file_id: str) -> list[FileLock]:
+        """Los locks de un archivo, con `SELECT ... FOR UPDATE` sobre sus filas.
+
+        Devuelve tambien los VENCIDOS: quien decide es `domain/filelock.can_acquire`, que
+        los ignora. Filtrarlos aqui repartiria la regla del vencimiento entre el
+        repositorio y el dominio, y bastaria tocar uno de los dos para que dejaran de
+        cuadrar.
+
+        **SQLite no implementa `FOR UPDATE`** y no se pide, igual que en el liderazgo:
+        escribe con cerrojo de base entera y el efecto se consigue igual.
+        """
+        consulta = select(FileLockRow).where(FileLockRow.file_id == file_id)
+        if self._session.bind is not None and self._session.bind.dialect.name != "sqlite":
+            consulta = consulta.with_for_update()
+        return [_to_file_lock(f) for f in self._session.execute(consulta).scalars()]
+
+    def peek(self, file_id: str) -> list[FileLock]:
+        """Los locks SIN cerrojo. Solo para mostrarlos (`stat`, `dfsha locks`).
+
+        Separada de `lock_rows()` por el mismo motivo que `peek` del liderazgo: una
+        consulta informativa no debe contender con las escrituras.
+        """
+        filas = self._session.execute(
+            select(FileLockRow).where(FileLockRow.file_id == file_id)
+        ).scalars()
+        return [_to_file_lock(f) for f in filas]
+
+    def upsert(self, lock: FileLock, holder_name: str = "") -> None:
+        """Concede o renueva. La unicidad (file_id, holder_id) la garantiza el esquema."""
+        fila = self._session.execute(
+            select(FileLockRow).where(
+                FileLockRow.file_id == lock.file_id,
+                FileLockRow.holder_id == lock.holder_id,
+            )
+        ).scalar_one_or_none()
+
+        if fila is None:
+            self._session.add(
+                FileLockRow(
+                    id=new_id(),
+                    file_id=lock.file_id,
+                    holder_id=lock.holder_id,
+                    holder_name=holder_name,
+                    mode=lock.mode.value,
+                    epoch=lock.epoch,
+                    acquired_at=lock.acquired_at,
+                    expires_at=lock.expires_at,
+                )
+            )
+            return
+
+        fila.mode = lock.mode.value
+        fila.epoch = lock.epoch
+        fila.acquired_at = lock.acquired_at
+        fila.expires_at = lock.expires_at
+        if holder_name:
+            fila.holder_name = holder_name
+
+    def release(self, file_id: str, holder_id: str) -> bool:
+        fila = self._session.execute(
+            select(FileLockRow).where(
+                FileLockRow.file_id == file_id, FileLockRow.holder_id == holder_id
+            )
+        ).scalar_one_or_none()
+        if fila is None:
+            return False
+        self._session.delete(fila)
+        return True
+
+    def max_epoch(self, file_id: str) -> int:
+        """La epoca mas alta que ha tenido este archivo, incluidos los locks vencidos.
+
+        Se mira el maximo y NO el del lock que se sustituye: la epoca de un archivo SOLO
+        SUBE, igual que la del liderazgo. Si se reiniciara al conceder un lock nuevo, un
+        cliente congelado con una epoca vieja podria volver a validarla, que es el fallo
+        entero que la epoca existe para cerrar.
+        """
+        valor = self._session.execute(
+            select(func.max(FileLockRow.epoch)).where(FileLockRow.file_id == file_id)
+        ).scalar()
+        return int(valor or 0)
+
+
+def _to_file_lock(fila: FileLockRow) -> FileLock:
+    return FileLock(
+        file_id=fila.file_id,
+        holder_id=fila.holder_id,
+        mode=LockMode(fila.mode),
+        epoch=fila.epoch,
+        acquired_at=fila.acquired_at,
+        expires_at=fila.expires_at,
+    )
+
+
+class SqlLeadershipRepository:
+    """El lease de liderazgo. Una fila, y toda la concurrencia del Bloque A pasa por ella.
+
+    `lock()` no es un `get()` con otro nombre: toma un cerrojo de fila. Todo lo que lea
+    o escriba el lease pasa por ahi, porque leerlo sin cerrojo y escribir despues deja
+    una ventana en la que otra instancia se cuela entre la lectura y la escritura, que es
+    exactamente el fallo que este mecanismo existe para evitar.
+    """
+
+    def __init__(self, session: Session) -> None:
+        self._session = session
+
+    def lock(self) -> Lease | None:
+        """Lee el lease tomando `SELECT ... FOR UPDATE` sobre su fila.
+
+        El cerrojo dura hasta el final de la transaccion, asi que si el llamador hace la
+        comprobacion de epoca y la escritura dentro del mismo `with`, ninguna otra
+        instancia puede adquirir el lease en medio.
+
+        **SQLite no implementa `FOR UPDATE`** y no se pide: escribe con un cerrojo de
+        base entera, asi que el efecto se consigue igual. La consecuencia para las
+        pruebas esta dicha en CLAUDE.md: la comparacion de epoca se prueba en SQLite, la
+        exclusion mutua real solo contra PostgreSQL.
+        """
+        consulta = select(LeadershipRow).where(LeadershipRow.id == LEADERSHIP_ROW_ID)
+        if self._session.bind is not None and self._session.bind.dialect.name != "sqlite":
+            consulta = consulta.with_for_update()
+
+        fila = self._session.execute(consulta).scalar_one_or_none()
+        return _to_lease(fila) if fila is not None else None
+
+    def peek(self) -> Lease | None:
+        """Lee el lease SIN cerrojo. Solo para exponerlo por la API.
+
+        Separada de `lock()` a proposito: un `GET /cluster/leadership` cada pocos
+        segundos tomando cerrojo sobre la fila que el lider renueva cada 2 s convertiria
+        una consulta informativa en un punto de contencion.
+        """
+        fila = self._session.get(LeadershipRow, LEADERSHIP_ROW_ID)
+        return _to_lease(fila) if fila is not None else None
+
+    def seed(self) -> Lease:
+        """Crea la fila si no esta. En PostgreSQL la siembra la migracion 0002; esto
+        cubre el esquema de SQLite de las pruebas, que se crea con `create_all`."""
+        fila = LeadershipRow(id=LEADERSHIP_ROW_ID, leader_id=None, epoch=0)
+        self._session.add(fila)
+        self._session.flush()
+        return _to_lease(fila)
+
+    def acquire(
+        self, leader_id: str, epoch: int, now: datetime, expires_at: datetime
+    ) -> Lease:
+        """Toma el lease con una epoca NUEVA. Nunca se reutiliza una epoca."""
+        self._session.execute(
+            update(LeadershipRow)
+            .where(LeadershipRow.id == LEADERSHIP_ROW_ID)
+            .values(
+                leader_id=leader_id,
+                epoch=epoch,
+                acquired_at=now,
+                renewed_at=now,
+                expires_at=expires_at,
+            )
+        )
+        return Lease(
+            leader_id=leader_id,
+            epoch=epoch,
+            acquired_at=now,
+            renewed_at=now,
+            expires_at=expires_at,
+        )
+
+    def renew(
+        self, leader_id: str, epoch: int, now: datetime, expires_at: datetime
+    ) -> Lease:
+        """Extiende el lease conservando la epoca.
+
+        El `where` repite leader_id y epoch aunque la fila ya se leyo bajo cerrojo: es
+        barato y convierte un error de programacion (renovar el lease de otro) en cero
+        filas afectadas en vez de en una usurpacion silenciosa.
+        """
+        resultado = self._session.execute(
+            update(LeadershipRow)
+            .where(
+                LeadershipRow.id == LEADERSHIP_ROW_ID,
+                LeadershipRow.leader_id == leader_id,
+                LeadershipRow.epoch == epoch,
+            )
+            .values(renewed_at=now, expires_at=expires_at)
+        )
+        if resultado.rowcount == 0:
+            raise RuntimeError(
+                "se intento renovar un lease que ya no es de esta instancia"
+            )
+        fila = self._session.get(LeadershipRow, LEADERSHIP_ROW_ID)
+        return _to_lease(fila)
+
+    def release(self, leader_id: str, epoch: int) -> None:
+        """Suelta el lease al apagarse limpiamente.
+
+        No hace falta para que el sistema sea correcto (el lease vence solo), pero hace
+        que un apagado ordenado no cueste un TTL entero sin lider. La epoca NO se toca:
+        el siguiente en tomarlo la subira.
+        """
+        self._session.execute(
+            update(LeadershipRow)
+            .where(
+                LeadershipRow.id == LEADERSHIP_ROW_ID,
+                LeadershipRow.leader_id == leader_id,
+                LeadershipRow.epoch == epoch,
+            )
+            .values(leader_id=None, expires_at=None)
+        )
+
+
+def _to_lease(fila: LeadershipRow) -> Lease:
+    return Lease(
+        leader_id=fila.leader_id,
+        epoch=fila.epoch,
+        acquired_at=fila.acquired_at,
+        renewed_at=fila.renewed_at,
+        expires_at=fila.expires_at,
+    )
+
+
 class SqlUnitOfWork:
     """Una sesion, una transaccion, todos los repositorios dentro.
 
@@ -768,6 +1712,10 @@ class SqlUnitOfWork:
         self.files = SqlFileRepository(self._session)
         self.blocks = SqlBlockRepository(self._session)
         self.data_nodes = SqlDataNodeRepository(self._session)
+        self.leadership = SqlLeadershipRepository(self._session)
+        self.rereplication = SqlRereplicationRepository(self._session)
+        self.acl = SqlAclRepository(self._session)
+        self.file_locks = SqlFileLockRepository(self._session)
 
     def __enter__(self) -> "SqlUnitOfWork":
         if self._session is None:

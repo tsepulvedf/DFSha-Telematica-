@@ -29,6 +29,12 @@ __all__ = [
     "BlockRow",
     "BlockReplicaRow",
     "DataNodeRow",
+    "LeadershipRow",
+    "LEADERSHIP_ROW_ID",
+    "RereplicationTaskRow",
+    "GroupRow",
+    "GroupMemberRow",
+    "AclEntryRow",
 ]
 
 ID_LEN = 36
@@ -72,6 +78,14 @@ class UserRow(Base):
     id: Mapped[str] = mapped_column(String(ID_LEN), primary_key=True)
     username: Mapped[str] = mapped_column(String(NAME_LEN), unique=True, nullable=False)
     password_hash: Mapped[str] = mapped_column(String(255), nullable=False)
+    #: Sal del KDF con el que el CLIENTE deriva su clave maestra. NO es secreta: su
+    #: trabajo es que dos usuarios con la misma contrasena tengan claves distintas y que
+    #: no se puedan precalcular tablas contra todo el sistema a la vez. Por eso se puede
+    #: devolver en el login sin comprometer nada.
+    #:
+    #: Nunca vacia desde la migracion 0008. Antes lo estaba en todo usuario anterior al
+    #: Bloque C, y eso hacia que el cliente subiera sus archivos EN CLARO sin avisar.
+    kdf_salt: Mapped[str] = mapped_column(String(64), nullable=False, default="")
     created_at: Mapped[datetime] = mapped_column(UtcDateTime, nullable=False)
 
 
@@ -149,6 +163,20 @@ class FileRow(Base):
     expires_at: Mapped[datetime | None] = mapped_column(UtcDateTime, nullable=True)
     deleted_at: Mapped[datetime | None] = mapped_column(UtcDateTime, nullable=True)
 
+    #: Clave del archivo ENVUELTA con la clave maestra del usuario, en hexadecimal.
+    #:
+    #: Es lo unico del esquema de cifrado que llega al servidor, y sin la clave maestra
+    #: —que nunca sale del cliente— no es mas que ruido. Con esto, la sal del usuario y
+    #: todos los bloques del disco, el servidor sigue sin poder descifrar nada.
+    #:
+    #: Vacia = archivo SIN CIFRAR. Es lo que permite que los archivos subidos en las
+    #: Etapas 1 y 2 se sigan pudiendo bajar: el cliente mira este campo para decidir si
+    #: descifra, en vez de suponerlo.
+    wrapped_key: Mapped[str] = mapped_column(String(255), nullable=False, default="")
+    #: Que algoritmo se uso. Existe para que cambiarlo algun dia no obligue a adivinar
+    #: con que se cifro cada archivo viejo.
+    key_algo: Mapped[str] = mapped_column(String(32), nullable=False, default="")
+
     __table_args__ = (
         # Unicidad solo entre los archivos vivos: la misma ruta puede acumular versiones
         # DELETED (copy-on-write) y reservas WRITING abandonadas sin colisionar.
@@ -171,8 +199,12 @@ class BlockRow(Base):
     __tablename__ = "blocks"
 
     block_id: Mapped[str] = mapped_column(String(ID_LEN), primary_key=True)
-    file_id: Mapped[str] = mapped_column(
-        String(ID_LEN), ForeignKey("files.id"), nullable=False, index=True
+    #: NULL = bloque DESLIGADO: ya no pertenece a ningun archivo y el GC puede recogerlo.
+    #: Lo produce el `append` al reescribir un bloque de cola a medias (copy-on-write,
+    #: decision 1). La fila sobrevive porque sus `block_replicas` son lo unico que sabe en
+    #: que discos estan sus bytes; borrarla los dejaria perdidos.
+    file_id: Mapped[str | None] = mapped_column(
+        String(ID_LEN), ForeignKey("files.id"), nullable=True, index=True
     )
     index: Mapped[int] = mapped_column(Integer, nullable=False)
     size: Mapped[int] = mapped_column(BigInteger, nullable=False)
@@ -209,9 +241,15 @@ class DataNodeRow(Base):
     __tablename__ = "data_nodes"
 
     id: Mapped[str] = mapped_column(String(ID_LEN), primary_key=True)
-    #: Direccion alcanzable por el CLIENTE, no por el ControlNode. El ControlNode se
-    #: limita a repetirsela al cliente en el plan, porque los bytes van directos.
+    #: Direccion alcanzable por el CLIENTE. El ControlNode se limita a repetirsela en
+    #: el plan, porque los bytes van directos.
     advertise_url: Mapped[str] = mapped_column(String(512), unique=True, nullable=False)
+    #: Direccion alcanzable por OTROS DATANODES. Vacia = usar `advertise_url`.
+    #:
+    #: NO lleva `unique`, al contrario que `advertise_url`: dos nodos con la misma
+    #: direccion de par serian un error de despliegue, pero detectarlo con una
+    #: restriccion impediria el caso legitimo de dejarla vacia en varios nodos a la vez.
+    peer_url: Mapped[str] = mapped_column(String(512), nullable=False, default="")
     #: Cadena opaca: solo se compara igualdad. En local son etiquetas logicas
     #: (local-1..local-4); en AWS, zonas de disponibilidad reales.
     fault_domain: Mapped[str] = mapped_column(String(128), nullable=False, default="")
@@ -238,3 +276,208 @@ class DataNodeRow(Base):
     stat_bytes_written_60s: Mapped[int] = mapped_column(BigInteger, nullable=False, default=0)
 
     __table_args__ = (Index("ix_data_nodes_state", "state"),)
+
+
+#: El liderazgo es una fila unica. La clave primaria fija es lo que lo garantiza: no hay
+#: forma de insertar una segunda, ni por una carrera ni por un error de codigo.
+LEADERSHIP_ROW_ID = 1
+
+
+class LeadershipRow(Base):
+    """El lease de liderazgo del ControlNode. Una sola fila, id = 1.
+
+    Vive en la base y no en la memoria de ningun proceso a proposito: es lo unico que
+    tres instancias sin estado comparten, y por tanto el unico sitio donde pueden
+    ponerse de acuerdo. La exclusion la da `SELECT ... FOR UPDATE` sobre esta fila.
+    """
+
+    __tablename__ = "leadership"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=False)
+    #: Quien lo sostiene. NULL solo en la fila recien sembrada, antes del primer lider.
+    leader_id: Mapped[str | None] = mapped_column(String(ID_LEN), nullable=True)
+    #: Token de aislamiento. SOLO SUBE: nunca baja ni se reinicia, ni siquiera cuando el
+    #: mismo proceso recupera el lease que acababa de perder. Ver domain/leadership.py.
+    epoch: Mapped[int] = mapped_column(BigInteger, nullable=False, default=0)
+    acquired_at: Mapped[datetime | None] = mapped_column(UtcDateTime, nullable=True)
+    renewed_at: Mapped[datetime | None] = mapped_column(UtcDateTime, nullable=True)
+    expires_at: Mapped[datetime | None] = mapped_column(UtcDateTime, nullable=True)
+
+
+class FileLockRow(Base):
+    """Un lock sobre un archivo, vivo o vencido.
+
+    **Los vencidos se quedan en la tabla y no molestan.** El vencimiento se evalua al
+    consultar (`domain/filelock.can_acquire` los ignora), que es la regla de las
+    comprobaciones perezosas de la seccion 1. Borrarlos exigiria un barrido en background,
+    que es justo lo que ese diseno evita.
+
+    `holder_id` es una SESION, no un usuario: Ana desde dos maquinas son dos titulares, y
+    tiene que ser asi o el lock no excluiria nada entre sus propios procesos. Por eso no
+    hay clave foranea a `users`.
+    """
+
+    __tablename__ = "file_locks"
+
+    id: Mapped[str] = mapped_column(String(ID_LEN), primary_key=True)
+    file_id: Mapped[str] = mapped_column(
+        String(ID_LEN), ForeignKey("files.id", ondelete="CASCADE"), nullable=False
+    )
+    holder_id: Mapped[str] = mapped_column(String(ID_LEN), nullable=False)
+    #: Para poder decir «lo tiene ana» en el conflicto. No se usa para decidir.
+    holder_name: Mapped[str] = mapped_column(String(64), nullable=False, default="")
+    mode: Mapped[str] = mapped_column(String(16), nullable=False)
+    #: Token de aislamiento, igual que el del liderazgo. SOLO SUBE. Es lo que impide que
+    #: un cliente congelado despierte pasado el vencimiento y escriba encima del
+    #: siguiente. Ver domain/filelock.py.
+    epoch: Mapped[int] = mapped_column(BigInteger, nullable=False, default=0)
+    acquired_at: Mapped[datetime] = mapped_column(UtcDateTime, nullable=False)
+    expires_at: Mapped[datetime] = mapped_column(UtcDateTime, nullable=False)
+
+    __table_args__ = (
+        # Pedir dos veces el mismo lock es RENOVAR, no crear otra fila. Sin esto, un
+        # cliente que reintenta tras un timeout de red se dejaria filas sueltas que
+        # cuentan como titulares distintos, y su EXCLUSIVE entraria en conflicto consigo
+        # mismo.
+        UniqueConstraint("file_id", "holder_id", name="uq_file_locks_file_holder"),
+        Index("ix_file_locks_file", "file_id"),
+    )
+
+
+class RereplicationTaskRow(Base):
+    """Una copia pendiente de hacer.
+
+    La cola vive en la base y no en la memoria del lider, y eso no es casualidad: si
+    viviera en memoria se perderia justo cuando mas falta hace, que es cuando el lider
+    cambia de manos. Ademas el stream de heartbeat del nodo destino lo puede estar
+    atendiendo OTRA instancia, que tiene que poder leer la orden para empujarsela.
+    """
+
+    __tablename__ = "rereplication_tasks"
+
+    id: Mapped[str] = mapped_column(String(ID_LEN), primary_key=True)
+    block_id: Mapped[str] = mapped_column(
+        String(ID_LEN), ForeignKey("blocks.block_id", ondelete="CASCADE"), nullable=False
+    )
+    #: REPLICATE (copiar de un nodo a otro) o DELETE (borrar un huerfano).
+    #:
+    #: Las dos ordenes comparten tabla porque comparten TODO lo que las hace no
+    #: triviales: van por el mismo stream, tienen que sobrevivir a un cambio de lider,
+    #: no se pueden reenviar en cada latido, y hay que saber si el nodo las cumplio.
+    #: Dos tablas serian dos copias del mismo mecanismo.
+    kind: Mapped[str] = mapped_column(String(16), nullable=False, default="REPLICATE")
+    #: PENDING -> IN_FLIGHT -> DONE | FAILED
+    state: Mapped[str] = mapped_column(String(16), nullable=False)
+    #: De donde tirar los bytes. Se decide al despachar, no al detectar el hueco: entre
+    #: una cosa y otra el origen elegido puede haberse caido.
+    source_node_id: Mapped[str | None] = mapped_column(String(ID_LEN), nullable=True)
+    target_node_id: Mapped[str | None] = mapped_column(String(ID_LEN), nullable=True)
+    #: Copias que tenia el bloque cuando se detecto el hueco. Es la clave de prioridad.
+    replicas_at_schedule: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+
+    created_at: Mapped[datetime] = mapped_column(UtcDateTime, nullable=False)
+    dispatched_at: Mapped[datetime | None] = mapped_column(UtcDateTime, nullable=True)
+    #: Ultima vez que la orden se empujo por el stream. Sin esto se reenviaria en cada
+    #: latido, tres veces por segundo y por nodo.
+    sent_at: Mapped[datetime | None] = mapped_column(UtcDateTime, nullable=True)
+    #: Si el destino no confirma antes de esto, la tarea vuelve a PENDING. Es el mismo
+    #: mecanismo de expiracion que las reservas de escritura de la Etapa 1 y el lease de
+    #: liderazgo: un cliente (aqui, un DataNode) que se cae no bloquea el recurso.
+    expires_at: Mapped[datetime | None] = mapped_column(UtcDateTime, nullable=True)
+    attempts: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    last_error: Mapped[str | None] = mapped_column(String(255), nullable=True)
+
+    __table_args__ = (
+        # Una sola tarea VIVA por bloque. Sin esto, dos pasadas del planificador (o dos
+        # lideres solapados durante un relevo) programarian la misma copia dos veces.
+        Index(
+            "uq_rereplication_block_activa",
+            "block_id",
+            unique=True,
+            sqlite_where=text("state IN ('PENDING', 'IN_FLIGHT')"),
+            postgresql_where=text("state IN ('PENDING', 'IN_FLIGHT')"),
+        ),
+        Index("ix_rereplication_state", "state"),
+        Index("ix_rereplication_target", "target_node_id", "state"),
+    )
+
+
+class GroupRow(Base):
+    """Un grupo plano: tiene miembros, y no otros grupos.
+
+    Sin anidamiento a proposito. Un grupo dentro de otro obliga a recorrer un grafo para
+    responder "de que grupos es miembro este usuario", con ciclos que hay que detectar, y
+    convierte una consulta constante en un recorrido. Para lo que el enunciado pide
+    —compartir un directorio con un equipo— un grupo plano basta.
+    """
+
+    __tablename__ = "groups"
+
+    id: Mapped[str] = mapped_column(String(ID_LEN), primary_key=True)
+    name: Mapped[str] = mapped_column(String(NAME_LEN), nullable=False)
+    owner_id: Mapped[str] = mapped_column(
+        String(ID_LEN), ForeignKey("users.id"), nullable=False, index=True
+    )
+    created_at: Mapped[datetime] = mapped_column(UtcDateTime, nullable=False)
+
+    __table_args__ = (
+        # El nombre es unico POR DUENO, no globalmente: que Ana tenga un grupo "equipo"
+        # no puede impedir que Beto tenga el suyo. Los grupos se nombran para quien los
+        # usa, no para un espacio compartido.
+        UniqueConstraint("owner_id", "name", name="uq_groups_owner_name"),
+    )
+
+
+class GroupMemberRow(Base):
+    __tablename__ = "group_members"
+
+    group_id: Mapped[str] = mapped_column(
+        String(ID_LEN), ForeignKey("groups.id", ondelete="CASCADE"), primary_key=True
+    )
+    user_id: Mapped[str] = mapped_column(
+        String(ID_LEN), ForeignKey("users.id"), primary_key=True
+    )
+    added_at: Mapped[datetime] = mapped_column(UtcDateTime, nullable=False)
+
+    __table_args__ = (Index("ix_group_members_user", "user_id"),)
+
+
+class AclEntryRow(Base):
+    """Una concesion sobre un directorio. SOLO concesiones: no hay denegaciones.
+
+    Se cuelga de un DIRECTORIO y no de un archivo: el permiso se resuelve subiendo por el
+    arbol, asi que colgarlo de archivos sueltos obligaria a mirar dos sitios en cada
+    comprobacion sin ganar expresividad.
+    """
+
+    __tablename__ = "acl_entries"
+
+    id: Mapped[str] = mapped_column(String(ID_LEN), primary_key=True)
+    directory_id: Mapped[str] = mapped_column(
+        String(ID_LEN), ForeignKey("directories.id", ondelete="CASCADE"), nullable=False
+    )
+    #: 1 = USER, 2 = GROUP. Ver domain/acl.PrincipalType.
+    principal_type: Mapped[int] = mapped_column(Integer, nullable=False)
+    principal_id: Mapped[str] = mapped_column(String(ID_LEN), nullable=False)
+    #: 1 = READ, 2 = WRITE, 3 = ADMIN. Se guarda el entero y no el nombre para que el
+    #: orden de potencia sea el del propio dato: comparar es lo que se hace todo el rato.
+    permission: Mapped[int] = mapped_column(Integer, nullable=False)
+    granted_by: Mapped[str] = mapped_column(
+        String(ID_LEN), ForeignKey("users.id"), nullable=False
+    )
+    granted_at: Mapped[datetime] = mapped_column(UtcDateTime, nullable=False)
+
+    __table_args__ = (
+        # Una sola concesion por (directorio, principal): conceder otra vez ACTUALIZA el
+        # permiso en vez de acumular filas. Sin esto, bajar un permiso dejaria la
+        # concesion vieja debajo y el maximo la haria ganar, o sea que bajar un permiso
+        # no bajaria nada.
+        UniqueConstraint(
+            "directory_id",
+            "principal_type",
+            "principal_id",
+            name="uq_acl_directory_principal",
+        ),
+        Index("ix_acl_directory", "directory_id"),
+        Index("ix_acl_principal", "principal_type", "principal_id"),
+    )

@@ -94,12 +94,20 @@ def ensure_can_commit(
     file: File,
     pending_block_ids: list[str],
     now: datetime | None = None,
+    quorum: int = 1,
 ) -> None:
     """Orden deliberado: primero el vencimiento, luego los bloques.
 
     Una reserva vencida es 410 aunque todos los bloques esten arriba, porque el nombre ya
     pudo ser tomado por otro cliente y el commit produciria dos archivos vivos en la misma
     ruta.
+
+    `pending_block_ids` son los bloques que **no alcanzan el quorum** de escritura, no
+    los que no tienen ninguna copia. Con W=2 y R=3, un bloque con una sola replica cuenta
+    como pendiente y uno con dos no, aunque le falte la tercera: un archivo con 2 de 3
+    copias no esta roto, todavia tolera perder un nodo, y la tercera la completa la
+    re-replicacion. `quorum` solo entra en el mensaje de error, para que un 409 diga que
+    se esperaba en vez de dejar al cliente adivinando.
     """
     now = now or utcnow()
 
@@ -115,10 +123,11 @@ def ensure_can_commit(
         )
     if pending_block_ids:
         raise BlocksNotStoredError(
-            "faltan bloques por subir",
+            f"hay bloques que no alcanzan el quorum de escritura (W={quorum})",
             file_id=file.id,
             missing=pending_block_ids[:20],
             missing_count=len(pending_block_ids),
+            quorum=quorum,
         )
 
 

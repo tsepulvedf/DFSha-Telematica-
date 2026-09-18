@@ -7,12 +7,12 @@ temporal sin parchear modulos.
 
 from __future__ import annotations
 
-import secrets
 from typing import Annotated, Callable
 
 from fastapi import Depends, Header, Request
 
 from dfsha.common.errors import AuthenticationError
+from dfsha.common.blocktoken import TokenSigner
 from dfsha.control_node.config import ControlNodeSettings
 from dfsha.control_node.repositories.sql import SqlUnitOfWork
 from dfsha.control_node.services.auth import TokenClaims, decode_access_token
@@ -21,27 +21,37 @@ from dfsha.control_node.services.placement import (
     BlockPlacementPolicy,
     LeastLoadedPlacement,
 )
+from dfsha.control_node.services.read_routing import ReadRouter
 
 __all__ = [
-    "INTERNAL_SECRET_HEADER",
     "get_settings_dep",
     "get_uow_factory",
     "get_uow",
+    "get_read_router",
+    "get_query_uow",
     "get_placement",
     "current_user",
-    "require_internal_secret",
     "Settings",
     "Uow",
+    "QueryUow",
     "UowFactory",
     "Placement",
     "CurrentUser",
+    "Signer",
 ]
-
-INTERNAL_SECRET_HEADER = "X-DFSha-Internal-Secret"
-
 
 def get_settings_dep(request: Request) -> ControlNodeSettings:
     return request.app.state.settings
+
+
+def get_token_signer(request: Request) -> TokenSigner | None:
+    """El firmante de tokens de bloque. `None` cuando no hay TLS configurado.
+
+    Que sea opcional no es una puerta trasera: el DataNode solo exige token cuando el
+    tambien tiene CA, y las dos condiciones son la misma —hay material TLS o no lo hay—.
+    En un despliegue sin TLS no hay nada que verificar contra nada.
+    """
+    return request.app.state.token_signer
 
 
 def get_uow_factory(request: Request) -> Callable[[], SqlUnitOfWork]:
@@ -57,6 +67,26 @@ def get_uow(
     exactamente lo que dura la operacion y no lo que dura la peticion HTTP.
     """
     return factory()
+
+
+def get_read_router(request: Request) -> ReadRouter:
+    return request.app.state.read_router
+
+
+def get_query_uow(
+    router: Annotated[ReadRouter, Depends(get_read_router)],
+    x_dfsha_read_lsn: Annotated[str | None, Header()] = None,
+) -> SqlUnitOfWork:
+    """Unidad de trabajo para el LADO DE CONSULTA.
+
+    Va a la replica salvo que el cliente traiga un LSN que la replica todavia no ha
+    reproducido, en cuyo caso se atiende desde el primario. Ver `services/read_routing`.
+
+    Que sea una dependencia distinta de `get_uow` y no un parametro de esta es lo que
+    hace imposible que un comando acabe por error contra la replica: el tipo del
+    parametro del endpoint dice a que lado pertenece.
+    """
+    return router.for_read(x_dfsha_read_lsn).uow
 
 
 def get_placement(
@@ -90,23 +120,17 @@ def current_user(
     return decode_access_token(token.strip(), settings.jwt_secret)
 
 
-def require_internal_secret(
-    settings: Annotated[ControlNodeSettings, Depends(get_settings_dep)],
-    x_dfsha_internal_secret: Annotated[str | None, Header()] = None,
-) -> None:
-    """Protege `/internal/v1`, que solo deben tocar el DataNode y el GC.
-
-    Comparacion en tiempo constante: con `==`, el tiempo de respuesta filtra cuantos
-    caracteres iniciales acerto quien prueba. En la Etapa 3 esto pasa a mTLS.
-    """
-    if not x_dfsha_internal_secret or not secrets.compare_digest(
-        x_dfsha_internal_secret, settings.internal_secret
-    ):
-        raise AuthenticationError("secreto interno invalido o ausente")
+# El `require_internal_secret` de las Etapas 1 y 2 ya no existe. El plano interno vive
+# ahora en un puerto propio con TLS mutuo, asi que la puerta la guarda el propio TLS:
+# quien no presente un certificado firmado por la CA de DFSha no llega a enviar la
+# peticion, y no hay ninguna comprobacion en el codigo que se pueda olvidar en una ruta
+# nueva. Ver `common/tls.py` y `create_internal_app`.
 
 
 Settings = Annotated[ControlNodeSettings, Depends(get_settings_dep)]
 Uow = Annotated[SqlUnitOfWork, Depends(get_uow)]
+QueryUow = Annotated[SqlUnitOfWork, Depends(get_query_uow)]
 UowFactory = Annotated[Callable[[], SqlUnitOfWork], Depends(get_uow_factory)]
 Placement = Annotated[BlockPlacementPolicy, Depends(get_placement)]
+Signer = Annotated[TokenSigner | None, Depends(get_token_signer)]
 CurrentUser = Annotated[TokenClaims, Depends(current_user)]

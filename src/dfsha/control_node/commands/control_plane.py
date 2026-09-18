@@ -12,7 +12,9 @@ from datetime import datetime
 
 from dfsha.common.errors import NotFoundError
 from dfsha.common.logging import get_logger
+from dfsha.control_node.commands.leadership import require_leadership
 from dfsha.control_node.domain.divergence import DivergenceReport, compare
+from dfsha.control_node.domain.leadership import Fencing
 from dfsha.control_node.domain.entities import (
     DataNode,
     DataNodeState,
@@ -69,6 +71,7 @@ def register_node(
     boot_id: str,
     capacity_bytes: int,
     data_node_id: str = "",
+    peer_url: str = "",
 ) -> RegistrationResult:
     """Da de alta un nodo, o lo readmite.
 
@@ -96,6 +99,7 @@ def register_node(
             fault_domain=fault_domain,
             boot_id=boot_id,
             data_node_id=(existente.id if existente else data_node_id) or None,
+            peer_url=peer_url,
         )
 
         perdidas = 0
@@ -110,6 +114,7 @@ def register_node(
         "node.registered",
         data_node_id=nodo.id,
         advertise_url=advertise_url,
+        peer_url=nodo.peer_base_url,
         fault_domain=fault_domain,
         boot_id=boot_id,
         capacity_bytes=capacity_bytes,
@@ -302,18 +307,31 @@ def evaluate_membership(
     uow: SqlUnitOfWork,
     thresholds: MembershipThresholds,
     now: datetime | None = None,
+    fencing: Fencing | None = None,
 ) -> list[StateChange]:
     """Persiste las transiciones de estado y emite sus eventos.
 
     El estado real se deriva del ultimo heartbeat en cada lectura, asi que esto no es lo
     que mantiene el sistema correcto: es lo que hace que la transicion quede registrada
     y que las replicas de un nodo muerto dejen de anunciarse.
+
+    **Exige liderazgo** (Etapa 3). Con varios ControlNodes, dos instancias evaluando a la
+    vez marcarian el mismo nodo muerto dos veces y, en el Bloque B, programarian la misma
+    re-replicacion por duplicado. La comprobacion de epoca va DENTRO de este `with`, en
+    la misma transaccion que las escrituras: comprobar fuera dejaria una ventana entre la
+    comprobacion y la escritura por la que se cuela un lider congelado.
+
+    `fencing=None` mantiene el comportamiento de la Etapa 2, sin liderazgo. Lo usan las
+    pruebas que evaluan la maquina de estados, que no tiene nada que ver con el lease.
     """
     log = get_logger("control_node")
     ahora = now or utcnow()
     cambios: list[StateChange] = []
 
     with uow:
+        if fencing is not None:
+            require_leadership(uow, fencing, ahora)
+
         for nodo in uow.data_nodes.list_all():
             cambio = evaluate(nodo, ahora, thresholds)
             if cambio is None:

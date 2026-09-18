@@ -21,10 +21,10 @@ from pathlib import Path
 import httpx
 
 from dfsha.common.logging import get_logger
+from dfsha.common.tls import TlsMaterial
 
 __all__ = ["ControlClient", "NodeIdentity", "Identity"]
 
-INTERNAL_SECRET_HEADER = "X-DFSha-Internal-Secret"
 IDENTITY_FILE = "node.json"
 
 
@@ -92,11 +92,41 @@ class NodeIdentity:
 
 
 class ControlClient:
-    def __init__(self, control_url: str, internal_secret: str, timeout: float = 10.0) -> None:
+    """Habla con el plano interno del ControlNode, presentando su certificado.
+
+    El plano interno vive en un puerto propio con TLS mutuo: sin un certificado firmado
+    por la CA de DFSha, la conexion no llega ni a enviar la peticion. Eso sustituye al
+    `X-DFSha-Internal-Secret` de las etapas anteriores, y la diferencia importa: un
+    secreto compartido dice que quien llama lo conoce, un certificado dice QUIEN es.
+    """
+
+    def __init__(
+        self,
+        control_url: str,
+        tls: TlsMaterial | None = None,
+        timeout: float = 10.0,
+    ) -> None:
         self.control_url = control_url.rstrip("/")
-        self._headers = {INTERNAL_SECRET_HEADER: internal_secret}
         self._timeout = timeout
+        self._tls = tls
         self._log = get_logger("data_node")
+        #: Un cliente reutilizado, no uno por peticion: el handshake TLS es caro y este
+        #: camino se recorre una vez por cada bloque que se sube.
+        self._cliente = self._construir_cliente()
+
+    def _construir_cliente(self) -> httpx.Client:
+        """Un cliente con contexto SSL construido a mano.
+
+        **No** `verify=<ruta>` con `cert=(crt, key)`: esa combinacion hace que httpx
+        descarte el certificado de cliente sin avisar, y el plano interno rechazaria a
+        este DataNode igual que a un intruso. Ver `common/tls.client_ssl_context`.
+        """
+        if self._tls is None:
+            return httpx.Client(timeout=self._timeout)
+        return httpx.Client(timeout=self._timeout, verify=self._tls.httpx_verify())
+
+    def close(self) -> None:
+        self._cliente.close()
 
     def notify_stored(
         self, block_id: str, data_node_id: str, size: int, checksum_sha256: str
@@ -107,14 +137,12 @@ class ControlClient:
         subido, el ControlNode ya lo sabe: sin ese orden, un commit inmediato podria
         encontrar el bloque todavia en PENDING y fallar con 409 por una carrera.
         """
-        respuesta = httpx.post(
+        respuesta = self._cliente.post(
             f"{self.control_url}/internal/v1/blocks/{block_id}/stored",
             json={
                 "data_node_id": data_node_id,
                 "size": size,
                 "checksum_sha256": checksum_sha256,
             },
-            headers=self._headers,
-            timeout=self._timeout,
         )
         respuesta.raise_for_status()

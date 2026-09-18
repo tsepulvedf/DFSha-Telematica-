@@ -31,6 +31,8 @@ __all__ = [
     "ChecksumMismatchError",
     "NoDataNodeAvailableError",
     "StorageError",
+    "NotLeaderError",
+    "StaleEpochError",
 ]
 
 
@@ -154,6 +156,64 @@ class NoDataNodeAvailableError(DFShaError):
     """Ningun DataNode vivo con espacio para colocar el bloque."""
 
     code = "no_datanode_available"
+
+
+# --- Liderazgo (Etapa 3) ---------------------------------------------------
+
+
+class NotLeaderError(DFShaError):
+    """Esta instancia no sostiene el lease y la operacion lo exige.
+
+    No es un fallo: con tres ControlNodes, dos de ellos no son lideres en todo momento.
+    """
+
+    code = "not_leader"
+
+
+class StaleEpochError(DFShaError):
+    """La epoca con la que se pidio la operacion ya no es la vigente.
+
+    Este es el error que atrapa al lider congelado: una pausa larga del recolector de
+    basura o una particion de red dejan a una instancia creyendo que sigue mandando
+    mientras otra ya tomo el lease. Se comprueba DENTRO de la misma transaccion que la
+    operacion, porque comprobarlo antes deja una ventana en la que el lease puede
+    cambiar entre la comprobacion y la escritura.
+    """
+
+    code = "stale_epoch"
+
+
+class FileLockedError(DFShaError):
+    """Otro cliente sostiene un lock incompatible sobre el archivo.
+
+    Lleva `holder` y `retry_after_seconds` para que el cliente pueda decidir si esperar:
+    «el archivo esta bloqueado» sin decir por quien ni hasta cuando es un mensaje con el
+    que no se puede hacer nada.
+    """
+
+    code = "file_locked"
+
+
+class StaleLockError(DFShaError):
+    """El lock con el que se pidio la operacion ya no es el vigente.
+
+    El equivalente del RF3 a `StaleEpochError`, y atrapa al mismo tipo de fallo: un
+    cliente que se congelo con el lock tomado, vio vencer su lease sin enterarse, y
+    despierta escribiendo encima de quien lo tomo despues. Se comprueba DENTRO de la
+    misma transaccion que la escritura, por el mismo motivo.
+    """
+
+    code = "stale_lock"
+
+
+class TlsCaNotFoundError(DFShaError):
+    """El servidor habla HTTPS y el cliente no encuentra la CA con la que verificarlo.
+
+    Es un error de CONFIGURACION del cliente, no del servidor, y por eso lleva la lista de
+    rutas donde buscó: un «SSL: CERTIFICATE_VERIFY_FAILED» a secas no dice qué hacer.
+    """
+
+    code = "tls_ca_no_encontrada"
 
 
 class StorageError(DFShaError):

@@ -1,6 +1,7 @@
-# DFSha - Etapa 2: un ControlNode y cuatro DataNodes en dominios de falla distintos.
+# DFSha - Etapa 3: PostgreSQL primario y replica, tres ControlNodes tras un balanceador,
+# y cuatro DataNodes en dominios de falla distintos.
 #
-#   cp .env.example .env    # y rellena los dos secretos
+#   cp .env.example .env    # y rellena los secretos (JWT, interno y los dos de Postgres)
 #   docker compose up --build
 #
 # ESCENARIO SOPORTADO: el cliente corre en el HOST y habla con los puertos publicados.
@@ -13,62 +14,244 @@
 #
 # Ojo con la asimetria, que es deliberada:
 #   DFSHA_DATANODE_ADVERTISE_URL -> localhost:800N   (lo consume el CLIENTE, desde fuera)
-#   DFSHA_CONTROL_GRPC_URL       -> control-node:9000 (ControlNode<->DataNode, por dentro)
-#   DFSHA_CONTROL_URL            -> control-node:8000 (idem, confirmacion de bloque)
+#   DFSHA_DATANODE_PEER_URL      -> data-node-N:8001 (lo consumen OTROS DATANODES, dentro)
+#   DFSHA_CONTROL_GRPC_URL       -> lb:9000          (ControlNode<->DataNode, por dentro)
+#   DFSHA_CONTROL_URL            -> lb:8000          (idem, confirmacion de bloque)
+#
+# Los DataNodes laten contra el BALANCEADOR, no contra una instancia fija. Asi, matar al
+# ControlNode lider no deja a ningun DataNode sin camino: reconecta y su latido acaba en
+# otra instancia. Puede funcionar asi porque el heartbeat escribe en la base compartida,
+# no en la memoria del proceso que lo recibe.
 
 name: "dfsha"
+
+# --- Etapa 3: el metadato vive en PostgreSQL -------------------------------
+#
+# Un primario y una replica en streaming. La replica sirve el lado de CONSULTA de CQRS
+# (ls, stat, open); los comandos y las lecturas que tienen que ver su propia escritura
+# van al primario. Ver "Enrutado CQRS" en CLAUDE.md.
+#
+# La promocion de la replica ante caida del primario es MANUAL y esta escrita en
+# deploy/RUNBOOK-postgres.md. Un failover de base de datos automatico y correcto es otro
+# proyecto, y uno a medias es peor que ninguno.
+
+x-postgres-secrets: &postgres-secrets
+  POSTGRES_USER: "dfsha"
+  POSTGRES_DB: "dfsha"
+  POSTGRES_PASSWORD: "${DFSHA_PG_PASSWORD:?falta DFSHA_PG_PASSWORD; copia .env.example a .env}"
+  DFSHA_REPLICATION_USER: "replicador"
+  DFSHA_REPLICATION_PASSWORD: "${DFSHA_PG_REPLICATION_PASSWORD:?falta DFSHA_PG_REPLICATION_PASSWORD; copia .env.example a .env}"
+
+x-controlnode-env: &controlnode-env
+  DFSHA_DB_URL: "postgresql+psycopg://dfsha:${DFSHA_PG_PASSWORD:?falta DFSHA_PG_PASSWORD}@postgres-primary:5432/dfsha"
+  DFSHA_DB_REPLICA_URL: "postgresql+psycopg://dfsha:${DFSHA_PG_PASSWORD:?falta DFSHA_PG_PASSWORD}@postgres-replica:5432/dfsha"
+  DFSHA_JWT_SECRET: "${DFSHA_JWT_SECRET:?falta DFSHA_JWT_SECRET; copia .env.example a .env}"
+  # mTLS del plano interno. SUSTITUYEN a DFSHA_INTERNAL_SECRET, que ya no existe.
+  # Generalos antes de levantar nada:  python scripts/gen_certs.py
+  DFSHA_TLS_CA_CERT: "/etc/dfsha/certs/ca.crt"
+  DFSHA_TLS_CERT: "/etc/dfsha/certs/control.crt"
+  DFSHA_TLS_KEY: "/etc/dfsha/certs/control.key"
+  DFSHA_INTERNAL_PORT: "8443"
+  DFSHA_BLOCK_SIZE: "${DFSHA_BLOCK_SIZE:-67108864}"
+  DFSHA_JWT_TTL_SECONDS: "${DFSHA_JWT_TTL_SECONDS:-3600}"
+  DFSHA_WRITE_TTL_SECONDS: "${DFSHA_WRITE_TTL_SECONDS:-600}"
+  DFSHA_LOG_LEVEL: "${DFSHA_LOG_LEVEL:-INFO}"
+  DFSHA_GRPC_PORT: "9000"
+  DFSHA_HEARTBEAT_INTERVAL_MS: "${DFSHA_HEARTBEAT_INTERVAL_MS:-3000}"
+  DFSHA_FULL_REPORT_EVERY_N: "${DFSHA_FULL_REPORT_EVERY_N:-20}"
+  DFSHA_SUSPECT_AFTER_MS: "${DFSHA_SUSPECT_AFTER_MS:-10000}"
+  DFSHA_DEAD_AFTER_MS: "${DFSHA_DEAD_AFTER_MS:-30000}"
+  DFSHA_MEMBERSHIP_INTERVAL_MS: "${DFSHA_MEMBERSHIP_INTERVAL_MS:-1000}"
+  # Lease de liderazgo. RENEW tiene que ser menor que TTL o el servicio no arranca.
+  DFSHA_LEASE_TTL_MS: "${DFSHA_LEASE_TTL_MS:-6000}"
+  DFSHA_LEASE_RENEW_MS: "${DFSHA_LEASE_RENEW_MS:-2000}"
+  DFSHA_REPLICATION_FACTOR: "${DFSHA_REPLICATION_FACTOR:-3}"
+  DFSHA_WRITE_QUORUM: "${DFSHA_WRITE_QUORUM:-2}"
+  # Re-replicacion. La gracia por defecto son 5 minutos; para la demostracion se baja:
+  #   DFSHA_REREPLICATION_GRACE_MS=30000 docker compose up -d
+  DFSHA_REREPLICATION_GRACE_MS: "${DFSHA_REREPLICATION_GRACE_MS:-300000}"
+  DFSHA_REREPLICATION_MAX_PER_NODE: "${DFSHA_REREPLICATION_MAX_PER_NODE:-2}"
+  DFSHA_REREPLICATION_MAX_PER_PASS: "${DFSHA_REREPLICATION_MAX_PER_PASS:-8}"
+  DFSHA_REREPLICATION_INTERVAL_MS: "${DFSHA_REREPLICATION_INTERVAL_MS:-5000}"
+  DFSHA_PLACEMENT_D: "${DFSHA_PLACEMENT_D:-3}"
+  DFSHA_MIN_FREE_BYTES: "${DFSHA_MIN_FREE_BYTES:-134217728}"
+
+x-controlnode-base: &controlnode-base
+  build:
+    context: "."
+    dockerfile: "docker/control_node.Dockerfile"
+  image: "dfsha/control-node:0.3.0"
+  # Solo lectura, y solo lo que le toca: aqui esta tambien ca.key, que NO deberia salir
+  # de la maquina que firma. Montar el directorio entero es la comodidad de un despliegue
+  # de practica; en AWS cada instancia recibe unicamente sus tres ficheros.
+  volumes:
+    - "./certs:/etc/dfsha/certs:ro"
+  depends_on:
+    migrate:
+      condition: "service_completed_successfully"
+    postgres-replica:
+      condition: "service_healthy"
+  healthcheck:
+    # HTTP o HTTPS segun DFSHA_CLIENT_TLS_CERT, la misma variable que decide el servidor.
+    # Con una URL http:// fija, encender C2 dejaba el stack sin arrancar. Ver la sonda.
+    test: ["CMD", "python", "-m", "dfsha.common.healthcheck", "8000"]
+    interval: "5s"
+    timeout: "3s"
+    start_period: "10s"
+    retries: 10
+  restart: "unless-stopped"
 
 x-datanode-base: &datanode-base
   build:
     context: "."
     dockerfile: "docker/data_node.Dockerfile"
-  image: "dfsha/data-node:0.2.0"
+  image: "dfsha/data-node:0.3.0"
   restart: "unless-stopped"
   depends_on:
-    control-node:
+    lb:
       condition: "service_healthy"
 
 x-datanode-env: &datanode-env
   DFSHA_DATA_DIR: "/var/lib/dfsha"
-  DFSHA_CONTROL_URL: "http://control-node:8000"
-  DFSHA_CONTROL_GRPC_URL: "control-node:9000"
-  DFSHA_INTERNAL_SECRET: "${DFSHA_INTERNAL_SECRET:?falta DFSHA_INTERNAL_SECRET; copia .env.example a .env}"
+  DFSHA_CONTROL_URL: "http://lb:8000"
+  DFSHA_CONTROL_GRPC_URL: "lb:9000"
+  # El plano interno va por el balanceador, igual que el gRPC: asi matar a una instancia
+  # no deja a ningun DataNode sin camino. nginx lo pasa en nivel 4 y el handshake es de
+  # punta a punta, asi que el certificado que se valida contra el SAN es el del
+  # ControlNode que atienda, y "lb" esta entre sus nombres.
+  DFSHA_CONTROL_INTERNAL_URL: "https://lb:8443"
+  DFSHA_TLS_CA_CERT: "/etc/dfsha/certs/ca.crt"
+  DFSHA_TLS_CERT: "/etc/dfsha/certs/data.crt"
+  DFSHA_TLS_KEY: "/etc/dfsha/certs/data.key"
   DFSHA_DATANODE_CAPACITY_BYTES: "${DFSHA_DATANODE_CAPACITY_BYTES:-10737418240}"
   DFSHA_LOG_LEVEL: "${DFSHA_LOG_LEVEL:-INFO}"
   # El depends_on de abajo espera a que el ControlNode este healthy, pero no cubre que
   # se reinicie despues: el DataNode tiene que poder volver a registrarse por su cuenta.
   DFSHA_REGISTER_MAX_ATTEMPTS: "30"
   DFSHA_REGISTER_RETRY_SECONDS: "2"
+  DFSHA_ORDER_WORKERS: "${DFSHA_ORDER_WORKERS:-2}"
 
 services:
-  control-node:
+  postgres-primary:
+    image: "postgres:16"
+    container_name: "dfsha-postgres-primary"
+    environment:
+      <<: *postgres-secrets
+      # wal_level=replica y los slots son lo que permite que la replica siga el WAL.
+      # Sin ellos el primario arranca igual y la replica falla al engancharse, que es
+      # el orden de fallos mas confuso posible.
+      POSTGRES_INITDB_ARGS: "--data-checksums"
+    command:
+      - "postgres"
+      - "-c"
+      - "wal_level=replica"
+      - "-c"
+      - "max_wal_senders=10"
+      - "-c"
+      - "max_replication_slots=10"
+      - "-c"
+      - "wal_keep_size=256MB"
+    volumes:
+      - "dfsha-pg-primary:/var/lib/postgresql/data"
+      - "./docker/postgres/primary-init.sh:/docker-entrypoint-initdb.d/10-replicacion.sh:ro"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U dfsha -d dfsha"]
+      interval: "5s"
+      timeout: "3s"
+      retries: 20
+    restart: "unless-stopped"
+
+  postgres-replica:
+    image: "postgres:16"
+    container_name: "dfsha-postgres-replica"
+    environment:
+      <<: *postgres-secrets
+      DFSHA_PRIMARY_HOST: "postgres-primary"
+      DFSHA_PRIMARY_PORT: "5432"
+    # Se invoca bash explicitamente: un bind mount desde Windows no siempre conserva el
+    # bit de ejecucion, y el fallo seria "permission denied" sin mas explicacion.
+    entrypoint: ["/bin/bash", "/dfsha/replica-entrypoint.sh"]
+    volumes:
+      - "dfsha-pg-replica:/var/lib/postgresql/data"
+      - "./docker/postgres/replica-entrypoint.sh:/dfsha/replica-entrypoint.sh:ro"
+    depends_on:
+      postgres-primary:
+        condition: "service_healthy"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U dfsha -d dfsha"]
+      interval: "5s"
+      timeout: "3s"
+      retries: 30
+    restart: "unless-stopped"
+
+  # Un solo uso: aplica las migraciones y termina. Los ControlNodes dependen de que
+  # haya terminado bien; ellos NO migran, solo comprueban que la base esta al dia.
+  # Con tres instancias arrancando a la vez, migrar desde cada una seria una carrera.
+  migrate:
     build:
       context: "."
       dockerfile: "docker/control_node.Dockerfile"
-    image: "dfsha/control-node:0.2.0"
-    container_name: "dfsha-control-node"
-    ports:
-      - "8000:8000"   # REST, lo consume el cliente
-      - "9000:9000"   # gRPC, plano de control
+    image: "dfsha/control-node:0.3.0"
+    container_name: "dfsha-migrate"
     environment:
-      DFSHA_DB_URL: "sqlite:////var/lib/dfsha-meta/dfsha.db"
-      DFSHA_JWT_SECRET: "${DFSHA_JWT_SECRET:?falta DFSHA_JWT_SECRET; copia .env.example a .env}"
-      DFSHA_INTERNAL_SECRET: "${DFSHA_INTERNAL_SECRET:?falta DFSHA_INTERNAL_SECRET; copia .env.example a .env}"
-      DFSHA_BLOCK_SIZE: "${DFSHA_BLOCK_SIZE:-67108864}"
-      DFSHA_JWT_TTL_SECONDS: "${DFSHA_JWT_TTL_SECONDS:-3600}"
-      DFSHA_WRITE_TTL_SECONDS: "${DFSHA_WRITE_TTL_SECONDS:-600}"
-      DFSHA_LOG_LEVEL: "${DFSHA_LOG_LEVEL:-INFO}"
-      DFSHA_GRPC_PORT: "9000"
-      DFSHA_HEARTBEAT_INTERVAL_MS: "${DFSHA_HEARTBEAT_INTERVAL_MS:-3000}"
-      DFSHA_FULL_REPORT_EVERY_N: "${DFSHA_FULL_REPORT_EVERY_N:-20}"
-      DFSHA_SUSPECT_AFTER_MS: "${DFSHA_SUSPECT_AFTER_MS:-10000}"
-      DFSHA_DEAD_AFTER_MS: "${DFSHA_DEAD_AFTER_MS:-30000}"
-      DFSHA_MEMBERSHIP_INTERVAL_MS: "${DFSHA_MEMBERSHIP_INTERVAL_MS:-1000}"
-      DFSHA_REPLICATION_FACTOR: "${DFSHA_REPLICATION_FACTOR:-1}"
-      DFSHA_PLACEMENT_D: "${DFSHA_PLACEMENT_D:-3}"
-      DFSHA_MIN_FREE_BYTES: "${DFSHA_MIN_FREE_BYTES:-134217728}"
+      DFSHA_DB_URL: "postgresql+psycopg://dfsha:${DFSHA_PG_PASSWORD:?falta DFSHA_PG_PASSWORD}@postgres-primary:5432/dfsha"
+    command: ["alembic", "upgrade", "head"]
+    depends_on:
+      postgres-primary:
+        condition: "service_healthy"
+    restart: "no"
+
+  # --- Tres ControlNodes tras un balanceador ------------------------------
+  #
+  # El cliente habla siempre con lb:8000 y no sabe cual le atiende. Puede ser asi porque
+  # el ControlNode es stateless: el token JWT lleva la identidad y el cwd vive en el
+  # cliente. Es la decision de la Etapa 1 cobrandose aqui; con sesion en memoria harian
+  # falta sesiones pegajosas en el balanceador.
+  #
+  # Los tres son identicos salvo el nombre. Quien manda NO lo decide el balanceador: lo
+  # decide el lease de la tabla `leadership`, y solo hace falta para el evaluador de
+  # pertenencia (y, en el Bloque B, la re-replicacion). Lecturas, planes de escritura y
+  # autenticacion las sirve cualquiera de los tres.
+  control-node-1:
+    <<: *controlnode-base
+    container_name: "dfsha-control-node-1"
+    environment: *controlnode-env
+
+  control-node-2:
+    <<: *controlnode-base
+    container_name: "dfsha-control-node-2"
+    environment: *controlnode-env
+
+  control-node-3:
+    <<: *controlnode-base
+    container_name: "dfsha-control-node-3"
+    environment: *controlnode-env
+
+  lb:
+    image: "nginx:1.27-alpine"
+    container_name: "dfsha-lb"
+    ports:
+      - "8000:8000"   # REST del cliente: proxy HTTP, nivel 7
+      - "9000:9000"   # gRPC con mTLS: passthrough TCP, nivel 4
+      - "8443:8443"   # plano interno con mTLS: passthrough TCP, nivel 4
     volumes:
-      - "dfsha-meta:/var/lib/dfsha-meta"
+      # nginx.conf propio porque el bloque `stream` solo existe al nivel mas alto del
+      # fichero: desde conf.d/ no se puede anadir, que la imagen incluye dentro de http.
+      - "./docker/nginx/nginx.conf:/etc/nginx/nginx.conf:ro"
+      - "./docker/nginx/dfsha.conf:/etc/nginx/conf.d/default.conf:ro"
+      - "./docker/nginx/dfsha-stream.conf:/etc/nginx/stream.conf.d/dfsha.conf:ro"
+    depends_on:
+      control-node-1:
+        condition: "service_healthy"
+      control-node-2:
+        condition: "service_healthy"
+      control-node-3:
+        condition: "service_healthy"
+    healthcheck:
+      test: ["CMD-SHELL", "wget -q -O - http://127.0.0.1:8000/health || exit 1"]
+      interval: "5s"
+      timeout: "3s"
+      retries: 10
     restart: "unless-stopped"
 
   # Cuatro DataNodes, cada uno en su dominio de falla. En local la separacion es logica
@@ -87,9 +270,14 @@ services:
     environment:
       <<: *datanode-env
       DFSHA_DATANODE_ADVERTISE_URL: "${DFSHA_ADVERTISE_1:-http://localhost:8001}"
+      # Direccion de PAR: la que usan los otros DataNodes para el pipeline y la
+      # re-replicacion. Sin ella, DN1 reenviaria a "localhost:800N" y eso, dentro
+      # de un contenedor, resuelve al propio contenedor.
+      DFSHA_DATANODE_PEER_URL: "${DFSHA_PEER_1:-http://data-node-1:8001}"
       DFSHA_DATANODE_FAULT_DOMAIN: "${DFSHA_FD_1:-local-1}"
     volumes:
       - "dfsha-blocks-1:/var/lib/dfsha"
+      - "./certs:/etc/dfsha/certs:ro"
 
   data-node-2:
     <<: *datanode-base
@@ -99,9 +287,14 @@ services:
     environment:
       <<: *datanode-env
       DFSHA_DATANODE_ADVERTISE_URL: "${DFSHA_ADVERTISE_2:-http://localhost:8002}"
+      # Direccion de PAR: la que usan los otros DataNodes para el pipeline y la
+      # re-replicacion. Sin ella, DN1 reenviaria a "localhost:800N" y eso, dentro
+      # de un contenedor, resuelve al propio contenedor.
+      DFSHA_DATANODE_PEER_URL: "${DFSHA_PEER_2:-http://data-node-2:8001}"
       DFSHA_DATANODE_FAULT_DOMAIN: "${DFSHA_FD_2:-local-2}"
     volumes:
       - "dfsha-blocks-2:/var/lib/dfsha"
+      - "./certs:/etc/dfsha/certs:ro"
 
   data-node-3:
     <<: *datanode-base
@@ -111,9 +304,14 @@ services:
     environment:
       <<: *datanode-env
       DFSHA_DATANODE_ADVERTISE_URL: "${DFSHA_ADVERTISE_3:-http://localhost:8003}"
+      # Direccion de PAR: la que usan los otros DataNodes para el pipeline y la
+      # re-replicacion. Sin ella, DN1 reenviaria a "localhost:800N" y eso, dentro
+      # de un contenedor, resuelve al propio contenedor.
+      DFSHA_DATANODE_PEER_URL: "${DFSHA_PEER_3:-http://data-node-3:8001}"
       DFSHA_DATANODE_FAULT_DOMAIN: "${DFSHA_FD_3:-local-3}"
     volumes:
       - "dfsha-blocks-3:/var/lib/dfsha"
+      - "./certs:/etc/dfsha/certs:ro"
 
   data-node-4:
     <<: *datanode-base
@@ -123,9 +321,14 @@ services:
     environment:
       <<: *datanode-env
       DFSHA_DATANODE_ADVERTISE_URL: "${DFSHA_ADVERTISE_4:-http://localhost:8004}"
+      # Direccion de PAR: la que usan los otros DataNodes para el pipeline y la
+      # re-replicacion. Sin ella, DN1 reenviaria a "localhost:800N" y eso, dentro
+      # de un contenedor, resuelve al propio contenedor.
+      DFSHA_DATANODE_PEER_URL: "${DFSHA_PEER_4:-http://data-node-4:8001}"
       DFSHA_DATANODE_FAULT_DOMAIN: "${DFSHA_FD_4:-local-4}"
     volumes:
       - "dfsha-blocks-4:/var/lib/dfsha"
+      - "./certs:/etc/dfsha/certs:ro"
 
   # No arranca con `up`: es para correr la CLI dentro de la red de compose.
   #   docker compose run --rm client ls /
@@ -138,20 +341,27 @@ services:
     build:
       context: "."
       dockerfile: "docker/client.Dockerfile"
-    image: "dfsha/client:0.2.0"
+    image: "dfsha/client:0.3.0"
     environment:
-      DFSHA_CONTROL_URL: "http://control-node:8000"
-      DFSHA_INTERNAL_SECRET: "${DFSHA_INTERNAL_SECRET:-}"
+      DFSHA_CONTROL_URL: "http://lb:8000"
+      # Los necesita el GC, que habla con el plano interno. La CLI normal no: el trafico
+      # de cliente sigue en REST plano hasta C2.
+      DFSHA_CONTROL_INTERNAL_URL: "https://lb:8443"
+      DFSHA_TLS_CA_CERT: "/etc/dfsha/certs/ca.crt"
+      DFSHA_TLS_CERT: "/etc/dfsha/certs/client.crt"
+      DFSHA_TLS_KEY: "/etc/dfsha/certs/client.key"
     volumes:
       - "dfsha-client-home:/home/dfsha/.dfsha"
+      - "./certs:/etc/dfsha/certs:ro"
     profiles:
       - "tools"
     depends_on:
-      control-node:
+      lb:
         condition: "service_healthy"
 
 volumes:
-  dfsha-meta:
+  dfsha-pg-primary:
+  dfsha-pg-replica:
   dfsha-blocks-1:
   dfsha-blocks-2:
   dfsha-blocks-3:

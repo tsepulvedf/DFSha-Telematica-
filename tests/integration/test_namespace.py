@@ -183,23 +183,44 @@ class TestMv:
 
 
 class TestPlanoInterno:
-    def test_exige_el_secreto_compartido(self, control) -> None:
-        assert control.get("/internal/v1/gc/orphan-blocks").status_code == 401
+    """El plano interno ya no vive en el puerto de cliente.
+
+    Estas pruebas comprobaban en las Etapas 1 y 2 que `/internal/v1` respondia 401 sin el
+    secreto compartido. Desde el Bloque C ese secreto no existe: el plano interno se
+    sirve en OTRO puerto, con TLS mutuo. Asi que lo que se afirma aqui cambia, y a algo
+    mas fuerte: desde el puerto de cliente esas rutas **no existen**, con secreto, sin el
+    o con el token de un usuario. No hay nada que adivinar.
+
+    Que ese otro puerto exija certificado se prueba donde se puede probar de verdad,
+    abriendo un socket: `test_mtls.py`.
+    """
+
+    def test_el_plano_interno_no_se_alcanza_desde_el_puerto_de_cliente(
+        self, control
+    ) -> None:
+        assert control.get("/internal/v1/gc/orphan-blocks").status_code == 404
+        # Tampoco con el secreto de las etapas anteriores: ya no significa nada.
         assert control.get(
             "/internal/v1/gc/orphan-blocks",
-            headers={"X-DFSha-Internal-Secret": "equivocado"},
-        ).status_code == 401
+            headers={"X-DFSha-Internal-Secret": "el-de-la-etapa-2"},
+        ).status_code == 404
 
-    def test_el_registro_ya_no_esta_en_rest(self, control, internal_headers) -> None:
+    def test_un_token_de_usuario_tampoco_abre_el_plano_interno(self, ana: Sesion) -> None:
+        """Un usuario autenticado sigue sin poder tocar el plano interno, y ahora ni
+        siquiera puede intentarlo desde donde el habla."""
+        assert ana.get("/internal/v1/gc/orphan-blocks").status_code == 404
+
+    def test_el_registro_ya_no_esta_en_rest(self, internal) -> None:
         # Se fue a gRPC (ControlPlane.Register) con el resto del plano de control. La
-        # idempotencia del registro se comprueba ahora en test_control_plane.py, contra
-        # el servidor gRPC de verdad.
-        respuesta = control.post(
+        # idempotencia del registro se comprueba en test_control_plane.py, contra el
+        # servidor gRPC de verdad. Se mira en la app INTERNA, que es donde estaria si
+        # siguiera existiendo.
+        respuesta = internal.post(
             "/internal/v1/datanodes/register",
             json={"base_url": "http://data-node-1:8001", "capacity_bytes": 10 * MB},
-            headers=internal_headers,
         )
         assert respuesta.status_code == 404
 
-    def test_un_token_de_usuario_no_abre_el_plano_interno(self, ana: Sesion) -> None:
-        assert ana.get("/internal/v1/gc/orphan-blocks").status_code == 401
+    def test_el_plano_interno_sirve_sus_rutas_en_su_propia_app(self, internal) -> None:
+        """Y no se rompio al mudarse: las rutas que si existen siguen respondiendo."""
+        assert internal.get("/internal/v1/gc/orphan-blocks").status_code == 200

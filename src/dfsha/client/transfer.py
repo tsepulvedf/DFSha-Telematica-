@@ -15,16 +15,34 @@ from typing import Callable, Iterable, Sequence
 
 import httpx
 
+import hashlib
+
+from dfsha.common.blocktoken import BLOCK_TOKEN_HEADER
 from dfsha.common.checksum import CHUNK_SIZE, Sha256Accumulator, checksum_matches
+from dfsha.common.crypto import FileCrypto
 from dfsha.common.dto import BlockReadPlan, BlockWritePlan
 from dfsha.common.errors import ChecksumMismatchError, DFShaError, StorageError
 from dfsha.common.logging import get_logger, timed
 
 from .chunker import checksum_block, read_block
+from .tls import verificacion_para
 
-__all__ = ["CHECKSUM_HEADER", "upload_blocks", "download_blocks", "TransferError"]
+__all__ = [
+    "CHECKSUM_HEADER",
+    "PIPELINE_HEADER",
+    "ACKED_HEADER",
+    "upload_blocks",
+    "download_blocks",
+    "TransferError",
+]
 
 CHECKSUM_HEADER = "X-DFSha-Checksum"
+#: El RESTO de la cadena de replicas, por orden. El cliente sube a la primera y esa
+#: reenvia a la siguiente: los bytes salen del cliente UNA sola vez.
+PIPELINE_HEADER = "X-DFSha-Pipeline"
+#: Cuantas replicas confirmo la cadena. Informativo: quien decide el quorum es el
+#: ControlNode en el `commit`, que recibe un aviso de cada nodo por separado.
+ACKED_HEADER = "X-DFSha-Replicas-Acked"
 
 
 class TransferError(DFShaError):
@@ -42,9 +60,21 @@ class _Slot:
     base_url: str
     data_node_id: str
     checksum: str | None = None
+    #: URL de las replicas 2..R, por orden. Vacia con R=1.
+    pipeline: tuple[str, ...] = ()
+    #: Autorizacion firmada por el ControlNode. Se copia TAL CUAL del plan: el cliente no
+    #: la construye ni la interpreta, solo la lleva.
+    token: str = ""
 
 
-def _slots_de_escritura(blocks: Sequence[BlockWritePlan]) -> list[_Slot]:
+def _slots_de_escritura(blocks: Sequence[BlockWritePlan], overhead: int = 0) -> list[_Slot]:
+    """Traduce el plan del ControlNode a posiciones en el archivo LOCAL.
+
+    `bloque.size` del plan es el tamano que el bloque ocupara EN DISCO; el archivo local
+    esta en claro. Con cifrado los dos no coinciden, asi que aqui se resta el sobrecoste
+    una vez y `_Slot.size` significa siempre bytes claros: los que hay que leer, los que
+    avanzan el offset y los que cuentan para la barra de progreso.
+    """
     slots: list[_Slot] = []
     offset = 0
     for bloque in sorted(blocks, key=lambda b: b.index):
@@ -52,19 +82,30 @@ def _slots_de_escritura(blocks: Sequence[BlockWritePlan]) -> list[_Slot]:
             raise TransferError(
                 "el plan no trae ningun DataNode para el bloque", block_id=bloque.block_id
             )
-        # Etapa 1: una replica por bloque. Cuando sean varias, aqui se abre el pipeline.
+        # La primera replica recibe los bytes del cliente; las demas viajan en la
+        # cabecera de pipeline. El orden del plan se respeta tal cual: lo decidio la
+        # politica de colocacion del ControlNode, que es quien conoce la carga y los
+        # dominios de falla.
+        #
+        # La cadena se copia de `bloque.pipeline`, NO se deduce de `replicas`. Y esa
+        # diferencia costo un fallo entero: `replicas` lleva las direcciones alcanzables
+        # por el CLIENTE, que en contenedores son `localhost:800N` y desde dentro de un
+        # DataNode resuelven al propio nodo. Ver "Dos direcciones por nodo" en CLAUDE.md.
         replica = bloque.replicas[0]
+        claro = bloque.size - overhead
         slots.append(
             _Slot(
                 block_id=bloque.block_id,
                 index=bloque.index,
-                size=bloque.size,
+                size=claro,
                 offset=offset,
                 base_url=replica.base_url,
                 data_node_id=replica.data_node_id,
+                pipeline=tuple(getattr(bloque, "pipeline", ()) or ()),
+                token=getattr(bloque, "token", "") or "",
             )
         )
-        offset += bloque.size
+        offset += claro
     return slots
 
 
@@ -74,14 +115,20 @@ def upload_blocks(
     parallel: int = 4,
     timeout: float = 300.0,
     on_block: Callable[[int], None] | None = None,
+    crypto: "FileCrypto | None" = None,
 ) -> int:
     """Sube todos los bloques y devuelve los bytes enviados.
 
     Cada bloque viaja a su DataNode con el checksum en una cabecera; el DataNode lo
     verifica y rechaza con 422 si no cuadra, de modo que una corrupcion en transito nunca
     llega a confirmarse como un archivo bueno.
+
+    Con R>1 los bytes **siguen saliendo una sola vez** del cliente: van a la primera
+    replica del plan con las demas en `X-DFSha-Pipeline`, y la cadena se encarga del
+    resto. Subir R veces desde aqui multiplicaria por R el tiempo de un `put` y el ancho
+    de banda de subida, que es el recurso mas escaso del lado del cliente.
     """
-    slots = _slots_de_escritura(blocks)
+    slots = _slots_de_escritura(blocks, overhead=crypto.overhead if crypto else 0)
     if not slots:
         return 0
 
@@ -89,30 +136,76 @@ def upload_blocks(
     enviados = 0
 
     def subir(slot: _Slot) -> int:
-        checksum = checksum_block(local_path, slot.offset, slot.size)
+        # Con cifrado, el bloque se cifra ANTES de calcular el checksum: lo que el
+        # DataNode verifica es el texto cifrado, que es lo unico que el ve. Asi puede
+        # comprobar integridad —y el pipeline puede comprobar antes de reenviar— sin
+        # tener la clave.
+        if crypto is not None:
+            cuerpo = crypto.encrypt(
+                b"".join(read_block(local_path, slot.offset, slot.size)), slot.index
+            )
+            checksum = hashlib.sha256(cuerpo).hexdigest()
+            longitud = len(cuerpo)
+        else:
+            cuerpo = None
+            checksum = checksum_block(local_path, slot.offset, slot.size)
+            longitud = slot.size
+
+        cabeceras = {
+            CHECKSUM_HEADER: checksum,
+            "Content-Type": "application/octet-stream",
+            "Content-Length": str(longitud),
+        }
+        if slot.pipeline:
+            cabeceras[PIPELINE_HEADER] = ",".join(slot.pipeline)
+        if slot.token:
+            cabeceras[BLOCK_TOKEN_HEADER] = slot.token
+
         with timed(
             "block.upload",
             logger=log,
             block_id=slot.block_id,
             size_bytes=slot.size,
             data_node_id=slot.data_node_id,
-        ):
+            replicas_planned=1 + len(slot.pipeline),
+        ) as t:
+            destino = f"{slot.base_url.rstrip('/')}/api/v1/blocks/{slot.block_id}"
             respuesta = httpx.put(
-                f"{slot.base_url.rstrip('/')}/api/v1/blocks/{slot.block_id}",
-                content=read_block(local_path, slot.offset, slot.size),
-                headers={
-                    CHECKSUM_HEADER: checksum,
-                    "Content-Type": "application/octet-stream",
-                    "Content-Length": str(slot.size),
-                },
+                destino,
+                content=(
+                    cuerpo
+                    if cuerpo is not None
+                    else read_block(local_path, slot.offset, slot.size)
+                ),
+                headers=cabeceras,
                 timeout=timeout,
+                verify=verificacion_para(destino),
             )
+            if respuesta.status_code == 201:
+                t.bind(replicas_acked=_acked(respuesta))
+
         if respuesta.status_code != 201:
             raise TransferError(
                 "el DataNode rechazo el bloque",
                 block_id=slot.block_id,
                 status=respuesta.status_code,
                 detail=respuesta.text[:200],
+            )
+
+        # Menos replicas de las planificadas NO es un fallo de la subida: con W=2 el
+        # commit pasa igual y la copia que falta la recupera la re-replicacion. Se avisa
+        # porque es lo que explica un `stat` que sale UNDER_REPLICATED despues.
+        confirmadas = _acked(respuesta)
+        if confirmadas < 1 + len(slot.pipeline):
+            log.warning(
+                "replication.partial",
+                block_id=slot.block_id,
+                planned=1 + len(slot.pipeline),
+                acked=confirmadas,
+                detail=(
+                    "la cadena no confirmo todas las replicas; el commit decidira si "
+                    "hay quorum y la re-replicacion recuperara el resto"
+                ),
             )
         return slot.size
 
@@ -126,6 +219,22 @@ def upload_blocks(
     return enviados
 
 
+def _acked(respuesta: httpx.Response) -> int:
+    """Replicas que confirmo la cadena. Ante una cabecera ausente o rara, 1.
+
+    Un 1 es lo unico seguro: respondio 201, o sea que el primer nodo tiene el bloque.
+    Contar de menos provoca como mucho un aviso de mas; contar de mas haria creer al
+    cliente que hay un quorum que no existe.
+    """
+    valor = respuesta.headers.get(ACKED_HEADER)
+    if not valor:
+        return 1
+    try:
+        return max(1, int(valor))
+    except ValueError:
+        return 1
+
+
 def download_blocks(
     destination: str | Path,
     blocks: Sequence[BlockReadPlan],
@@ -133,6 +242,8 @@ def download_blocks(
     timeout: float = 300.0,
     on_block: Callable[[int], None] | None = None,
     chunk_size: int = CHUNK_SIZE,
+    crypto: "FileCrypto | None" = None,
+    plain_size: int | None = None,
 ) -> int:
     """Descarga los bloques y reconstruye el archivo.
 
@@ -145,7 +256,11 @@ def download_blocks(
     destino = Path(destination)
     destino.parent.mkdir(parents=True, exist_ok=True)
 
-    total = sum(b.size for b in ordenados)
+    # `b.size` es el tamano ALMACENADO. Con cifrado incluye la etiqueta de GCM, asi que
+    # el archivo destino se reserva con el tamano claro, que es el que el metadato guarda
+    # en `files.size` y llega aqui como `plain_size`.
+    sobrecoste = crypto.overhead if crypto is not None else 0
+    total = plain_size if plain_size is not None else sum(b.size for b in ordenados)
     # Se reserva el archivo completo por adelantado para poder escribir cada bloque en su
     # sitio desde varios hilos.
     with open(destino, "wb") as fh:
@@ -159,57 +274,57 @@ def download_blocks(
     acumulado = 0
     for bloque in ordenados:
         offsets[bloque.block_id] = acumulado
-        acumulado += bloque.size
+        # El desplazamiento en el archivo destino va en bytes CLAROS: de un bloque
+        # cifrado salen `sobrecoste` bytes menos al descifrarlo.
+        acumulado += bloque.size - sobrecoste
 
     def bajar(bloque: BlockReadPlan) -> int:
+        """Descarga un bloque probando sus replicas por orden hasta que una responde.
+
+        Con R=3 esto es lo que convierte "hay tres copias" en "el archivo se sigue
+        leyendo": sin reintento en otra replica, perder el primer nodo del plan haria
+        fallar el `get` aunque los otros dos tuvieran los bytes intactos, y las tres
+        copias solo servirian para ocupar disco.
+
+        Una replica que devuelve bytes CORRUPTOS tambien se descarta y se pasa a la
+        siguiente, en vez de abandonar: es exactamente el caso para el que existe tener
+        mas de una copia. Solo se falla cuando se acabaron todas.
+        """
         if not bloque.replicas:
             raise TransferError(
                 "el plan no trae ninguna replica para el bloque", block_id=bloque.block_id
             )
-        replica = bloque.replicas[0]
+
         offset = offsets[bloque.block_id]
-        acumulador = Sha256Accumulator()
+        fallos: list[str] = []
 
-        with timed(
-            "block.download",
-            logger=log,
+        for intento, replica in enumerate(bloque.replicas, start=1):
+            try:
+                return _bajar_de(
+                    bloque, replica, offset, destino, timeout, chunk_size, log, crypto
+                )
+            except (TransferError, ChecksumMismatchError, StorageError, httpx.HTTPError) as exc:
+                motivo = getattr(exc, "message", str(exc))
+                fallos.append(f"{replica.data_node_id[:8]} ({replica.base_url}): {motivo}")
+                log.warning(
+                    "block.replica_failed",
+                    block_id=bloque.block_id,
+                    data_node_id=replica.data_node_id,
+                    attempt=intento,
+                    replicas=len(bloque.replicas),
+                    error=type(exc).__name__,
+                    detail=(
+                        "se prueba la siguiente replica"
+                        if intento < len(bloque.replicas)
+                        else "no quedan replicas"
+                    ),
+                )
+
+        raise TransferError(
+            f"ninguna de las {len(bloque.replicas)} replicas pudo servir el bloque",
             block_id=bloque.block_id,
-            size_bytes=bloque.size,
-            data_node_id=replica.data_node_id,
-        ):
-            with httpx.stream(
-                "GET",
-                f"{replica.base_url.rstrip('/')}/api/v1/blocks/{bloque.block_id}",
-                timeout=timeout,
-            ) as respuesta:
-                if respuesta.status_code != 200:
-                    respuesta.read()
-                    raise TransferError(
-                        "el DataNode no devolvio el bloque",
-                        block_id=bloque.block_id,
-                        status=respuesta.status_code,
-                    )
-                with open(destino, "r+b") as fh:
-                    fh.seek(offset)
-                    for trozo in respuesta.iter_bytes(chunk_size):
-                        acumulador.update(trozo)
-                        fh.write(trozo)
-
-        if not checksum_matches(bloque.checksum_sha256, acumulador.hexdigest):
-            raise ChecksumMismatchError(
-                "el bloque descargado no coincide con su checksum",
-                block_id=bloque.block_id,
-                expected=bloque.checksum_sha256,
-                actual=acumulador.hexdigest,
-            )
-        if acumulador.size != bloque.size:
-            raise StorageError(
-                "el bloque descargado no tiene el tamano esperado",
-                block_id=bloque.block_id,
-                expected=bloque.size,
-                actual=acumulador.size,
-            )
-        return acumulador.size
+            failures=fallos,
+        )
 
     recibidos = 0
     with ThreadPoolExecutor(max_workers=max(1, parallel)) as pool:
@@ -217,9 +332,85 @@ def download_blocks(
         for futuro in as_completed(futuros):
             recibidos += futuro.result()
             if on_block:
-                on_block(futuros[futuro].size)
+                on_block(futuros[futuro].size - sobrecoste)
 
     return recibidos
+
+
+def _bajar_de(
+    bloque: BlockReadPlan,
+    replica,
+    offset: int,
+    destino: Path,
+    timeout: float,
+    chunk_size: int,
+    log,
+    crypto: "FileCrypto | None" = None,
+) -> int:
+    """Un intento contra UNA replica. Lanza si no sirve; el que reintenta es `bajar`."""
+    acumulador = Sha256Accumulator()
+
+    with timed(
+        "block.download",
+        logger=log,
+        block_id=bloque.block_id,
+        size_bytes=bloque.size,
+        data_node_id=replica.data_node_id,
+    ):
+        origen = f"{replica.base_url.rstrip('/')}/api/v1/blocks/{bloque.block_id}"
+        with httpx.stream(
+            "GET",
+            origen,
+            timeout=timeout,
+            verify=verificacion_para(origen),
+            headers=(
+                {BLOCK_TOKEN_HEADER: bloque.token}
+                if getattr(bloque, "token", "")
+                else {}
+            ),
+        ) as respuesta:
+            if respuesta.status_code != 200:
+                respuesta.read()
+                raise TransferError(
+                    "el DataNode no devolvio el bloque",
+                    block_id=bloque.block_id,
+                    status=respuesta.status_code,
+                )
+            if crypto is None:
+                with open(destino, "r+b") as fh:
+                    fh.seek(offset)
+                    for trozo in respuesta.iter_bytes(chunk_size):
+                        acumulador.update(trozo)
+                        fh.write(trozo)
+            else:
+                # El checksum se acumula sobre el texto CIFRADO —que es lo que el
+                # metadato guarda— y lo que se escribe en disco es el claro.
+                cifrado = bytearray()
+                for trozo in respuesta.iter_bytes(chunk_size):
+                    acumulador.update(trozo)
+                    cifrado.extend(trozo)
+                claro = crypto.decrypt(bytes(cifrado), bloque.index)
+                with open(destino, "r+b") as fh:
+                    fh.seek(offset)
+                    fh.write(claro)
+
+    if not checksum_matches(bloque.checksum_sha256, acumulador.hexdigest):
+        raise ChecksumMismatchError(
+            "el bloque descargado no coincide con su checksum",
+            block_id=bloque.block_id,
+            expected=bloque.checksum_sha256,
+            actual=acumulador.hexdigest,
+        )
+    if acumulador.size != bloque.size:
+        raise StorageError(
+            "el bloque descargado no tiene el tamano esperado",
+            block_id=bloque.block_id,
+            expected=bloque.size,
+            actual=acumulador.size,
+        )
+    # Lo comprobado arriba es el texto CIFRADO, que es lo que el metadato describe. Lo
+    # que se devuelve son los bytes CLAROS: es lo que el usuario ve crecer en su disco.
+    return acumulador.size - (crypto.overhead if crypto is not None else 0)
 
 
 def iter_sizes(blocks: Iterable) -> int:

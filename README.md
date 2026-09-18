@@ -1,6 +1,6 @@
 # DFSha — sistema de archivos distribuido por bloques
 
-**Hito 2** · SI3007 / ST0263 Sistemas Distribuidos
+**Hito 3 (completo)** · SI3007 / ST0263 Sistemas Distribuidos
 
 DFSha parte archivos en bloques de tamaño fijo, los reparte entre DataNodes y guarda todo
 el metadato en un ControlNode. La arquitectura es de tipo HDFS, opción cliente/servidor:
@@ -11,10 +11,35 @@ El **Hito 1** entregó RF1 (namespace) y RF2 (transferencia) con un ControlNode 
 DataNode, autenticación JWT, integridad por bloque con SHA-256 y un recolector manual de
 bloques huérfanos.
 
-El **Hito 2** pasa a **N DataNodes reales**: un plano de control propio sobre gRPC con
+El **Hito 2** pasó a **N DataNodes reales**: un plano de control propio sobre gRPC con
 heartbeats cada 3 s, detección de caídas en segundos, y una política de colocación
 *power of d choices* que reparte los bloques según la carga real de cada nodo y su
 dominio de falla.
+
+El **Hito 3** quita los dos puntos únicos de fallo que quedaban.
+
+El **ControlNode**: el metadato pasa a **PostgreSQL** (primario y réplica de lectura), el
+esquema se versiona con **Alembic**, y hay **tres ControlNodes** tras un balanceador de
+los que uno sostiene un **lease con época** — un token de aislamiento que impide que un
+ControlNode congelado despierte y siga dando órdenes creyendo que todavía manda. Matar al
+líder se recupera en menos de 6 segundos sin intervención.
+
+Y los **datos**: cada bloque pasa a tener **tres copias en tres dominios de falla**,
+subidas *en cadena* para que el cliente mande los bytes una sola vez. El `commit` pasa con
+**dos** copias confirmadas y la tercera se completa después; si un nodo muere, la copia
+que falta se **restaura sola** pasada una espera de gracia. Un archivo sobrevive a perder
+dos de sus tres nodos.
+
+Y la **seguridad**: el plano interno pasa a **TLS mutuo** con una CA propia, los archivos
+se **cifran en el cliente** —el servidor guarda los bloques y no puede leerlos—, hay
+**ACLs con grupos** para compartir, y cada petición de bloque lleva una **autorización
+firmada** que el DataNode verifica por su cuenta. Más el **RF3**: `open`, lectura por
+rango, `append` y bloqueo de archivos con lease.
+
+> **Estado.** El hito está **completo**: Bloques A (PostgreSQL, CQRS con réplica de
+> lectura, elección de líder), B (replicación R=3 con pipeline, quórum W=2 y
+> re-replicación) y C (mTLS, cifrado extremo a extremo, ACLs, token de bloque, RF3 y TLS
+> de cliente). 529 pruebas en verde.
 
 ---
 
@@ -24,7 +49,7 @@ Necesitas Docker y Python 3.11+. Debería llevarte menos de cinco minutos.
 
 ### 1. Crear el `.env` — obligatorio antes de nada
 
-`docker compose up` **aborta** si no existe `.env` con los dos secretos rellenos:
+`docker compose up` **aborta** si no existe `.env` con los secretos rellenos:
 
 ```
 falta DFSHA_JWT_SECRET; copia .env.example a .env
@@ -43,9 +68,13 @@ cd DFSha-Telematica-
 ```bash
 cp .env.example .env
 sed -i "s|^DFSHA_JWT_SECRET=$|DFSHA_JWT_SECRET=$(python -c 'import secrets;print(secrets.token_urlsafe(48))')|" .env
-sed -i "s|^DFSHA_INTERNAL_SECRET=$|DFSHA_INTERNAL_SECRET=$(python -c 'import secrets;print(secrets.token_urlsafe(48))')|" .env
+sed -i "s|^DFSHA_PG_PASSWORD=$|DFSHA_PG_PASSWORD=$(python -c 'import secrets;print(secrets.token_urlsafe(24))')|" .env
+sed -i "s|^DFSHA_PG_REPLICATION_PASSWORD=$|DFSHA_PG_REPLICATION_PASSWORD=$(python -c 'import secrets;print(secrets.token_urlsafe(24))')|" .env
 
-grep -E '^DFSHA_(JWT|INTERNAL)_SECRET=.+' .env    # deben salir dos líneas con valor
+# La URL de la base lleva dentro la contraseña que acabas de generar
+sed -i "s|^DFSHA_DB_URL=.*|# DFSHA_DB_URL lo fija docker-compose.yml; esta linea solo vale sin Docker|" .env
+
+grep -E '^DFSHA_(JWT_SECRET|PG_PASSWORD|PG_REPLICATION_PASSWORD)=.+' .env  # tres líneas
 ```
 
 **PowerShell:**
@@ -53,30 +82,83 @@ grep -E '^DFSHA_(JWT|INTERNAL)_SECRET=.+' .env    # deben salir dos líneas con 
 ```powershell
 Copy-Item .env.example .env
 $jwt = python -c "import secrets;print(secrets.token_urlsafe(48))"
-$int = python -c "import secrets;print(secrets.token_urlsafe(48))"
-(Get-Content .env) -replace '^DFSHA_JWT_SECRET=$', "DFSHA_JWT_SECRET=$jwt" -replace '^DFSHA_INTERNAL_SECRET=$', "DFSHA_INTERNAL_SECRET=$int" | Set-Content .env
+$pg  = python -c "import secrets;print(secrets.token_urlsafe(24))"
+$rep = python -c "import secrets;print(secrets.token_urlsafe(24))"
+(Get-Content .env) `
+  -replace '^DFSHA_JWT_SECRET=$', "DFSHA_JWT_SECRET=$jwt" `
+  -replace '^DFSHA_PG_PASSWORD=$', "DFSHA_PG_PASSWORD=$pg" `
+  -replace '^DFSHA_PG_REPLICATION_PASSWORD=$', "DFSHA_PG_REPLICATION_PASSWORD=$rep" | Set-Content .env
 
-Select-String -Path .env -Pattern '^DFSHA_(JWT|INTERNAL)_SECRET=.+'   # deben salir dos
+Select-String -Path .env -Pattern '^DFSHA_(JWT_SECRET|PG_PASSWORD|PG_REPLICATION_PASSWORD)=.+'  # tres
 ```
 
-Rellenan las dos líneas vacías en su sitio, sin duplicar claves. En macOS el `sed -i`
+Rellenan las líneas vacías en su sitio, sin duplicar claves. En macOS el `sed -i`
 del sistema pide un argumento: usa `sed -i ''` en lugar de `sed -i`.
 
 `.env` está en `.gitignore`. No lo subas nunca.
 
-### 2. Levantar el clúster
+### 2. Generar la CA y los certificados — también obligatorio
+
+El plano interno usa **TLS mutuo**, y los servicios no arrancan sin su material:
+
+```bash
+python scripts/gen_certs.py
+```
+
+Deja en `certs/` la CA y un certificado por rol (`control`, `data`, `client`). **No se
+versiona nada de esto**: `.gitignore` cubre `*.crt`, `*.key` y `certs/`.
+
+El script **se niega a regenerar una CA existente** sin `--force`, y explica por qué:
+volver a firmarla invalida todos los certificados emitidos, y un clúster a medio rotar
+deja de hablar consigo mismo.
+
+> Esto **sustituye a `DFSHA_INTERNAL_SECRET`**, que ya no existe. Un secreto compartido
+> protege contra quien no lo conoce, pero no dice *quién* está al otro lado: cualquiera
+> que lo tenga es todos a la vez. Con mTLS cada rol presenta su propio certificado.
+
+### 3. Levantar el clúster
 
 ```bash
 docker compose up --build -d
-docker compose ps          # control-node y data-node-1..4
+docker compose ps          # postgres x2, migrate, control-node-1..3, lb, data-node-1..4
+curl http://localhost:8000/health
 curl http://localhost:8001/health
 ```
 
-Son cinco servicios: el ControlNode (8000 REST, 9000 gRPC) y cuatro DataNodes en
-8001–8004, cada uno con su volumen y su dominio de falla (`local-1`…`local-4`).
+Once servicios, en este orden de arranque:
+
+| Servicio | Qué es |
+|---|---|
+| `postgres-primary` | El metadato. Todas las escrituras van aquí |
+| `postgres-replica` | Réplica en streaming. Sirve el lado de consulta de CQRS |
+| `migrate` | Aplica las migraciones y termina. Los ControlNodes esperan a que acabe |
+| `control-node-1..3` | Tres instancias idénticas. Una sostiene el lease de líder |
+| `lb` | nginx. Publica 8000 (REST del cliente), 8443 (plano interno) y 9000 (gRPC) |
+| `data-node-1..4` | 8001–8004, cada uno con su volumen y su dominio de falla |
+
+**El ControlNode no migra la base**: lo hace `migrate`, una sola vez. Con tres instancias
+arrancando a la vez competirían por aplicar la misma migración. Cada ControlNode solo
+comprueba al arrancar que la base está en la última revisión y falla pronto, con el
+comando exacto, si no lo está.
 
 Cada DataNode se registra solo por gRPC al arrancar, reintentando hasta que el
-ControlNode responde, y a partir de ahí late cada 3 s.
+ControlNode responde, y a partir de ahí late cada 3 s. Late **contra el balanceador**, no
+contra una instancia fija: así, matar al ControlNode líder no deja a ningún DataNode sin
+camino.
+
+### Ver la elección de líder
+
+```bash
+dfsha cluster          # última línea: lider, epoca y cuánto le queda al lease
+
+# Matar al líder y ver el relevo
+docker kill dfsha-control-node-2
+sleep 8
+dfsha cluster          # otro líder, y la época exactamente una más alta
+```
+
+La **época** es el número a mirar. Sube cada vez que alguien toma un lease vencido y no
+baja nunca; si se repitiera, no serviría para nada. Ver «Elección de líder» más abajo.
 
 ### 3. Instalar el cliente
 
@@ -130,8 +212,8 @@ up --build -d`.
 
 ### 5. Ver el ciclo de borrado y el GC
 
-Corre el GC **desde la raíz del repositorio**: lee `DFSHA_INTERNAL_SECRET` del entorno y,
-si no está, del `.env` que creaste en el paso 1. No hace falta exportar nada.
+Corre el GC **desde la raíz del repositorio**: encuentra los certificados en `certs/` por
+su cuenta. No hace falta exportar nada.
 
 ```bash
 dfsha rm /datos/pruebas/original.bin     # borrado lógico: los bloques siguen en disco
@@ -143,14 +225,16 @@ python scripts/gc.py                     # borrarlos de verdad
 curl http://localhost:8001/health        # used_bytes y block_count de vuelta a cero
 ```
 
-Si lo ejecutas desde otro directorio no encontrará el `.env`, y entonces sí hay que
-pasarle el secreto:
+Si lo ejecutas desde otro directorio no encontrará `certs/`, y entonces hay que decirle
+dónde está:
 
 ```bash
-export DFSHA_INTERNAL_SECRET=...              # bash: el mismo valor que en .env
-$env:DFSHA_INTERNAL_SECRET = "..."            # PowerShell
-python scripts/gc.py --internal-secret ...    # o directamente por argumento
+python scripts/gc.py   --tls-ca-cert certs/ca.crt --tls-cert certs/client.crt --tls-key certs/client.key
 ```
+
+Presenta el certificado de **cliente**, no el del ControlNode, y eso importa: el GC pide la
+lista de huérfanos y recibe con ella un **token de borrado por bloque**, firmado. No puede
+fabricarlos él, así que quien decide qué es un huérfano sigue siendo el ControlNode.
 
 ---
 
@@ -198,6 +282,227 @@ flowchart LR
 La línea gruesa es el camino de los datos; la punteada, el plano de control. El
 ControlNode no es un cuello de botella de ancho de banda: cada DataNode que se añade suma
 capacidad de transferencia en lugar de saturar un nodo central.
+
+### Dos direcciones por DataNode
+
+Desde el Hito 3 un DataNode anuncia **dos** direcciones: una para el cliente y otra para
+sus pares. Hasta el Hito 2 solo el cliente hablaba con los DataNodes, así que una bastaba;
+ahora los DataNodes hablan **entre sí** (pipeline y re-replicación), y en `docker compose`
+el cliente está fuera (`localhost:800N`) y los vecinos dentro (`data-node-N:8001`).
+
+Con una sola dirección, DN1 reenviaba a `localhost:8002` y eso, dentro de un contenedor,
+resuelve **al propio contenedor**. El síntoma era un `put` fallando con 409 «no alcanzan
+el quórum» y 50 réplicas donde debería haber 150.
+
+Esto **no** reabre la decisión del Hito 2 de no anunciar dos direcciones. Lo que allí se
+rechazó fue que el ControlNode **infiriera** cuál usar según el origen de la petición, que
+es una suposición sobre la red del cliente. Aquí no hay inferencia: las dos direcciones
+son estáticas y su destinatario se sabe por la **estructura del mensaje** — el plan del
+cliente lleva siempre la de cliente, la cadena del pipeline lleva siempre la de par.
+
+### Replicación R=3: el cliente sube una vez
+
+Con tres copias, la alternativa ingenua es que el cliente suba el mismo bloque tres veces.
+DFSha lo sube **en cadena**: el cliente manda el bloque a la primera réplica del plan con
+las otras dos en una cabecera, y cada DataNode lo reenvía al siguiente quitándose de la
+lista. Con instancias pequeñas y un enlace doméstico, el ancho de subida del cliente es el
+recurso más escaso, y multiplicarlo por tres es justo lo que no se puede permitir.
+
+Dentro de cada nodo el orden es **verificar, luego escribir y reenviar a la vez**:
+
+- **Verificar antes de reenviar** impide que una corrupción se propague por la cadena. Lo
+  que sale de un nodo ya está comprobado.
+- **Escribir y reenviar en paralelo** evita que la cadena sea la suma de las latencias de
+  disco de tres nodos: el reenvío no espera al `fsync`.
+
+Un fallo aguas abajo **no tumba la subida**. Si el primer nodo escribió bien y el tercero
+falla, el cliente recibe `201` con un `X-DFSha-Replicas-Acked` menor. Fallar la petición
+convertiría W=3 en el mínimo de hecho, que es lo contrario de lo que se decidió.
+
+> **Un interbloqueo que costó encontrar, y que explica una línea del código.** La primera
+> versión hacía la escritura y el reenvío dentro del handler asíncrono, lo que deja el
+> bucle de eventos del nodo parado: mientras escribe, **el nodo deja de aceptar
+> peticiones**. Con dos subidas concurrentes eso es una espera circular — DN1 esperando a
+> DN2 y DN2 esperando a DN1 — y las dos mueren por *timeout*. Por eso todo el trabajo
+> bloqueante sale a un hilo del pool. Las pruebas de integración pasaron de 248 s en
+> timeouts a 50 s.
+
+### Quórum W=2: legible con dos copias, completo con tres
+
+El `commit` pasa con **dos** réplicas confirmadas. El archivo queda legible y la tercera se
+completa en segundo plano.
+
+Un archivo con 2 de 3 copias **no está roto**: todavía tolera perder un nodo. Rechazar su
+commit pondría la durabilidad por encima de la disponibilidad, que es la elección contraria
+a la que hacen estos sistemas. Con **menos de dos**, el commit falla y el cliente reintenta:
+no hay medias tintas.
+
+Quien decide el quórum es el ControlNode, contando filas de `block_replicas` — no la
+cabecera que ve el cliente, que es informativa. Que eso no tenga carreras depende de una
+decisión del Hito 2: el aviso de bloque almacenado es **síncrono y anterior** al `201`, así
+que cuando el cliente puede pedir el commit, el ControlNode ya sabe de esas copias.
+
+Se ve donde importa:
+
+```bash
+dfsha stat /video.mp4
+  ...
+  replicacion    FULLY_REPLICATED (3 de 3 copias por bloque)
+
+dfsha cluster
+  ...
+  12 bloques sub-replicados (menos de 3 copias) · 1 con UNA sola copia — a un fallo de perderse
+```
+
+Los críticos se cuentan aparte de los sub-replicados porque **no cuestan lo mismo**: uno
+con dos copias todavía tolera una caída; uno con una sola está a un fallo de desaparecer.
+
+> **Puede aparecer `FULLY_REPLICATED (3-4 de 3)`, y es normal.** Si un nodo muere, se
+> repone su copia y luego el nodo **vuelve** con su disco intacto, sus réplicas se
+> readmiten y el bloque queda con una copia de más. Es la otra cara de la propiedad que
+> hace que una reincorporación normal no cueste una re-replicación.
+>
+> Esa copia extra **no la recoge el GC**, que solo recoge bloques de archivos borrados y
+> reservas vencidas: el bloque pertenece a un archivo vivo. Cuesta disco, no corrección.
+> Quitarla automáticamente significaría que el ControlNode borra datos por su cuenta, que
+> es justo lo que el diseño no hace.
+
+### Re-replicación: tres frenos
+
+Cuando un nodo muere de verdad, sus copias se rehacen solas. El mecanismo tiene más
+capacidad de hacerse daño a sí mismo que ningún otro del sistema —reacciona a una caída
+moviendo gigabytes, justo cuando el clúster ya va justo—, así que lleva tres frenos:
+
+| Freno | Por defecto | Qué evita |
+|---|---|---|
+| Espera de gracia | 5 min desde `DEAD` | Copiar el disco entero de un nodo por un **reinicio de contenedor**, que tarda segundos. Es el error clásico, y se encadena: la copia satura la red, otro nodo deja de latir a tiempo, y se dispara otra copia |
+| Tope por destino | 2 copias a la vez | Que la recuperación se concentre en el nodo más vacío y lo **tumbe por saturación** — el nodo que se ofreció como destino justo por estar libre |
+| Prioridad | por copias restantes | Que un bloque con **una sola** copia espere detrás de uno con dos. Si el clúster no da abasto, el orden en que se rinde decide si se pierden datos |
+
+**El destino tira, el origen no empuja.** La orden llega a quien tiene que hacer el
+trabajo y puede negarse si no le cabe; el origen solo ve una descarga más, que es lo que ya
+sabe hacer. Las órdenes viajan por el stream de heartbeat, en el `oneof` que el Hito 2
+dejó preparado: un caso más, no un transporte nuevo.
+
+La cola vive en PostgreSQL, no en la memoria del líder — si viviera en memoria se perdería
+justo cuando más falta hace, que es cuando el líder cambia de manos — y **solo el líder la
+programa**, con su época verificada dentro de la transacción. Dos líderes programando a la
+vez no duplicarían un log: duplicarían el tráfico de copia de un clúster que ya se está
+recuperando de algo.
+
+Para verlo en vivo, con la gracia bajada:
+
+```bash
+DFSHA_REREPLICATION_GRACE_MS=30000 docker compose up -d
+dfsha put ./archivo.bin /archivo.bin
+docker kill dfsha-data-node-2
+dfsha stat /archivo.bin     # UNDER_REPLICATED (2 de 3)
+# ... 30 s ...
+dfsha stat /archivo.bin     # FULLY_REPLICATED (3 de 3)
+```
+
+### El GC, ahora por dos vías
+
+`scripts/gc.py` sigue siendo el recolector manual que pide el enunciado. La novedad es
+`--via-control-plane`, que encola los borrados como órdenes que viajan por el heartbeat.
+
+La diferencia no es de eficiencia: por esa vía **no hace falta tener ruta hasta los
+DataNodes**, solo hasta el ControlNode. En AWS es el único caso posible desde fuera de la
+VPC, porque los nodos anuncian su IP privada. A cambio el borrado es asíncrono, así que esa
+vía **no confirma**: las filas del metadato se quitan en una pasada posterior, cuando
+conste que el bloque ya no está en ningún disco. El ControlNode no borra metadato sobre una
+promesa.
+
+### Elección de líder: la época es un token de aislamiento
+
+Los tres ControlNodes son idénticos y **ninguno guarda estado**: el token JWT lleva la
+identidad y el cwd vive en el cliente. Por eso el balanceador puede repartir sin sesiones
+pegajosas, y por eso una petición puede caer en cualquiera de los tres.
+
+Pero hay trabajo que **no** puede hacer más de uno a la vez: evaluar qué DataNodes están
+muertos y (en el Bloque B) programar re-replicaciones. Dos instancias haciéndolo en
+paralelo marcarían el mismo nodo muerto dos veces y copiarían los mismos bloques por
+duplicado. Para eso está el lease: una fila en PostgreSQL que una instancia sostiene
+renovándola cada 2 s, y que caduca a los 6 s si deja de renovarla.
+
+**Un lease solo no basta**, y este es el punto que merece el espacio:
+
+```
+t=0   A toma el lease (época 7) y empieza a evaluar la pertenencia
+t=1   A se congela — una pausa larga del recolector de basura, una partición
+      de red, un contenedor al que el planificador dejó sin CPU
+t=7   el lease de A vence sin que A se entere
+t=8   B lo toma con época 8 y empieza a trabajar
+t=9   A despierta EN MEDIO de su operación, convencido de que sigue mandando
+```
+
+Si lo único que A comprobó fue «¿soy el líder?» antes de empezar, en `t=9` **escribe**. Y
+entonces hay dos líderes dando órdenes contradictorias sobre el mismo clúster.
+
+Lo que lo corta es que A lleve su época encima y se compruebe contra la almacenada
+**dentro de la misma transacción que la escritura**. En `t=9` la fila dice 8, A trae 7, y
+la operación se aborta entera sin dejar nada escrito. De ahí que en el código **no exista
+ningún `soy_el_lider()`** consultable por separado: esa función es exactamente el patrón
+que deja pasar a A.
+
+Dos consecuencias que parecen detalles y no lo son:
+
+- **La época solo sube.** Nunca baja ni se reinicia.
+- **Recuperar el propio lease vencido también sube la época.** Si A vuelve y el lease
+  está libre, lo toma con la 9, no con la 7. Entre una y otra pudo pasar cualquier cosa,
+  y su trabajo a medio camino sigue invalidado. Es lo correcto.
+
+Medido en un stack desechable: matar al líder da relevo en **5,8 s**, con la época
+subiendo de 2 a 3.
+
+```bash
+curl -s localhost:8000/api/v1/cluster/leadership -H "Authorization: Bearer $TOKEN"
+{"leader_id":"12801511-...","epoch":3,"is_self":false,
+ "instance_id":"5c71586c-...","expires_in_seconds":4.25, ...}
+```
+
+`is_self` dice si te atendió el líder o una de las otras dos; `instance_id` dice cuál de
+las tres te atendió. Con un balanceador delante es la única forma de saberlo.
+
+**Qué exige liderazgo y qué no.** Lo exigen el evaluador de pertenencia, la
+re-replicación (Bloque B) y el recolector. **No** lo exigen las consultas de metadatos,
+los planes de escritura y lectura, la autenticación, ni el servidor gRPC que recibe
+heartbeats: los DataNodes pueden latir contra cualquier instancia, porque el heartbeat
+escribe en la base compartida y no en la memoria del proceso que lo recibe.
+
+### CQRS: la réplica de lectura, y por qué no te miente
+
+Las consultas (`ls`, `stat`, `open`, `cluster/status`) van a la réplica de PostgreSQL;
+todo lo que escribe va al primario. La separación `commands/` y `queries/` existe en el
+código desde el Hito 1 esperando este momento.
+
+El problema de hacerlo es que la replicación es **asíncrona**. Un `mkdir /a` seguido de un
+`ls /` puede preguntarle a una réplica que todavía no ha reproducido el `mkdir`, y eso no
+es «un poco de retraso»: es mentirle al cliente sobre su propia escritura.
+
+La solución es *read-your-writes* con el LSN del WAL:
+
+1. Tras cada comando, el ControlNode devuelve `pg_current_wal_lsn()` en
+   `X-DFSha-Write-LSN`. Va en un middleware y no en cada caso de uso porque tiene que
+   medirse **después** del commit.
+2. El cliente lo guarda en `~/.dfsha/session.json` — cada invocación de `dfsha` es un
+   proceso nuevo, así que en memoria no serviría — y lo reenvía como `X-DFSha-Read-LSN`.
+3. El ControlNode lo compara con `pg_last_wal_replay_lsn()` de la réplica. Si va por
+   detrás, la consulta se atiende desde el primario.
+
+El coste cae **solo sobre los clientes que acaban de escribir**: quien no manda LSN va
+derecho a la réplica sin consulta adicional. Y todos los caminos de fallo caen del lado
+seguro — un LSN mal formado, una réplica inalcanzable, o un `DFSHA_DB_REPLICA_URL` que por
+error apunta a un primario acaban sirviendo desde el primario.
+
+`GET /internal/v1/gc/orphan-blocks` es una consulta y **se queda en el primario** a
+propósito: su respuesta dispara un borrado en disco. La regla, escrita en `CLAUDE.md`: una
+consulta cuya respuesta dispara una escritura destructiva no se sirve desde la réplica.
+
+**La promoción de la réplica ante caída del primario es manual**, y está en
+[`deploy/RUNBOOK-postgres.md`](deploy/RUNBOOK-postgres.md). No confundirla con la elección
+de líder: el ControlNode no tiene estado y puede elegir líder solo; una base de datos sí
+lo tiene y no puede.
 
 ### Por qué gRPC solo en el plano de control
 
@@ -393,13 +698,34 @@ dfsha register <usuario>              dfsha ls [ruta]          dfsha put <local>
 dfsha login <usuario>                 dfsha cd <ruta>          dfsha get <remoto> <local>
 dfsha logout                          dfsha pwd                dfsha cluster
 dfsha mkdir [-p] <ruta>               dfsha rm <ruta>          dfsha mv <origen> <destino>
-dfsha rmdir [-r] <ruta>
+dfsha rmdir [-r] <ruta>               dfsha stat <ruta>
+```
+
+Compartir (Bloque C):
+
+```
+dfsha share <ruta> <usuario|grupo> <read|write|admin>     dfsha shared
+dfsha unshare <ruta> <usuario|grupo>                      dfsha acl <ruta>
+dfsha group create|add|remove|list
+```
+
+RF3:
+
+```
+dfsha lock [--shared] <ruta>          dfsha read <ruta> --offset N --length N
+dfsha unlock <ruta>                   dfsha append <remoto> <local>
+dfsha locks <ruta>
 ```
 
 - `cd` y `pwd` operan sobre un directorio de trabajo **del lado del cliente**, guardado
   junto al token en `~/.dfsha/session.json`. El ControlNode es stateless.
 - `put` y `get` aceptan `--parallel N` (por defecto 4) para transferir bloques a la vez.
 - `-v` emite los logs JSON de tiempos por stdout.
+- `login` **deriva la clave de cifrado aquí** y no la manda a ninguna parte. Con
+  `--ask-password` no la guarda en disco y la pide en cada `put` y `get`.
+- `read` escribe el tramo pedido por la salida estándar, así que se encadena con `head`,
+  `jq` o lo que sea. Descarga **solo los bloques que tocan el tramo**.
+- `lock` vuelve a ejecutarse para **renovar**: el bloqueo vence solo si el proceso muere.
 
 ### `dfsha cluster`: por qué `bloq.` y `repl.` son dos columnas
 
@@ -498,7 +824,6 @@ Corre el GC desde el host, que es donde sí funciona en ambos casos:
 
 ```bash
 export DFSHA_CONTROL_URL=http://localhost:8000
-export DFSHA_INTERNAL_SECRET=...   # el mismo valor que en .env
 python scripts/gc.py
 ```
 
@@ -516,14 +841,21 @@ Todo por variables de entorno; `.env.example` las lista todas.
 |---|---|---|
 | `DFSHA_BLOCK_SIZE` | `67108864` (64 MB) | Tamaño de bloque |
 | `DFSHA_CONTROL_URL` | `http://localhost:8000` | Dónde está el ControlNode |
-| `DFSHA_DB_URL` | `sqlite:///./dfsha.db` | Metadato |
+| `DFSHA_DB_URL` | `sqlite:///./dfsha.db` | Metadato. En Docker, PostgreSQL primario. SQLite solo para pruebas |
+| `DFSHA_DB_REPLICA_URL` | vacío | Réplica de lectura. **Vacío = todo al primario**, y es un modo soportado |
+| `DFSHA_PG_PASSWORD` | — **obligatorio** | Clave del rol de aplicación de PostgreSQL |
+| `DFSHA_PG_REPLICATION_PASSWORD` | — **obligatorio** | Clave del rol de replicación, que solo puede replicar |
 | `DFSHA_JWT_SECRET` | — **obligatorio** | Firma de los tokens |
 | `DFSHA_JWT_TTL_SECONDS` | `3600` | Vida del token |
-| `DFSHA_INTERNAL_SECRET` | — **obligatorio** | Protege `/internal/v1` |
+| `DFSHA_TLS_CA_CERT` | — **obligatorio** | La CA contra la que todos se validan |
+| `DFSHA_TLS_CERT` / `DFSHA_TLS_KEY` | — **obligatorio** | El certificado de este rol y su clave |
+| `DFSHA_INTERNAL_PORT` | `8443` | Puerto del plano interno, separado del de cliente |
+| `DFSHA_FILE_LOCK_TTL_MS` | `120000` | Vida de un bloqueo de archivo (RF3) sin renovar |
 | `DFSHA_DATA_DIR` | `/var/lib/dfsha` | Dónde guarda bloques el DataNode |
 | `DFSHA_DATANODE_ADVERTISE_URL` | `http://localhost:8001` | URL con la que se anuncia el DataNode, **alcanzable por el cliente** |
+| `DFSHA_DATANODE_PEER_URL` | vacío | URL **alcanzable por otros DataNodes** (pipeline y re-replicación). Vacío = la misma que la anterior |
 | `DFSHA_DATANODE_FAULT_DOMAIN` | `local-1` | Dominio de falla: cadena opaca, solo se compara igualdad |
-| `DFSHA_CONTROL_GRPC_URL` | `control-node:9000` | Dónde escucha el plano de control |
+| `DFSHA_CONTROL_GRPC_URL` | `lb:9000` | Dónde escucha el plano de control (el balanceador, no una instancia) |
 | `DFSHA_DATANODE_CAPACITY_BYTES` | libre en disco | Capacidad anunciada |
 | `DFSHA_GRPC_PORT` | `9000` | Puerto gRPC del ControlNode |
 | `DFSHA_HEARTBEAT_INTERVAL_MS` | `3000` | Cada cuánto late un DataNode |
@@ -531,14 +863,31 @@ Todo por variables de entorno; `.env.example` las lista todas.
 | `DFSHA_SUSPECT_AFTER_MS` | `10000` | Silencio tras el que un nodo sale de la colocación |
 | `DFSHA_DEAD_AFTER_MS` | `30000` | Silencio tras el que sus réplicas se dan por no disponibles |
 | `DFSHA_MEMBERSHIP_INTERVAL_MS` | `1000` | Cada cuánto se evalúan las transiciones de estado |
-| `DFSHA_REPLICATION_FACTOR` | `1` | R=1 en esta etapa; la replicación efectiva llega en la Etapa 3 |
+| `DFSHA_LEASE_TTL_MS` | `6000` | Vida del lease de líder sin renovar |
+| `DFSHA_LEASE_RENEW_MS` | `2000` | Cada cuánto renueva el líder. Debe ser menor que el TTL o el servicio no arranca |
+| `DFSHA_WRITE_QUORUM` | `2` | Réplicas confirmadas que exige el `commit`. No puede ser mayor que R o el servicio no arranca |
+| `DFSHA_REREPLICATION_GRACE_MS` | `300000` | Espera desde que un nodo entra en `DEAD` antes de copiar sus bloques |
+| `DFSHA_REREPLICATION_MAX_PER_NODE` | `2` | Copias simultáneas hacia el mismo destino |
+| `DFSHA_REREPLICATION_MAX_PER_PASS` | `8` | Copias despachadas por pasada del planificador |
+| `DFSHA_REREPLICATION_INTERVAL_MS` | `5000` | Cada cuánto corre el planificador |
+| `DFSHA_ORDER_WORKERS` | `2` | Copias simultáneas que un DataNode acepta ejecutar |
+| `DFSHA_REPLICATION_FACTOR` | `3` | Copias por bloque |
 | `DFSHA_PLACEMENT_D` | `3` | Tamaño de la ventana del *power of d choices* |
 | `DFSHA_MIN_FREE_BYTES` | `134217728` | Margen de disco que un nodo debe conservar para ser candidato |
 | `DFSHA_WRITE_TTL_SECONDS` | `600` | Vencimiento de las reservas de escritura |
 | `DFSHA_LOG_LEVEL` | `INFO` | Nivel de log |
 
-Los dos secretos **no tienen valor por defecto en el código** y deben tener al menos 16
+Los secretos **no tienen valor por defecto en el código** y deben tener al menos 16
 caracteres. Un secreto por defecto en un repositorio público es un hallazgo de seguridad.
+
+`DFSHA_INTERNAL_SECRET` **ya no existe**: lo sustituyó el mTLS del Bloque C. Un `.env`
+viejo que todavía lo tenga no estorba —simplemente se ignora— pero le faltarán las tres
+variables de TLS, y entonces el servicio no arranca y lo dice.
+
+Los tres ficheros de TLS **no tienen valor por defecto**, igual que el secreto de JWT: un
+plano interno que arranca sin autenticación porque se olvidó una variable es peor que uno
+que no arranca. Y el DataNode además comprueba que los ficheros **existen**, para que el
+fallo sea «no existe `certs/data.crt`» y no un error de handshake diez segundos después.
 
 ---
 
@@ -577,6 +926,10 @@ python scripts/gen_proto.py    # genera el codigo del .proto (no se versiona)
 pytest -q                      # toda la suite
 pytest tests/unit -q           # rápido, sin red
 pytest tests/integration -q    # levanta ControlNode y DataNode reales en puertos reales
+
+# Cuatro pruebas se SALTAN sin PostgreSQL. Ver abajo: no son opcionales, son las que
+# no se pueden fingir.
+DFSHA_TEST_PG_URL="postgresql+psycopg://dfsha:...@localhost:5432/dfsha" pytest -q
 ```
 
 Las de integración arrancan servidores uvicorn de verdad en hilos y usan el cliente real,
@@ -595,9 +948,45 @@ nodo con menos capacidad recibiendo una fracción menor, el ciclo completo de ca
 reincorporación), y un `.blk` borrado a mano que acaba en `MISSING` sin que el ControlNode
 borre nada.
 
+Y los del Hito 3. **Bloque A**: que la migración de Alembic y `models.py` describen
+**exactamente** el mismo esquema (`compare_metadata` con cero diferencias), el enrutado de
+consultas con sus cuatro caminos de fallo, y el lease de líder.
+
+**Bloque B**, con cuatro DataNodes reales: cada bloque en tres nodos y tres dominios; el
+cliente hablando con **un** nodo por bloque mientras los otros dos reciben su copia de la
+cadena; un nodo caído durante la subida que no impide el `commit` y deja el archivo
+`UNDER_REPLICATED`; el archivo legible con **dos de tres nodos caídos** y el SHA-256
+intacto; y el ciclo completo de recuperación —matar un nodo, espera de gracia,
+re-replicación, vuelta a `FULLY_REPLICATED`— comprobando además que el archivo se sigue
+bajando bien desde la copia nueva.
+
+Y la otra mitad, que es la que no se ve si solo se prueba el camino feliz:
+`test_un_reinicio_rapido_NO_dispara_una_copia`. Un nodo que se reinicia y vuelve enseguida
+no debe costar ni una copia; sin ese freno, cada despliegue rodante movería el disco
+entero.
+
 Los umbrales van comprimidos en las pruebas (1,5 s y 3 s) para que la suite no tarde
 minutos; la aritmética de los valores reales está cubierta por las unitarias de
-`test_membership.py`, con reloj inyectado.
+`test_membership.py`, con reloj inyectado. Lo mismo con el lease: reloj inyectado, sin
+esperas reales.
+
+### Las cuatro pruebas que necesitan PostgreSQL de verdad
+
+`tests/integration/test_leadership_postgres.py` se salta si no hay `DFSHA_TEST_PG_URL`,
+para que `pytest` siga corriendo en un portátil sin Docker. **No son un extra.** La
+exclusión mutua del lease depende de `SELECT ... FOR UPDATE`, que SQLite no implementa y
+SQLAlchemy omite silenciosamente en ese dialecto: en SQLite se prueba la comparación de
+época, pero que dos instancias compitiendo no ganen las dos solo se puede comprobar contra
+PostgreSQL. Ocho hilos saliendo de una barrera común; gana exactamente uno.
+
+El CI levanta un servicio PostgreSQL para eso, así que en cada push sí se comprueban.
+
+### La prueba que importa del Bloque A
+
+`test_el_lider_congelado_es_rechazado_y_no_escribe_nada` reproduce el escenario completo:
+A toma el lease, se congela, B lo toma con la época siguiente, y A despierta a mitad de su
+operación. Comprueba las dos mitades, y la segunda es la que suele olvidarse: que A fue
+rechazado, **y** que no dejó ni una escritura detrás.
 
 ---
 
@@ -606,51 +995,152 @@ minutos; la aritmética de los valores reales está cubierta por las unitarias d
 ```
 src/dfsha/
 ├── common/          DTOs compartidos, checksum, errores, logging
+│   ├── crypto.py    las tres capas de clave del cifrado extremo a extremo
+│   ├── blocktoken.py  autorización por bloque que el DataNode verifica solo
+│   ├── tls.py       único sitio donde se construye un contexto TLS de cliente
 │   └── proto/       control.proto (el codigo generado no se versiona)
 ├── control_node/
 │   ├── api/         routers: sólo traducción HTTP ↔ casos de uso
 │   ├── commands/    lado escritura (CQRS)
 │   ├── queries/     lado lectura (CQRS)
-│   ├── domain/      Path, File, Block, reglas, partición, pertenencia, divergencia
+│   ├── domain/      Path, File, Block, reglas, partición, pertenencia, acl, filelock
 │   ├── repositories/  modelos SQLAlchemy, interfaces, unidad de trabajo
-│   └── services/    auth, placement, resolver, monitor de pertenencia
+│   └── services/    auth, placement, resolver, pertenencia, access, shared
 ├── data_node/       storage.py (layout en disco), heartbeat.py (cliente gRPC) + api/
 └── client/          cli.py, session.py, chunker.py, transfer.py
-scripts/             gc.py, gen_testfile.py, gen_proto.py
+alembic/versions/    migraciones del metadato (0001–0007)
+scripts/             gc.py, gen_testfile.py, gen_proto.py, gen_certs.py,
+                     verificar_pruebas.py, demo/
+certs/               la CA y los certificados (NO se versiona)
 deploy/              material de despliegue en AWS
 tests/               unit/, integration/
 ```
 
 `CLAUDE.md` guarda las decisiones de diseño, la hoja de ruta por etapas y los contratos.
 
+### Dos herramientas que no son del sistema sino de cómo se verifica
+
+- **`scripts/demo/`** — cuatro guiones que reproducen los escenarios del hito y
+  **comprueban el resultado**. Cada uno lleva un *control positivo* junto a la
+  comprobación negativa, porque «no aparece el texto claro» y «un `grep` mal escrito» se
+  parecen demasiado. Ver [`scripts/demo/README.md`](scripts/demo/README.md).
+- **`scripts/verificar_pruebas.py`** — rompe a propósito cada protección de seguridad y
+  exige que las pruebas que dicen fijarla **caigan**. Encontró tres pruebas que pasaban
+  por un camino distinto del que su nombre anunciaba. Una prueba que nunca has visto
+  fallar no sabes si prueba algo.
+
 ---
 
 ## Despliegue en AWS
 
-Cinco instancias `t3.micro` —un ControlNode y cuatro DataNodes en dos zonas de
+Seis instancias `t3.micro` —PostgreSQL, un ControlNode y cuatro DataNodes en dos zonas de
 disponibilidad— con su grupo de seguridad propio. Los pasos exactos, las reglas de red y
 qué cambia en cada instancia están en **[`deploy/README.md`](deploy/README.md)**.
 
 > **Sin ejecutar todavía.** El material está escrito y revisado, pero nadie lo ha corrido
-> en una cuenta de AWS. El despliegue local con `docker compose` sí está verificado de
-> punta a punta.
+> en una cuenta de AWS. El despliegue local con `docker compose` sí está verificado:
+> arranque de los diez servicios, clúster 4/4, liderazgo, los cuatro guiones de
+> demostración, el RF3 y el TLS de cliente encendido con el override. El detalle de cada
+> pasada está en CLAUDE.md, «Estado de la validacion en Docker».
 
 ## Alcance de esta etapa
 
-**Entra**: gRPC para el plano de control, heartbeat cada 3 s con métricas, block report
-incremental y completo, máquina de estados `ALIVE`/`SUSPECT`/`DEAD` con reincorporación,
-*power of d choices* con dominios de falla, detección de divergencia sin borrado
-automático, `/cluster/status`, compose de cuatro nodos y material de despliegue en AWS.
+**Entra**, y está terminado y probado:
 
-**No entra, y llega en la Etapa 3**: replicación efectiva (aquí **R=1**; la política
-soporta R>1 y está probada para ello, pero el default no cambia), pipeline de escritura
-entre DataNodes, quórum W, re-replicación automática, alta disponibilidad del ControlNode,
-mTLS, cifrado en reposo, y RF3 con leases.
+| Bloque | Qué |
+|---|---|
+| **A** | PostgreSQL con réplica de lectura, migraciones con Alembic, tres ControlNodes y elección de líder por lease con **época** |
+| **B** | Replicación **R=3** con pipeline encadenado, quórum **W=2** en el commit, re-replicación automática con tres frenos |
+| **C** | **mTLS** en el plano interno, **cifrado extremo a extremo**, **ACLs** con grupos, **token de bloque**, y **RF3** (`open`, lectura por rango, `append`, `lock` con lease) |
 
-Las costuras que la Etapa 3 hereda:
+**El TLS de cliente es opcional y viene apagado por defecto** (`DFSHA_CLIENT_TLS_CERT` y
+`DFSHA_CLIENT_TLS_KEY` vacías = HTTP plano). No es una concesión: es lo que permite que
+`curl http://localhost:8000/health` siga funcionando en desarrollo. Y lo que aporta cuando
+se enciende conviene decirlo en el orden correcto: **los bloques ya viajaban cifrados**
+desde el Bloque C, así que esto no salva la confidencialidad del contenido —eso ya estaba—
+sino el **token JWT**, el **metadato** (nombres, rutas, tamaños) y los tokens de bloque.
 
-- El stream de `Heartbeat` es **bidireccional** y el ControlNode ya empuja mensajes no
-  solicitados. Las órdenes de re-replicación son un caso más en el `oneof`.
-- El estado `MISSING` de una réplica ya se detecta y se registra: es lo que disparará la
-  recuperación.
-- `select(block_size, replication_factor)` no cambia de firma: solo sube el default.
+No es mTLS: al cliente **no** se le pide certificado, porque su identidad es el JWT. Dar un
+certificado a cada usuario sería montar una PKI para acabar sabiendo lo mismo que ya dice
+el token.
+
+### Encender y apagar el TLS de cliente en `docker compose`
+
+Es un fichero que se superpone, no variables en el `.env`: encender C2 cambia a la vez el
+certificado de siete servicios, las ocho direcciones anunciadas y la configuración de nginx,
+y tienen que moverse juntos. No toca el `.env` ni los volúmenes, así que encender y apagar
+no borra datos. En PowerShell, desde la raíz del repositorio:
+
+```powershell
+# 1. Encender: ControlNodes, DataNodes y nginx pasan a HTTPS
+docker compose -f docker-compose.yml -f docker-compose.tls.yml up -d --build
+docker compose ps                  # los diez healthy; las sondas ya preguntan en HTTPS
+
+# 2. El cliente del host cambia de URL (la de la sesión guardada era http://)
+$env:DFSHA_CONTROL_URL = "https://localhost:8000"
+dfsha login ana                    # la CA la toma de certs/ca.crt
+
+# 3. Comprobar que va por HTTPS y que se verifica de verdad (con httpx, como el cliente)
+python -c "import httpx, ssl; print(httpx.get('https://localhost:8000/health', verify=ssl.create_default_context(cafile='certs/ca.crt')).json())"
+#   -> {'status': 'ok', 'service': 'control-node'}
+python -c "import httpx; httpx.get('https://localhost:8000/health')"
+#   -> ConnectError ... CERTIFICATE_VERIFY_FAILED: sin NUESTRA CA no se confia
+python -c "import httpx; print(httpx.get('http://localhost:8000/health').status_code)"
+#   -> 400: nginx contesta "plain HTTP request was sent to HTTPS port"
+python -c "import httpx, ssl; print(httpx.get('https://localhost:8001/health', verify=ssl.create_default_context(cafile='certs/ca.crt')).json()['status'])"
+#   -> ok: el DataNode tambien habla HTTPS
+dfsha cluster                      # las direcciones salen como https://localhost:800N
+python scripts/demo/permisos_y_token.py
+python scripts/demo/replicacion_y_caida.py
+
+# 4. Apagar: volver a levantar SIN el override, y el cliente de vuelta a http://
+docker compose up -d
+$env:DFSHA_CONTROL_URL = "http://localhost:8000"
+dfsha login ana
+Remove-Item Env:DFSHA_CONTROL_URL  # la sesión ya guarda http://
+```
+
+Las dos comprobaciones que **no** devuelven `ok` son la mitad que importa: un TLS que
+acepta cualquier certificado se ve igual que uno que verifica, y solo el rechazo lo
+distingue. No se usa `curl.exe` porque en Windows va con Schannel, que con una CA propia
+sin lista de revocación falla por la revocación y no por la cadena: el rechazo saldría,
+pero por un motivo que no es el que se quiere enseñar.
+
+Qué hace el override, tramo a tramo:
+
+| Tramo | Con el override |
+|---|---|
+| cliente → nginx `:8000` | HTTPS con el certificado de control (SAN `localhost`) |
+| nginx → ControlNode | HTTPS **verificado** contra la CA del proyecto |
+| cliente → DataNode `:800N` | HTTPS con el certificado de datos |
+| DataNode → DataNode (pipeline, re-replicación) | HTTPS **verificado** contra la CA |
+| plano interno `:8443`, gRPC `:9000` | sin cambios: ya llevaban mTLS |
+
+nginx **termina** TLS en `:8000` y vuelve a cifrar hacia el ControlNode, al revés que en
+`:8443` y `:9000`. En el plano interno el certificado es la identidad y no puede morir en
+el balanceador; en el de cliente la identidad es el JWT, que viaja dentro de la petición y
+llega intacto. Terminar aquí conserva lo que justifica el nivel 7: reparto por petición y
+reintento en otra instancia. Está explicado en `docker/nginx/dfsha-tls.conf`.
+
+### Límites conocidos, escritos a propósito
+
+Ninguno es un olvido. Están razonados en `CLAUDE.md` y se defienden como decisiones:
+
+- **PBKDF2 en vez de Argon2id** para derivar la clave del usuario. Argon2id resiste mejor
+  el hardware especializado; PBKDF2 está en la biblioteca estándar y no añade dependencia.
+- **La clave maestra se guarda en la sesión.** El modelo es «el servidor nunca ve la
+  clave», no «la clave nunca toca el disco». `login --ask-password` no la guarda.
+- **No hay revocación de tokens de bloque.** Retirar un permiso corta la *emisión*; lo ya
+  emitido vale hasta caducar, y por eso la vida son 10 minutos. Consultar al ControlNode
+  en cada petición de bloque devolvería el plano de control al camino de los datos.
+- **Cambiar la contraseña no re-cifra nada.** Las envolturas existentes dejarían de
+  abrirse. El CLI lo dice al fallar en vez de dejar un archivo ilegible sin explicación.
+- **La promoción de la réplica de PostgreSQL es manual** (`deploy/RUNBOOK-postgres.md`).
+  Un failover de base de datos automático y correcto es otro proyecto; uno a medias es
+  peor que ninguno.
+- **La sobre-replicación tras una reincorporación no se limpia sola.** Un bloque puede
+  quedar con 4 copias y R=3. Cuesta disco, no corrección, y quitarla automáticamente
+  violaría la regla de que el ControlNode no borra datos por una divergencia.
+- **`append` reescribe el bloque de cola.** Añadir un byte puede reescribir hasta un
+  bloque entero (64 MB con el default). El coste está acotado por el tamaño de bloque, no
+  por el del archivo; la alternativa dejaba miles de bloques diminutos.

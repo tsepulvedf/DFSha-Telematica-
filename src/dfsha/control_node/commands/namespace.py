@@ -21,13 +21,12 @@ from dfsha.control_node.domain.rules import (
     ensure_name_is_free,
     ensure_visible,
 )
+from dfsha.control_node.domain.acl import Permission
 from dfsha.control_node.repositories.sql import SqlUnitOfWork, new_id
-from dfsha.control_node.services.resolver import (
-    find_directory,
-    resolve_directory,
-    resolve_entry,
-    resolve_root,
-)
+from dfsha.control_node.services.access import directory_for, entry_for
+from dfsha.control_node.services.permissions import require
+from dfsha.control_node.services.resolver import find_directory
+from dfsha.control_node.services.shared import resolve_scope
 from dfsha.control_node.tracing import command
 
 __all__ = ["mkdir", "rmdir", "rm", "mv"]
@@ -40,7 +39,13 @@ def mkdir(uow: SqlUnitOfWork, owner_id: str, raw_path: str, parents: bool = Fals
         raise AlreadyExistsError("la raiz ya existe", path=str(path))
 
     with uow:
-        actual = resolve_root(uow.directories, owner_id)
+        # `mkdir` arranca en la raiz del SCOPE, que para una ruta normal es la raiz del
+        # usuario y para una compartida es el directorio que le compartieron. Asi crear
+        # dentro de lo ajeno funciona igual que dentro de lo propio, con el permiso
+        # comprobado abajo.
+        alcance = resolve_scope(uow, owner_id, path)
+        actual = alcance.start
+        require(uow, owner_id, actual, Permission.WRITE, path=raw_path)
         ahora = utcnow()
 
         for indice, nombre in enumerate(path.segments):
@@ -88,7 +93,11 @@ def rmdir(uow: SqlUnitOfWork, owner_id: str, raw_path: str, recursive: bool = Fa
         raise InvalidPathError("no se puede borrar la raiz")
 
     with uow:
-        directorio = resolve_directory(uow.directories, owner_id, path)
+        # Borrar un directorio es escribir en su padre. Se pide WRITE sobre el propio
+        # directorio, que por la herencia hacia arriba implica tenerlo en el padre salvo
+        # que alguien haya puesto una regla mas fina ahi, que es justo lo que se quiere
+        # respetar.
+        directorio = directory_for(uow, owner_id, path, Permission.WRITE).directory
         ensure_directory_is_empty(
             path, uow.directories.count_children(directorio.id), recursive
         )
@@ -110,7 +119,7 @@ def rm(uow: SqlUnitOfWork, owner_id: str, raw_path: str) -> None:
     path = Path.parse(raw_path)
 
     with uow:
-        encontrado = resolve_entry(uow.directories, uow.files, owner_id, path)
+        encontrado = entry_for(uow, owner_id, path, Permission.WRITE)
         if encontrado.is_directory:
             raise InvalidPathError("es un directorio; usa rmdir", path=str(path))
 
@@ -127,13 +136,15 @@ def mv(uow: SqlUnitOfWork, owner_id: str, raw_src: str, raw_dst: str) -> None:
     dst = Path.parse(raw_dst)
 
     with uow:
-        origen = resolve_entry(uow.directories, uow.files, owner_id, src)
+        # Mover exige WRITE en los DOS extremos: se quita algo de un sitio y se pone en
+        # otro. Con permiso solo en el destino se podria sacar de un directorio ajeno.
+        origen = entry_for(uow, owner_id, src, Permission.WRITE)
         if not origen.exists:
             raise NotFoundError("no existe el origen", path=str(src))
         if origen.file is not None:
             ensure_visible(src, origen.file)
 
-        destino = resolve_entry(uow.directories, uow.files, owner_id, dst)
+        destino = entry_for(uow, owner_id, dst, Permission.WRITE)
         if destino.is_directory:
             clase = MoveKind.DIRECTORY
         elif destino.file is not None and destino.file.holds_name():

@@ -9,6 +9,8 @@ from pathlib import Path
 import httpx
 import pytest
 
+from dfsha.common.blocktoken import BLOCK_TOKEN_HEADER
+from dfsha.common.errors import DFShaError
 from dfsha.client.api import ControlApi
 from dfsha.client.session import Session
 from dfsha.client.transfer import download_blocks, upload_blocks
@@ -40,6 +42,19 @@ def nueva_sesion(cluster: Cluster, username: str) -> Session:
 def api(cluster: Cluster, request) -> ControlApi:
     return ControlApi(nueva_sesion(cluster, f"u{abs(hash(request.node.name)) % 10**9}"))
 
+
+
+def cabeceras_de_token(bloque, **extra) -> dict[str, str]:
+    """Las cabeceras de una peticion directa al DataNode, con su autorizacion.
+
+    Hablar con el DataNode "a mano" sigue siendo legitimo —es lo que hace el cliente—,
+    pero desde el Bloque C hay que llevar el token que el plan trae. Antes no: un `GET
+    /blocks/{id}` sin credencial ninguna devolvia los bytes, que es justo el agujero que
+    el token cierra. Estas pruebas lo ejercitaban sin darse cuenta.
+    """
+    cabeceras = {BLOCK_TOKEN_HEADER: bloque.token} if getattr(bloque, "token", "") else {}
+    cabeceras.update(extra)
+    return cabeceras
 
 def generar(path: Path, size: int, semilla: int = 1234) -> str:
     """Contenido pseudoaleatorio reproducible. Devuelve su SHA-256."""
@@ -152,16 +167,21 @@ class TestIntegridad:
         respuesta = httpx.put(
             f"{destino}/api/v1/blocks/{bloque.block_id}",
             content=b"0123456789",
-            headers={"X-DFSha-Checksum": "0" * 64},
+            headers=cabeceras_de_token(bloque, **{"X-DFSha-Checksum": "0" * 64}),
             timeout=30,
         )
         assert respuesta.status_code == 422
         assert respuesta.json()["code"] == "checksum_mismatch"
 
         # Y como no se almaceno, el commit no puede confirmar el archivo.
+        #
+        # Se afirma sobre el `code`, que es el contrato estable, y no sobre el texto del
+        # mensaje. La Etapa 3 cambio esa prosa ("faltan bloques" -> "no alcanzan el
+        # quorum de escritura") porque ahora un bloque puede tener copias y aun asi no
+        # bastar; el codigo no cambio, y es lo que un cliente programaria contra el.
         with pytest.raises(Exception) as excinfo:
             api.commit_file(plan.file_id)
-        assert "blocks_not_stored" in str(excinfo.value) or "faltan bloques" in str(excinfo.value)
+        assert getattr(excinfo.value, "code", "") == "blocks_not_stored"
 
     def test_falta_la_cabecera_de_checksum(self, cluster: Cluster, api: ControlApi) -> None:
         plan = api.create_file("/sin-checksum.bin", 10)
@@ -169,6 +189,7 @@ class TestIntegridad:
         respuesta = httpx.put(
             f"{bloque.replicas[0].base_url}/api/v1/blocks/{bloque.block_id}",
             content=b"0123456789",
+            headers=cabeceras_de_token(bloque),
             timeout=30,
         )
         assert respuesta.status_code == 422
@@ -178,7 +199,7 @@ class TestIntegridad:
         plan = api.create_file("/inmutable.bin", len(datos))
         bloque = plan.blocks[0]
         url = f"{bloque.replicas[0].base_url}/api/v1/blocks/{bloque.block_id}"
-        cabeceras = {"X-DFSha-Checksum": sha256_bytes(datos)}
+        cabeceras = cabeceras_de_token(bloque, **{"X-DFSha-Checksum": sha256_bytes(datos)})
 
         assert httpx.put(url, content=datos, headers=cabeceras, timeout=30).status_code == 201
         segunda = httpx.put(url, content=datos, headers=cabeceras, timeout=30)
@@ -195,7 +216,9 @@ class TestIntegridad:
         plan = api.open_file("/con-checksum.bin")
         bloque = plan.blocks[0]
         respuesta = httpx.get(
-            f"{bloque.replicas[0].base_url}/api/v1/blocks/{bloque.block_id}", timeout=30
+            f"{bloque.replicas[0].base_url}/api/v1/blocks/{bloque.block_id}",
+            headers=cabeceras_de_token(bloque),
+            timeout=30,
         )
         assert respuesta.headers["X-DFSha-Checksum"] == bloque.checksum_sha256
         assert sha256_bytes(respuesta.content) == bloque.checksum_sha256
@@ -322,3 +345,45 @@ class TestReservaVencida:
             assert nuevo.file_id != plan.file_id
         finally:
             cluster.stop()
+
+
+class TestDetallesDelError:
+    """Los `details` del servidor tienen que llegar al cliente.
+
+    **Esto era codigo muerto y nadie lo noto.** `cli._fallar` lleva desde la Etapa 1 una
+    rama `if error.details: ...`, pero `_to_error` no los copiaba nunca, asi que esa rama
+    no se ejecuto una sola vez. Se descubrio al escribir la prueba de un conflicto de lock
+    del RF3, y el descarte no era de ese error: era **general**, para los 106 sitios que
+    lanzan errores con datos adjuntos.
+
+    El efecto no era un fallo visible sino algo peor de detectar: mensajes empobrecidos.
+    «no alcanzan el quorum» sin decir CUALES bloques, «la reserva vencio» sin decir cuando.
+    """
+
+    def test_un_error_de_dominio_conserva_sus_detalles(
+        self, cluster: Cluster, api: ControlApi
+    ) -> None:
+        """Se usa un tamano de bloque invalido porque su error adjunta el valor pedido,
+        que es justo el dato que hace accionable el mensaje."""
+        with pytest.raises(DFShaError) as fallo:
+            api.create_file("/bloque-raro.bin", 100, block_size=-1)
+
+        assert fallo.value.details, "los details del servidor se perdieron por el camino"
+
+    def test_el_quorum_fallido_dice_QUE_bloques_faltan(
+        self, cluster: Cluster, api: ControlApi
+    ) -> None:
+        """El caso que de verdad se sufre: un `put` que no confirma.
+
+        Sin los detalles, el mensaje es «no alcanzan el quorum de escritura» y no hay por
+        donde empezar. Con ellos viene la lista de bloques que no llegaron.
+        """
+        plan = api.create_file("/sin-subir.bin", 10)  # no se sube ningun bloque
+
+        with pytest.raises(DFShaError) as fallo:
+            api.commit_file(plan.file_id)
+
+        assert fallo.value.code == "blocks_not_stored"
+        detalles = fallo.value.details
+        assert detalles.get("missing"), "no se dice QUE bloques faltan"
+        assert detalles.get("quorum") == 1, "no se dice contra que quorum se comparo"

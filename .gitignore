@@ -3,6 +3,12 @@
 .env.local
 *.pem
 *.key
+*.crt
+*.csr
+# La CA y los certificados de la Etapa 3. Se generan con scripts/gen_certs.py;
+# lo que se versiona es el script y el procedimiento, nunca las claves.
+certs/
+deploy/certs/
 
 # Metadato y datos de bloques (nunca versionar)
 *.db
@@ -46,3 +52,6 @@ htmlcov/
 .vscode/
 .DS_Store
 Thumbs.db
+
+# Salida de los guiones de scripts/demo/: ficheros de prueba, nada que versionar.
+tmp/

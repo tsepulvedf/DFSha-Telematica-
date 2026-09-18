@@ -28,7 +28,13 @@ from pathlib import Path
 
 import httpx
 
-INTERNAL_SECRET_HEADER = "X-DFSha-Internal-Secret"
+from dfsha.common.blocktoken import BLOCK_TOKEN_HEADER
+from dfsha.common.tls import TlsMaterial
+
+# El secreto compartido de las Etapas 1 y 2 ya no existe: el plano interno vive en su
+# propio puerto con TLS mutuo, asi que el recolector se identifica con un certificado.
+# La diferencia importa: un secreto dice que quien llama lo conoce; un certificado dice
+# QUIEN es, y revocar al recolector no obliga a rotar el de todos los DataNodes.
 
 
 def leer_env(nombre: str) -> str | None:
@@ -93,15 +99,18 @@ def _humano(n: int) -> str:
 
 
 def recolectar(
-    control_url: str, internal_secret: str, dry_run: bool = False, timeout: float = 30.0
+    control_url: str,
+    tls: TlsMaterial,
+    dry_run: bool = False,
+    timeout: float = 30.0,
 ) -> Resumen:
-    cabeceras = {INTERNAL_SECRET_HEADER: internal_secret}
     control = control_url.rstrip("/")
     resumen = Resumen()
+    # `tls.httpx_verify()` y NO `verify=<ruta> + cert=tupla`: esa combinacion hace que
+    # httpx descarte el certificado de cliente en silencio. Ver common/tls.py.
+    plano = httpx.Client(verify=tls.httpx_verify(), timeout=timeout)
 
-    respuesta = httpx.get(
-        f"{control}/internal/v1/gc/orphan-blocks", headers=cabeceras, timeout=timeout
-    )
+    respuesta = plano.get(f"{control}/internal/v1/gc/orphan-blocks")
     respuesta.raise_for_status()
     huerfanos = respuesta.json()["blocks"]
     resumen.bloques_vistos = len(huerfanos)
@@ -125,10 +134,22 @@ def recolectar(
         tamano = bloque.get("size", 0)
         todas_fuera = True
 
+        # El token de borrado lo emitio el ControlNode al decidir que este bloque es
+        # huerfano. El GC no puede fabricarlo: presenta un certificado de CLIENTE, no de
+        # ControlNode, y la verificacion exige el rol. Es lo que impide que un script con
+        # acceso a la red borre bloques por su cuenta.
+        cabeceras = {BLOCK_TOKEN_HEADER: bloque["token"]} if bloque.get("token") else {}
+
         for replica in replicas:
             base = replica["base_url"].rstrip("/")
             try:
-                borrado = httpx.delete(f"{base}/api/v1/blocks/{block_id}", timeout=timeout)
+                # Por `plano`, que verifica contra la CA del proyecto. Con `httpx.delete`
+                # a secas se verificaba contra el almacen del sistema, y con el TLS de
+                # cliente (C2) encendido cada borrado fallaba por certificado.
+                borrado = plano.delete(
+                    f"{base}/api/v1/blocks/{block_id}",
+                    headers=cabeceras,
+                )
                 if borrado.status_code not in (204, 404):
                     todas_fuera = False
                     resumen.fallos.append(
@@ -147,53 +168,130 @@ def recolectar(
             resumen.bytes_liberados += tamano
 
     if confirmables and not dry_run:
-        confirmacion = httpx.post(
-            f"{control}/internal/v1/gc/confirm",
-            json={"block_ids": confirmables},
-            headers=cabeceras,
-            timeout=timeout,
+        confirmacion = plano.post(
+            f"{control}/internal/v1/gc/confirm", json={"block_ids": confirmables}
         )
         confirmacion.raise_for_status()
 
+    plano.close()
     return resumen
+
+
+def _por_el_canal_de_control(
+    control_url: str, tls: TlsMaterial, dry_run: bool, timeout: float = 30.0
+) -> int:
+    """Encola los borrados en el ControlNode y deja que viajen por el heartbeat.
+
+    La diferencia con el camino normal no es de eficiencia: es que por aqui **no hace
+    falta tener ruta hasta los DataNodes**, solo hasta el ControlNode. En AWS los nodos
+    anuncian su IP privada, asi que recolectar desde fuera de la VPC solo es posible por
+    esta via.
+
+    A cambio, el borrado es asincrono: se encola y se cumple cuando cada nodo recibe su
+    orden en el siguiente latido. Por eso aqui NO se llama a `/gc/confirm`: las filas del
+    metadato se quitan en una pasada posterior, cuando conste que el bloque ya no esta en
+    ningun disco. El ControlNode no borra metadato sobre una promesa.
+    """
+    control = control_url.rstrip("/")
+    plano = httpx.Client(verify=tls.httpx_verify(), timeout=timeout)
+
+    if dry_run:
+        respuesta = plano.get(f"{control}/internal/v1/gc/orphan-blocks")
+        respuesta.raise_for_status()
+        huerfanos = respuesta.json()["blocks"]
+        print(f"[simulacion] encolaria el borrado de {len(huerfanos)} bloques huerfanos")
+        for bloque in huerfanos:
+            destinos = ", ".join(r["data_node_id"][:8] for r in bloque["replicas"])
+            print(f"  [simulacion] {bloque['block_id']} -> {destinos}")
+        return 0
+
+    respuesta = plano.post(f"{control}/internal/v1/gc/dispatch")
+    respuesta.raise_for_status()
+    datos = respuesta.json()
+
+    print(
+        f"encoladas {datos['orders']} ordenes de borrado para {datos['blocks']} bloques "
+        f"huerfanos ({datos['skipped']} ya tenian una orden en curso)."
+    )
+    print(
+        "Las ordenes viajan en el proximo latido de cada DataNode. Vuelve a correr el "
+        "GC sin --via-control-plane mas tarde para confirmar y limpiar el metadato."
+    )
+    return 0
 
 
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     parser.add_argument(
         "--control-url",
-        default=leer_env("DFSHA_CONTROL_URL") or "http://localhost:8000",
-        help="URL del ControlNode (por defecto DFSHA_CONTROL_URL, o el .env de la raiz).",
+        default=(
+            leer_env("DFSHA_CONTROL_INTERNAL_URL") or "https://localhost:8443"
+        ),
+        help=(
+            "URL del PLANO INTERNO del ControlNode, que no es la de cliente: otro "
+            "puerto, HTTPS y certificado en vez de token. Por defecto "
+            "DFSHA_CONTROL_INTERNAL_URL."
+        ),
     )
     parser.add_argument(
-        "--internal-secret",
-        default=leer_env("DFSHA_INTERNAL_SECRET"),
-        help=(
-            "Secreto del plano interno. Por defecto DFSHA_INTERNAL_SECRET del entorno "
-            "y, si no esta, del .env de la raiz del repositorio."
-        ),
+        "--tls-ca-cert",
+        default=leer_env("DFSHA_TLS_CA_CERT") or "certs/ca.crt",
+        help="CA de DFSha, para validar al ControlNode.",
+    )
+    parser.add_argument(
+        "--tls-cert",
+        default=leer_env("DFSHA_TLS_CERT") or "certs/client.crt",
+        help="Certificado con el que se identifica el recolector.",
+    )
+    parser.add_argument(
+        "--tls-key",
+        default=leer_env("DFSHA_TLS_KEY") or "certs/client.key",
+        help="Clave del certificado anterior.",
     )
     parser.add_argument(
         "--dry-run",
         action="store_true",
         help="Muestra que se borraria sin tocar nada.",
     )
+    parser.add_argument(
+        "--via-control-plane",
+        action="store_true",
+        help=(
+            "Encola los borrados por el canal de control en vez de llamar a cada "
+            "DataNode por REST. Util cuando quien recolecta no tiene ruta hasta los "
+            "DataNodes, que es el caso en AWS: ahi anuncian su IP privada."
+        ),
+    )
     args = parser.parse_args(argv)
 
-    if not args.internal_secret:
-        raiz = Path(__file__).resolve().parent.parent
+    faltan = [
+        ruta
+        for ruta in (args.tls_ca_cert, args.tls_cert, args.tls_key)
+        if not Path(ruta).is_file()
+    ]
+    if faltan:
         print(
-            "falta el secreto interno. El GC lo busca, en este orden:\n"
-            "  1. la variable de entorno DFSHA_INTERNAL_SECRET\n"
-            f"  2. DFSHA_INTERNAL_SECRET en {raiz / '.env'}\n"
-            "  3. la opcion --internal-secret\n"
-            "Tiene que ser el MISMO valor con el que arrancaron los servicios.",
+            "faltan certificados. El recolector se identifica con uno de la CA de\n"
+            "DFSha; el secreto compartido de las etapas anteriores ya no existe.\n"
+            "\n"
+            f"No se encontraron: {', '.join(faltan)}\n"
+            "\n"
+            "Generalos con:\n"
+            "    python scripts/gen_certs.py\n"
+            "\n"
+            "o indica donde estan con --tls-ca-cert, --tls-cert y --tls-key (o las\n"
+            "variables DFSHA_TLS_CA_CERT, DFSHA_TLS_CERT y DFSHA_TLS_KEY).",
             file=sys.stderr,
         )
         return 2
 
+    tls = TlsMaterial.from_paths(args.tls_ca_cert, args.tls_cert, args.tls_key)
+
+    if args.via_control_plane:
+        return _por_el_canal_de_control(args.control_url, tls, args.dry_run)
+
     try:
-        resumen = recolectar(args.control_url, args.internal_secret, args.dry_run)
+        resumen = recolectar(args.control_url, tls, args.dry_run)
     except httpx.HTTPStatusError as exc:
         print(
             f"el ControlNode respondio {exc.response.status_code}: {exc.response.text[:200]}",

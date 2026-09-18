@@ -11,16 +11,38 @@ from fastapi import FastAPI
 
 from dfsha.common.logging import configure_logging, get_logger
 from dfsha.common.proto.gen import control_pb2
+from dfsha.common.tls import TlsMaterial, ca_only_context
 from dfsha.control_node.api.errors import install_error_handlers
 from dfsha.data_node.config import DataNodeSettings, load_settings_or_exit
 from dfsha.data_node.control_client import ControlClient, Identity, NodeIdentity
 from dfsha.data_node.heartbeat import BlockChangeLog, HeartbeatClient
+from dfsha.data_node.orders import OrderExecutor
 from dfsha.data_node.runtime import LoadTracker
 from dfsha.data_node.storage import BlockStorage
 
 from .api.routers import blocks_router, health_router
 
 __all__ = ["create_app"]
+
+
+class _EstadoDiferido:
+    """Referencia al `app.state` que todavia no existe cuando se construye el ejecutor.
+
+    El `data_node_id` definitivo lo devuelve el ControlNode al registrarse, dentro del
+    lifespan, asi que el ejecutor de ordenes no puede quedarse con una copia de los
+    valores: tiene que leerlos cuando los use. Esto es esa indireccion, y nada mas.
+    """
+
+    def __init__(self) -> None:
+        self._state = None
+
+    def bind(self, state) -> None:
+        self._state = state
+
+    def __getattr__(self, nombre: str):
+        if self._state is None:
+            raise RuntimeError("el estado del DataNode todavia no esta construido")
+        return getattr(self._state, nombre)
 
 
 def create_app(
@@ -41,7 +63,19 @@ def create_app(
     identity_store = NodeIdentity(settings.data_dir)
     identity = identity_store.load_or_create()
     capacity = settings.resolved_capacity_bytes()
-    control = control or ControlClient(settings.control_url, settings.internal_secret)
+    tls = (
+        TlsMaterial.from_paths(settings.tls_ca_cert, settings.tls_cert, settings.tls_key)
+        if settings.tls_ca_cert and settings.tls_cert and settings.tls_key
+        else None
+    )
+    control = control or ControlClient(settings.control_internal_url, tls=tls)
+    # Verificacion para hablar con OTROS DATANODES por su direccion de par: el reenvio
+    # del pipeline y la descarga de una re-replicacion. Con TLS de cliente (C2) esas
+    # direcciones son https:// y el certificado del vecino lo firma NUESTRA CA, que no
+    # esta en el almacen del sistema. Sin esto, cada reenvio fallaba por certificado, el
+    # nodo respondia 201 con una sola copia confirmada, y el commit daba 409 de quorum.
+    # Con http:// httpx ignora el contexto: el mismo codigo sirve con C2 y sin el.
+    peer_verify = ca_only_context(tls.ca_cert) if tls is not None else True
     load = LoadTracker()
     changes = BlockChangeLog()
 
@@ -57,9 +91,18 @@ def create_app(
             bytes_written_60s=load.bytes_written_60s(),
         )
 
+    # El ejecutor se construye antes que el heartbeat porque este lo necesita, pero
+    # recibe `app.state` y no las piezas sueltas: el `data_node_id` definitivo no se
+    # conoce hasta despues del registro, que ocurre en el lifespan.
+    app_state_holder = _EstadoDiferido()
+    orders = OrderExecutor(
+        app_state_holder, max_workers=settings.order_workers, verify=peer_verify
+    )
+
     heartbeat = HeartbeatClient(
         grpc_url=settings.control_grpc_url,
         advertise_url=settings.datanode_advertise_url,
+        peer_url=settings.datanode_peer_url,
         fault_domain=settings.datanode_fault_domain,
         boot_id=identity.boot_id,
         capacity_bytes=capacity,
@@ -68,6 +111,8 @@ def create_app(
         changes=changes,
         data_node_id=identity.data_node_id,
         retry_seconds=settings.register_retry_seconds,
+        orders=orders,
+        tls=tls,
     )
 
     @asynccontextmanager
@@ -101,9 +146,11 @@ def create_app(
             data_node_id=app.state.data_node_id,
             data_dir=str(storage.root),
             advertise_url=settings.datanode_advertise_url,
+            peer_url=settings.datanode_peer_url or settings.datanode_advertise_url,
             fault_domain=settings.datanode_fault_domain,
             boot_id=identity.boot_id,
             capacity_bytes=capacity,
+            mtls=tls is not None,
             used_bytes=estado.used_bytes,
             block_count=estado.block_count,
             disk_free_bytes=estado.disk_free_bytes,
@@ -111,6 +158,7 @@ def create_app(
         yield
 
         heartbeat.stop()
+        orders.shutdown()
         log.info("data_node.stop", data_node_id=app.state.data_node_id)
 
     app = FastAPI(
@@ -120,8 +168,16 @@ def create_app(
         lifespan=lifespan,
     )
 
+    app_state_holder.bind(app.state)
+
+    # La CA en memoria: es contra ella contra la que se valida el firmante de cada token
+    # de bloque. `None` sin TLS, y entonces no se exige token — la misma condicion que
+    # apaga la firma en el ControlNode. Se lee una vez porque no cambia.
+    app.state.block_token_ca = tls.ca_cert.read_bytes() if tls is not None else None
     app.state.settings = settings
+    app.state.orders = orders
     app.state.storage = storage
+    app.state.peer_verify = peer_verify
     app.state.control = control
     app.state.capacity_bytes = capacity
     app.state.data_node_id = identity.data_node_id or "sin-registrar"

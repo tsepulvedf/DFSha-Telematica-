@@ -63,6 +63,8 @@ class User:
     username: str
     password_hash: str
     created_at: datetime
+    #: Sal del KDF del CLIENTE. No es secreta; ver models.UserRow.
+    kdf_salt: str = ""
 
 
 @dataclass(frozen=True, slots=True)
@@ -100,6 +102,14 @@ class File:
     committed_at: datetime | None = None
     expires_at: datetime | None = None
     deleted_at: datetime | None = None
+    #: Clave del archivo envuelta con la maestra del usuario. Vacia = SIN CIFRAR, que es
+    #: como se reconocen los archivos de las Etapas 1 y 2.
+    wrapped_key: str = ""
+    key_algo: str = ""
+
+    @property
+    def is_encrypted(self) -> bool:
+        return bool(self.wrapped_key)
 
     def is_expired(self, now: datetime | None = None) -> bool:
         """Solo un archivo en WRITING puede vencer: al hacer commit, `expires_at` se
@@ -188,9 +198,24 @@ class DataNode:
     #: UUID nuevo en cada arranque con disco vacio. Distinguir "volvio el mismo nodo" de
     #: "volvio con el disco perdido" es lo que decide si sus replicas se recuperan.
     boot_id: str = ""
+    #: Direccion alcanzable por OTROS DATANODES. Vacia = la misma que la del cliente.
+    #: Se lee siempre por `peer_base_url`, nunca directamente: leer el campo crudo es
+    #: como se cuela un `None` en una cadena de pipeline.
+    peer_url: str = ""
     last_heartbeat_at: datetime | None = None
     last_sequence: int = 0
     stats: NodeStats = field(default_factory=NodeStats)
+
+    @property
+    def peer_base_url(self) -> str:
+        """Con que direccion alcanzarle desde OTRO DataNode.
+
+        Unico punto de lectura, a proposito. Todo lo que sea trafico entre nodos —la
+        cadena del pipeline y el origen de una re-replicacion— tiene que pasar por aqui;
+        si en algun sitio aparece `advertise_url` en un camino nodo-a-nodo, es el error
+        que el `fix(addressing)` vino a arreglar.
+        """
+        return self.peer_url or self.advertise_url
 
     @property
     def is_alive(self) -> bool:

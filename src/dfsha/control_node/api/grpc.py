@@ -12,6 +12,8 @@ plano REST en el suyo, compartiendo solo la base de datos.
 
 from __future__ import annotations
 
+from datetime import timedelta
+
 from concurrent import futures
 from typing import Callable, Iterator
 
@@ -21,6 +23,8 @@ from dfsha.common.errors import DFShaError, NotFoundError
 from dfsha.common.logging import get_logger
 from dfsha.common.proto.gen import control_pb2, control_pb2_grpc
 from dfsha.control_node.commands import control_plane as commands
+from dfsha.common.tls import TlsMaterial, grpc_server_credentials
+from dfsha.control_node.commands import rereplication
 from dfsha.control_node.domain.entities import NodeStats
 from dfsha.control_node.domain.membership import MembershipThresholds
 from dfsha.control_node.repositories.sql import SqlUnitOfWork
@@ -49,11 +53,20 @@ class ControlPlaneServicer(control_pb2_grpc.ControlPlaneServicer):
         thresholds: MembershipThresholds,
         heartbeat_interval_ms: int,
         full_report_every_n: int,
+        order_resend_after: timedelta = timedelta(seconds=30),
+        signer=None,
     ) -> None:
         self._uow = uow_factory
         self._thresholds = thresholds
         self._heartbeat_interval_ms = heartbeat_interval_ms
         self._full_report_every_n = full_report_every_n
+        #: Cada cuanto se le repite una orden que no ha confirmado. El nodo late cada
+        #: 3 s y copiar un bloque tarda mucho mas que eso: sin este margen se le
+        #: repetiria la misma orden veinte veces por minuto.
+        self._order_resend_after = order_resend_after
+        #: Firma los tokens de lectura que el nodo destino presenta al origen. `None` sin
+        #: TLS, que es el mismo interruptor que apaga la verificacion en el DataNode.
+        self._signer = signer
         self._log = get_logger("control_node")
 
     # --- Register ----------------------------------------------------------
@@ -63,6 +76,7 @@ class ControlPlaneServicer(control_pb2_grpc.ControlPlaneServicer):
             resultado = commands.register_node(
                 self._uow(),
                 advertise_url=request.advertise_url,
+                peer_url=request.peer_url,
                 fault_domain=request.fault_domain,
                 boot_id=request.boot_id,
                 capacity_bytes=request.capacity_bytes,
@@ -138,11 +152,78 @@ class ControlPlaneServicer(control_pb2_grpc.ControlPlaneServicer):
                     yield control_pb2.ControlMessage(
                         full_report=control_pb2.FullReportReq(reason="; ".join(razones))
                     )
+
+                # Etapa 3: las ordenes pendientes para este nodo viajan por aqui. Es la
+                # costura que la Etapa 2 dejo hecha al declarar el stream bidireccional.
+                #
+                # Se leen de la BASE, no de la memoria de este proceso: este stream lo
+                # puede estar atendiendo una instancia que no es la lider, y quien
+                # programo la copia fue el lider. Por eso la cola se persiste.
+                for mensaje in self._ordenes_para(peticion.data_node_id):
+                    yield mensaje
         except grpc.RpcError:
             # El nodo colgo. No es un error del ControlNode: la deteccion de caidas es
             # por ausencia de heartbeat, no por el cierre del stream, precisamente para
             # que una red que se corta y vuelve no cambie el estado del cluster.
             self._log.info("heartbeat.stream_closed", data_node_id=data_node_id)
+
+    def _ordenes_para(self, data_node_id: str) -> list[control_pb2.ControlMessage]:
+        """Ordenes pendientes de este nodo, ya marcadas como enviadas.
+
+        Nunca lanza: un fallo leyendo la cola no puede cortar el heartbeat. Perder una
+        ronda de ordenes cuesta 3 s de retraso; perder el stream cuesta que el nodo
+        parezca muerto y se dispare una re-replicacion de todo su disco.
+        """
+        try:
+            uow = self._uow()
+            with uow:
+                ordenes = rereplication.pending_orders(
+                    uow, data_node_id, self._order_resend_after, signer=self._signer
+                )
+                if ordenes:
+                    uow.commit()
+        except Exception as exc:
+            self._log.warning(
+                "rereplication.orders_unavailable",
+                data_node_id=data_node_id,
+                error=type(exc).__name__,
+                error_detail=str(exc),
+            )
+            return []
+
+        mensajes: list[control_pb2.ControlMessage] = []
+        for copia in ordenes.replicate:
+            self._log.info(
+                "rereplication.order_sent",
+                task_id=copia.task_id,
+                block_id=copia.block_id,
+                target=data_node_id,
+                source=copia.source_node_id,
+            )
+            mensajes.append(
+                control_pb2.ControlMessage(
+                    replicate_block=control_pb2.ReplicateBlock(
+                        task_id=copia.task_id,
+                        block_id=copia.block_id,
+                        source_base_url=copia.source_base_url,
+                        source_node_id=copia.source_node_id,
+                        size=copia.size,
+                        checksum_sha256=copia.checksum_sha256,
+                        block_token=copia.block_token,
+                    )
+                )
+            )
+        for borrado in ordenes.delete:
+            mensajes.append(
+                control_pb2.ControlMessage(
+                    delete_block=control_pb2.DeleteBlock(
+                        task_id=borrado.task_id,
+                        block_id=borrado.block_id,
+                        reason=borrado.reason,
+                    )
+                )
+            )
+        return mensajes
 
     # --- BlockReport -------------------------------------------------------
 
@@ -169,15 +250,28 @@ def build_grpc_server(
     servicer: ControlPlaneServicer,
     port: int,
     max_workers: int = 16,
+    tls: TlsMaterial | None = None,
 ) -> grpc.Server:
-    """Servidor gRPC escuchando en `port`.
+    """Servidor gRPC escuchando en `port`, con TLS mutuo.
 
     `max_workers` tiene que ser holgadamente mayor que el numero de DataNodes: cada
     stream de heartbeat ocupa un hilo mientras esta abierto. Con el pool justo, el nodo
     N+1 se queda esperando un hilo libre y el ControlNode lo declararia muerto sin que
     le pase nada.
+
+    **`tls=None` abre un puerto sin cifrar.** Solo lo usan las pruebas que ejercitan la
+    maquinaria del plano de control sin montar una CA. En el arranque real el material
+    TLS es obligatorio (no tiene default en la configuracion), asi que un despliegue no
+    puede acabar aqui por un descuido.
     """
     servidor = grpc.server(futures.ThreadPoolExecutor(max_workers=max_workers))
     control_pb2_grpc.add_ControlPlaneServicer_to_server(servicer, servidor)
-    servidor.add_insecure_port(f"[::]:{port}")
+
+    if tls is None:
+        servidor.add_insecure_port(f"[::]:{port}")
+    else:
+        # require_client_auth=True es lo que sustituye al secreto compartido: quien no
+        # presente un certificado firmado por nuestra CA no llega a mandar ni un latido.
+        servidor.add_secure_port(f"[::]:{port}", grpc_server_credentials(tls))
+
     return servidor

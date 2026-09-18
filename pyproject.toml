@@ -21,6 +21,12 @@ dependencies = [
     "pyjwt>=2.8",
     "structlog>=24.1",
     "grpcio>=1.60",
+    # Etapa 3: el metadato pasa a PostgreSQL y el esquema se versiona.
+    "alembic>=1.13",
+    "psycopg[binary]>=3.1",
+    # Etapa 3, Bloque C: AES-256-GCM para el cifrado extremo a extremo y la
+    # generacion de la CA. No hay AES en la biblioteca estandar.
+    "cryptography>=42",
 ]
 
 [project.optional-dependencies]
