@@ -1,16 +1,19 @@
 # Despliegue de DFSha en AWS — Etapa 3
 
-> **Sin ejecutar.** Estos pasos están escritos y revisados, pero nadie los ha corrido
-> todavía en una cuenta de AWS. Lo que sí está verificado de punta a punta es el
-> despliegue local con `docker compose`, incluido el TLS de cliente, y las 640 pruebas
-> automatizadas (más 4 que solo corren contra PostgreSQL). Esta nota se borra cuando alguien
-> complete el despliegue y confirme el resultado.
+> **Ejecutado y validado el 9 de octubre de 2026**, de punta a punta: las seis instancias,
+> las ocho migraciones, los cuatro DataNodes con mTLS y HTTPS, un `put` de 50 MB
+> `FULLY_REPLICATED (3 de 3)` con 150 réplicas repartidas 36/38/39/37, la caída de un
+> DataNode con recuperación automática en ~80 s, y el relevo del líder con la época
+> subiendo de 1 a 2 sin interrumpir el servicio. Los numeros medidos estan en los pasos 8
+> y 9; el resumen, en `CLAUDE.md`, «Estado de la validacion en Docker».
 >
-> Al revisarlos antes de ejecutarlos aparecieron **cuatro fallos** que habrían parado el
-> despliegue: una URL que salía vacía por la interpolación de compose, `R=1` en el ejemplo
-> del ControlNode, un Ubuntu cuyo Python no instala el cliente, y el paso de `git clone`
-> sin rama. Están explicados en su sitio. La lección es la de toda la etapa: **lo que no
-> se ha ejecutado nunca está sin probar**, por muy revisado que esté.
+> **Cinco fallos aparecieron en el camino, y la diferencia entre ellos es la leccion.**
+> Cuatro se vieron **repasando** este material antes de ejecutarlo: una URL que salía
+> vacía por la interpolación de compose, `R=1` en el ejemplo del ControlNode, un Ubuntu
+> cuyo Python no instala el cliente, y el `git clone` sin rama. El quinto **solo podía
+> aparecer ejecutando**: el grupo de seguridad no permitía el escenario que este mismo
+> documento recomienda (ver el paso 1). **Lo que no se ha ejecutado nunca está sin
+> probar**, por muy revisado que esté.
 
 **Seis** instancias `t3.micro`, repartidas en dos zonas de disponibilidad para que la
 restricción de dominios de falla sea física y no una etiqueta:
@@ -118,17 +121,29 @@ entre sí sin abrir nada hacia fuera.
 | Puerto | Origen | Quién lo usa |
 |---|---|---|
 | 22 | **tu IP**, `x.x.x.x/32` | SSH. Nunca `0.0.0.0/0` |
-| 8000 | el propio grupo | El cliente (en `dfsha-control`) hacia nginx; nginx hacia el ControlNode A |
+| 8000 | el propio grupo | **La regla que hace funcionar el escenario soportado**: el cliente (en `dfsha-control`) hacia nginx, y nginx hacia el ControlNode A |
+| 8000 | **tu IP**, `x.x.x.x/32` | Solo **diagnostico** desde fuera: `curl` al `/health` y comprobar el certificado. Con esto solo, el cliente NO funciona |
 | 8443 | el propio grupo | Plano interno con mTLS: confirmación de bloques y GC. DataNodes → nginx → ControlNodes |
 | 9000 | el propio grupo | gRPC del plano de control, con mTLS. Igual que el 8443 |
 | 8001 | el propio grupo | Cliente → DataNodes (los bytes), y **DataNode → DataNode**: pipeline y re-replicación |
 | 5432 | el propio grupo | PostgreSQL. **Nunca hacia fuera**: aquí no hay TLS |
 
-**Ningún puerto de la aplicación se abre a tu IP**, y es deliberado: el cliente corre
-**dentro** del clúster, en `dfsha-control` (ver el paso 7). Abrir el 8000 a tu IP no
-bastaría: los bytes van directos a los DataNodes por su IP privada, así que harían falta
-cinco túneles y que los nodos anunciaran `localhost`, lo que rompe la comunicación entre
-ellos. Es la tensión de una sola dirección anunciada que documenta `CLAUDE.md`.
+**El 8000 lleva DOS reglas, y cada una es para una cosa distinta.** La del **propio
+grupo** es la que hace funcionar el escenario soportado: el cliente corre **dentro** del
+clúster, en `dfsha-control` (paso 7), y desde ahí llega a nginx por la IP privada. La de
+**tu IP** es solo para **diagnosticar desde fuera** —un `curl` al `/health`, mirar el
+certificado— y con ella sola el cliente no funciona: los bytes van directos a los DataNodes
+por su IP privada, así que harían falta cinco túneles y que los nodos anunciaran
+`localhost`, lo que rompe la comunicación entre ellos. Es la tensión de una sola dirección
+anunciada que documenta `CLAUDE.md`.
+
+**Esto es el quinto fallo del despliegue, y solo se vio ejecutándolo.** Hasta la validación
+del 9 de octubre, esta tabla abría el 8000 **solo a tu IP** mientras el paso 7 explicaba en
+una sección entera que el cliente va dentro de la VPC. Dos partes del mismo documento, una
+describiendo el escenario y la otra impidiéndolo. El síntoma fue un `ConnectTimeout` del
+cliente contra `IP_PRIVADA_DB:8000`, sin llegar al handshake TLS. Y el agravante: el **8001
+sí** tenía las dos reglas desde el principio. Se penso en el doble origen para el puerto de
+los datos y no para el del control.
 
 **El 8001 entre miembros no es opcional.** Si falta, las subidas fallan con «no alcanzan el
 quórum de escritura», un síntoma que apunta a capacidad y no a red.
@@ -153,8 +168,12 @@ SG=$(aws ec2 create-security-group --group-name dfsha-cluster \
 MI_IP=$(curl -s https://checkip.amazonaws.com)/32
 
 aws ec2 authorize-security-group-ingress --group-id "$SG" --protocol tcp --port 22 --cidr "$MI_IP"
+# Diagnostico desde fuera. NO sustituye a la regla del grupo de abajo: con esta sola, el
+# cliente de dfsha-control no alcanza nginx.
+aws ec2 authorize-security-group-ingress --group-id "$SG" --protocol tcp --port 8000 --cidr "$MI_IP"
 
-# Todo lo demas, solo entre miembros del grupo.
+# Todo lo demas, entre miembros del grupo. El 8000 va aqui TAMBIEN, y es lo que hace
+# funcionar el escenario del paso 7.
 for PUERTO in 8000 8001 8443 9000 5432; do
   aws ec2 authorize-security-group-ingress --group-id "$SG" --protocol tcp \
     --port "$PUERTO" --source-group "$SG"
@@ -469,6 +488,24 @@ volver a arrancar el nodo se reincorpora con el mismo `boot_id`; algunos bloques
 quedar con 4 copias, que es esperable (`CLAUDE.md`, «Sobre-replicación tras una
 reincorporación»).
 
+**Medido en la validación del 9 de octubre**, con un archivo de 50 MB en bloques de 1 MB:
+
+| Hora | Qué se vio |
+|---|---|
+| 02:59:21 | `ALIVE`: estado de partida |
+| 03:00:03 | `SUSPECT`, 13 s después de parar el nodo |
+| 03:00:24 | `DEAD` a los 32 s, **43 bloques sub-replicados** |
+| 03:00:58 | 37 sub-replicados: la re-replicación ya está copiando |
+| 03:01:07 | 25 |
+| 03:01:41 | todas las copias completas |
+
+**~80 segundos de recuperación automática, sin intervención.** Y un detalle que vale para
+la sustentación: con el nodo `DEAD`, `dfsha cluster` mostró **`bloq. 82 / repl. 0`** para
+ese nodo. Los 82 bloques siguen en su disco; las 0 réplicas son las que el ControlNode
+considera disponibles. Esas dos columnas separan **lo que hay en el disco** de **lo que se
+puede servir**, que es justo la distinción que la decisión 8 de la Etapa 2 protege: el
+ControlNode no borra datos por una divergencia.
+
 ---
 
 ## 9. Demostrar el relevo del líder, a mano por SSH
@@ -587,6 +624,24 @@ nginx descarta el destino que no responde, y si no, en `dfsha-db`:
 `docker compose -f deploy/docker-compose.db.yml restart lb`. El A no tiene este problema:
 nginx lo alcanza por IP privada. Detalle en `CLAUDE.md`, «nginx resuelve los upstreams al
 arrancar».
+
+**Medido en la validación del 9 de octubre**, y con el control positivo completo: A
+respondió `is_self: false`, B `is_self: true`, y se mató **a B**, el que mandaba.
+
+| Qué | Resultado |
+|---|---|
+| Relevo | `leader_id` 8867fae8 (época **1**) -> 0a4bf411 (época **2**), en ~10 s |
+| El servicio no se interrumpió | `ls` y un `get` de 50 MB con SHA-256 correcto, justo después del `kill` |
+| Los DataNodes | los cuatro siguieron `ALIVE`; ninguno llegó a `DEAD` |
+| Escrituras con un solo ControlNode vivo | `put` de 50 MB -> `FULLY_REPLICATED (3 de 3)` |
+| El log del superviviente | `{"leader_id":"0a4bf411","epoch":2,"previous_leader":"8867fae8","self_recovery":false,"duration_ms":10.198,"event":"leadership.acquired"}` |
+| Al devolver B | vuelve `healthy` y **no** recupera el mando: el lease es de A y sigue vivo |
+
+El `previous_leader` con el id del muerto es la prueba de que el lease **caducó** en vez de
+soltarse: por eso `kill` y no `stop`. Y el `put` que confirma con un solo ControlNode es la
+otra mitad de la demostración —el aviso síncrono `/stored` por el 8443 siguió llegando a
+través de nginx—, que es lo que un segundo ControlNode sin balanceador no habría podido
+enseñar.
 
 **Lo que esto NO demuestra**, igual que el guion local: el líder **congelado** que despierta
 creyendo que manda. Un contenedor matado no despierta. Lo cubren
