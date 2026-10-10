@@ -814,7 +814,7 @@ aparece un `verify=<ruta>` junto a un `cert=` en algun sitio nuevo, es este fall
 
 #### El patron, que es lo que va al informe
 
-Los **diecisiete** fallos serios de la Etapa 3 de esta tabla han sido el mismo tipo de cosa:
+Los **dieciocho** fallos serios de la Etapa 3 de esta tabla han sido el mismo tipo de cosa:
 **algo que aparenta estar puesto y no lo esta**, y ninguno se detecto leyendo el codigo.
 La tabla crecio a lo largo de la etapa; las tres primeras filas son las del codigo del
 Bloque B y C, que es donde se reconocio el patron.
@@ -838,6 +838,7 @@ Bloque B y C, que es donde se reconocio el patron.
 | `DFSHA_REPLICATION_FACTOR` en AWS | El ejemplo desplegaba la Etapa 3 | Traia `R=1`: la Etapa 3 **sin replicacion**, funcionando en apariencia bien | Repasando `deploy/` antes de ejecutarlo |
 | Python del despliegue en AWS | Ubuntu 22.04 servia para todo | Trae 3.10 y el cliente exige 3.11: su `pip install` **fallaba** | Repasando `deploy/`, contra `requires-python` |
 | Permisos de las claves en AWS | `chmod 600` dejaba las claves legibles por el servicio | Legibles **por coincidencia** entre el uid de `ubuntu` y el del contenedor | Repasando `deploy/`, contra el `USER` de los Dockerfiles |
+| El grupo de seguridad de AWS (8000) | El despliegue permitia el escenario que su README recomienda | Abria el 8000 **solo a tu IP**, y el cliente va DENTRO de la VPC: `ConnectTimeout` sin llegar al handshake. El 8001 si tenia las dos reglas | **Ejecutando el despliegue**: ningun repaso lo vio |
 
 **El cuarto (`details`) es distinto de los tres primeros, y esa diferencia es lo que va
 al informe.** Los tres primeros se manifestaban como un **fallo**: un 409, una conexion cerrada, una descarga
@@ -872,16 +873,16 @@ codigo hasta las pruebas y la documentacion**.
 |---|---|---|
 | **Codigo** | el direccionamiento, `cert=` de httpx, `blocks.size`, y los pares del DataNode sin la CA con C2 | 4 |
 | **Cliente** | los `details` descartados desde la Etapa 1 | 1 |
-| **Documentacion** | el arranque rapido con un secreto muerto y sin los certificados | 1 |
+| **Documentacion** | el arranque rapido con un secreto muerto y sin los certificados, y el grupo de seguridad que impedia el escenario que el propio README recomienda | 2 |
 | **Arranque** | el `__main__.py` que no compilaba, el `.env` vacio que tumbaba el DataNode en AWS, los guiones de demostracion que no arrancaban en Windows, `verificar_pruebas.py`, que solo arrancaba en la maquina donde se escribio, C2, que no se podia encender, y los cuatro del despliegue en AWS: la URL interna vacia, `R=1`, el Python de Ubuntu 22.04 y los permisos por coincidencia | 9 |
 | **Migracion** | la 0006, que dejo sin sal a los usuarios existentes y con ellos el cifrado desactivado en silencio | 1 |
 | **Repositorio** | la rama por defecto de GitHub, que apuntaba a `etapa-1` desde el hito 1 | 1 |
 | **Pruebas** | tres que pasaban por un camino distinto del que su nombre anunciaba, y la del append «con cifrado» que no comprobaba el cifrado | 4 |
 
-**Veintiun casos en siete capas.** Conviene contarlos bien, porque la cifra se cita: las
-**diecisiete** filas de la tabla de fallos de arriba cubren las seis primeras capas, y la
+**Veintidos casos en siete capas.** Conviene contarlos bien, porque la cifra se cita: las
+**dieciocho** filas de la tabla de fallos de arriba cubren las seis primeras capas, y la
 septima —las **cuatro** pruebas que no probaban— no esta en esa tabla: tres en la seccion
-«Verificacion por mutacion» y la cuarta en «El agujero de la 0006». Decir «diecisiete casos en
+«Verificacion por mutacion» y la cuarta en «El agujero de la 0006». Decir «dieciocho casos en
 siete capas» mezclaria las dos cuentas.
 
 Que se cuenta y que no, para poder defender la cifra: el agujero del cifrado es **un** caso,
@@ -903,6 +904,38 @@ distintas y capas distintas. Los pares del DataNode sin la CA son un fallo de
 funcionalidad **no se podia encender**, que es un fallo de arranque. Arreglar uno no
 arreglaba el otro. En cambio las seis filas de su tabla de detalle no son seis casos:
 el GC y el guion de failover son la misma causa que sus vecinos.
+
+#### El grupo de seguridad: dos partes del MISMO documento se contradicen
+
+**Variante nueva del patron, y la unica que aparecio ejecutando el despliegue y no
+repasandolo.** Las otras son «algo dejo de ser verdad y lo que lo afirmaba no se entero».
+Aqui nada dejo de ser verdad: **el documento se contradecia consigo mismo desde el primer
+dia**.
+
+- La **seccion 1** abria el 8000 —el REST del cliente— **solo a tu IP**.
+- La **seccion 7** dedica una seccion entera a explicar que la opcion soportada, y la
+  unica, es el cliente corriendo **dentro de la VPC**, en `dfsha-control`.
+
+Las dos frases son defendibles por separado y juntas no funcionan: con esas reglas, el
+cliente que la seccion 7 recomienda **no puede alcanzar nginx**. El sintoma fue un
+`ConnectTimeout` contra `IP_PRIVADA_DB:8000`, sin llegar al handshake TLS; es decir, un
+fallo de **red** y no de TLS ni de configuracion, que al menos apunta al sitio correcto.
+
+**El agravante dice donde estaba la atencion**: el 8001 **si** tenia las dos reglas, la de
+la IP de fuera y la del propio grupo. Se penso en el doble origen para el puerto de los
+**datos** y no para el del **control**, aunque el puerto de control es el que usa el
+escenario descrito.
+
+Lo que esto anade al patron: **no basta con que cada afirmacion de un documento sea
+correcta; tienen que ser compatibles entre si, y nada lo comprueba**. Un README no tiene
+pruebas, y dos secciones escritas en momentos distintos envejecen por separado. Las otras
+capas al menos tenian un camino de ejecucion que podia delatarlas; aqui el unico camino era
+montar el despliegue y usar el cliente que el propio documento recomienda.
+
+El arreglo son **dos reglas con su motivo escrito al lado**: la del propio grupo es la que
+hace funcionar el escenario soportado, y la de tu IP sirve solo para diagnosticar desde
+fuera. Decir para que es cada una es lo que impide que alguien vuelva a quitar la que
+parece redundante.
 
 #### La rama por defecto: el patron en su forma mas externa
 
@@ -950,7 +983,7 @@ por defecto a `main` en GitHub —un ajuste que no se puede fijar desde el repos
 **atar la documentacion al destino** con `git clone --branch main`, que sigue siendo
 correcto aunque el ajuste de GitHub vuelva a cambiar.
 
-Veintiun casos en siete capas distintas no es un descuido puntual: es un **modo de fallo del
+Veintidos casos en siete capas distintas no es un descuido puntual: es un **modo de fallo del
 proyecto**. Y tiene una causa comun que conviene nombrar: en todos, **algo dejo de ser
 verdad y lo que lo afirmaba no se entero**, porque nada los ataba. El codigo no comprueba
 que el README sea cierto, una prueba no comprueba que su nombre describa lo que hace, y un
@@ -2028,10 +2061,34 @@ implementado y probado, y no se podia encender» (18/09):
 - **Apagado** con `docker compose up -d`: vuelve a `http://` sin tocar el `.env` ni los
   volumenes.
 
-**Queda validado en Docker todo lo de la Etapa 3.** Lo unico sin ejecutar nunca es el
-despliegue en AWS (`deploy/README.md`). **No se empieza todavia**: el equipo decide cuando se montan
-las seis instancias. Cuando se haga, clonar con `--branch main` (ver «La rama por
-defecto»).
+**Queda validado en Docker todo lo de la Etapa 3.**
+
+### Despliegue en AWS: validado el 9 de octubre de 2026
+
+**Ya no queda nada sin ejecutar.** Seis `t3.micro` con Ubuntu 24.04 en `us-east-1b` y
+`us-east-1d`, las ocho migraciones de Alembic sobre PostgreSQL, los tres servicios de
+`dfsha-db` `healthy` —incluido `lb`, cuya sonda llega a un ControlNode por HTTPS
+verificando la CA— y los cuatro DataNodes registrados al primer intento, con `mtls: true`
+y HTTPS en el 8001.
+
+| Que | Medido |
+|---|---|
+| Cluster | 4/4 `ALIVE` en **dos dominios de falla reales**, direcciones `https://` con IP privadas |
+| `put` de 50 MB en bloques de 1 MB | `FULLY_REPLICATED (3 de 3)`; **150 replicas repartidas 36/38/39/37** |
+| Ida y vuelta | SHA-256 identico (`6d081597...`), con cifrado extremo a extremo |
+| El balanceador reparte | «lider: otra instancia (8867fae8) ... te atendio 0a4bf411» |
+| Caida de un DataNode | `ALIVE` -> `SUSPECT` en 13 s -> `DEAD` en 32 s con 43 bloques sub-replicados -> **todas las copias repuestas a los ~80 s**, sin intervencion |
+| Reincorporacion | `FULLY_REPLICATED (3-4 de 3)`: la sobre-replicacion documentada |
+| Relevo del lider | Se identifico al lider por `is_self` y se mato a **el**: epoca **1 -> 2** en ~10 s, `previous_leader` con el id del muerto |
+| Durante el relevo | `ls` y `get` de 50 MB correctos justo despues del `kill`; los cuatro DataNodes siguieron `ALIVE`; un `put` de 50 MB con **un solo ControlNode vivo** quedo `FULLY_REPLICATED` |
+
+**Dos observaciones que valen para la sustentacion.** La primera: con el nodo `DEAD`,
+`dfsha cluster` mostro `bloq. 82 / repl. 0` para ese nodo —los bloques siguen en su disco,
+las replicas disponibles son cero—, que es la distincion entre **lo que hay** y **lo que se
+puede servir** que protege la decision 8 de la Etapa 2. La segunda: el `put` que confirma
+con un solo ControlNode vivo es lo que **un segundo ControlNode sin balanceador no habria
+podido enseñar**, porque el aviso sincrono `/stored` siguio llegando por nginx. Era
+exactamente el argumento de la decision 1 de «Despliegue en AWS».
 
 ### Decision del hito-3: C2 viene APAGADO por defecto
 
@@ -2101,6 +2158,16 @@ las instancias, y por motivos distintos:
   equivocada. **Eso es peor que fallar**: un fallo se investiga; un sistema que funciona se
   da por bueno, y se habria descubierto, si acaso, al matar un DataNode delante de quien
   evalua.
+
+**Y un quinto aparecio solo al EJECUTARLO**, que es el que cierra el argumento: el grupo
+de seguridad **impedia el escenario que este mismo material recomienda** —el 8000 abierto
+solo a una IP de fuera, con el cliente corriendo dentro de la VPC—. Ningun repaso lo vio
+porque las dos mitades estan en secciones distintas y cada una es correcta por separado.
+Esta contado en «El grupo de seguridad: dos partes del MISMO documento se contradicen».
+
+**La proporcion es el dato**: cuatro de cinco se encontraron leyendo con la lupa del
+patron, y el quinto necesito seis maquinas encendidas. Repasar sirve, y no sustituye a
+ejecutar.
 
 `scripts/demo/failover_del_lider.py` no sirve en AWS (usa `docker exec` local): la
 secuencia manual por SSH esta en `deploy/README.md`, paso 9, con `docker kill` y no `stop`,

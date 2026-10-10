@@ -1041,11 +1041,13 @@ de los dos, para que el relevo del líder se pueda enseñar sobre máquinas real
 servicio se interrumpa. Con el TLS de cliente encendido. Los pasos exactos, las reglas de red y
 qué cambia en cada instancia están en **[`deploy/README.md`](deploy/README.md)**.
 
-> **Sin ejecutar todavía.** El material está escrito y revisado, pero nadie lo ha corrido
-> en una cuenta de AWS. El despliegue local con `docker compose` sí está verificado:
-> arranque de los diez servicios, clúster 4/4, liderazgo, los cuatro guiones de
-> demostración, el RF3 y el TLS de cliente encendido con el override. El detalle de cada
-> pasada está en CLAUDE.md, «Estado de la validacion en Docker».
+> **Ejecutado y validado el 9 de octubre de 2026.** Las seis instancias, las ocho
+> migraciones, los cuatro DataNodes con mTLS, un `put` de 50 MB `FULLY_REPLICATED (3 de 3)`
+> con 150 réplicas repartidas entre los cuatro nodos, la caída de un DataNode con
+> recuperación automática en ~80 s, y el relevo del líder con la época subiendo de 1 a 2 sin
+> interrumpir el servicio. El despliegue local con `docker compose` también está verificado,
+> TLS de cliente incluido. El detalle de cada pasada está en CLAUDE.md, «Estado de la
+> validacion en Docker».
 
 ## Alcance de esta etapa
 
