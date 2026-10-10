@@ -1583,6 +1583,17 @@ Cambiar un fallo raro y auto-recuperable por perder el balanceo en el camino pri
 mal negocio. Queda documentado en `scripts/demo/README.md` con la salida —`docker compose
 restart lb`— y con el aviso de que **el balanceador no es el primer sospechoso**.
 
+**Visto en ejecucion el 10/10/2026, y conviene saber el disparador exacto**: un
+`docker compose up -d --build` que **recrea los tres ControlNodes pero no el `lb`** —porque
+la configuracion del balanceador no cambio— les da IP nuevas y deja a nginx con las
+viejas. El sintoma no fue en el `:8000` sino en el gRPC: los cuatro DataNodes en bucle de
+reinicio con `datanode.register_retry` y `code: UNAVAILABLE` contra `lb:9000`, y ninguno
+registrado. `docker compose restart lb` lo arreglo y los diez servicios quedaron
+`healthy`. Asi que el caso «raro» tiene un disparador de lo mas comun —reconstruir las
+imagenes— y el remedio sigue siendo una orden. Lo que **no** se sostiene es llamarlo
+auto-recuperable aqui: con la IP vieja no respondiendo nadie, nginx la descarta, pero si
+las tres estan obsoletas no queda ninguna a la que pasar.
+
 #### Los certificados en compose
 
 `./certs` se monta **solo lectura** en los ControlNodes, los DataNodes y el cliente. Cada
@@ -2398,7 +2409,11 @@ Reglas de dominio, a hacer cumplir en `domain/`:
 
 ```
 POST /auth/register   {username, password}          -> 201
-POST /auth/login      {username, password}          -> {access_token, expires_in}
+POST /auth/login      {username, password}
+     -> {access_token, expires_in, token_type, kdf_salt}
+     `kdf_salt` viaja AQUI, y no es un descuido: el cliente la necesita para
+     derivar su clave maestra en una sesion nueva, y una sal no es secreta. Su
+     trabajo es que dos usuarios con la misma contrasena no compartan clave
 ```
 
 Todo lo demás exige `Authorization: Bearer <token>`.
@@ -2407,7 +2422,12 @@ Namespace (RF1):
 
 ```
 GET    /fs/ls?path=/a/b        -> {entries:[{name, type, size, created_at}]}
-GET    /fs/stat?path=/a/b/c    -> {path, type, size, block_size, block_count, created_at}
+GET    /fs/stat?path=/a/b/c
+       -> {path, type, size, block_size, block_count, created_at,
+           replication_state, min_replicas, max_replicas, replication_factor}
+       los cuatro ultimos son de la Etapa 3 y NULL en un directorio.
+       `replication_state` se DERIVA del bloque peor replicado en el momento de
+       la consulta: FULLY_REPLICATED | UNDER_REPLICATED | UNAVAILABLE
 POST   /fs/mkdir               {path, parents: bool}
 DELETE /fs/rmdir?path=&recursive=
 DELETE /fs/rm?path=
@@ -2455,19 +2475,28 @@ POST /fs/lock     {path, mode, holder}   -> {file_id, path, holder, epoch, mode,
                                              expires_at, lease_seconds}
      pedirlo dos veces con el mismo holder es RENOVAR, no un lock nuevo
 POST /fs/unlock   {path, mode, holder}   -> 204   (el mismo LockRequest)
-GET  /fs/locks?path=/a/b                 -> {path, holders:[...]}
-     los VENCIDOS no se barren: el vencimiento se evalua al consultar
+GET  /fs/locks?path=/a/b
+     -> {path, holders:[{holder, mode, epoch, expires_at}]}
+     se lee SIN cerrojo y los VENCIDOS se filtran al responder: el vencimiento
+     se evalua al consultar, nunca con un barrido
 
-GET  /files/read?path=&offset=&length=
-     -> {file_id, offset, length, size, blocks:[...]}
-     solo los bloques que intersectan el tramo, con cuanto recortar de cada uno.
-     El bloque se baja ENTERO: con cifrado no se puede descifrar por partes
+GET  /files/read?path=&offset=0&length=   (length ausente = hasta el final)
+     -> {file_id, offset, length, size,
+         blocks:[{block_id, index, size, checksum_sha256, replicas, token,
+                  skip, take}]}
+     solo los bloques que intersectan el tramo; `skip` y `take` dicen cuanto
+     recortar de cada uno YA DESCIFRADO. El bloque se baja ENTERO: con cifrado
+     no se puede descifrar ni verificar un tramo suelto
 
 POST /files/{file_id}/append         {size, cipher_overhead?, lock_holder, lock_epoch}
-     -> {file_id, block_size, expires_at, tail, tail_plain_size, blocks:[...]}
-     `tail` es el bloque de cola a REESCRIBIR, si estaba a medias
+     -> 201 {file_id, block_size, expires_at, tail, tail_plain_size,
+             blocks:[{block_id, index, size, replicas, pipeline, token}]}
+     `tail` es el bloque de cola a REESCRIBIR si estaba a medias (un
+     BlockReadPlan, con su token de lectura), y `tail_plain_size` lo que ya
+     ocupaba en claro
 POST /files/{file_id}/append/commit  {block_ids, new_size, replaces,
-                                      lock_holder, lock_epoch} -> 200
+                                      lock_holder, lock_epoch}
+     -> 200 {path, size, block_count}
      el lock se exige DOS veces, aqui y al planificar: entre las dos el cliente
      sube bytes y su lease pudo vencer
 ```
@@ -2479,13 +2508,25 @@ ACLs y grupos (Bloque C). `/compartido-conmigo` es un directorio **virtual**: no
 POST /acl/share     {path, principal, permission}   -> 204
 POST /acl/unshare   {path, principal}               -> 204
 GET  /acl/show?path=/a/b
-     -> {path, effective, source, inherited_from, grants:[...]}
-GET  /acl/shared-with-me                            -> {entries:[...]}
+     -> {path, effective, source, inherited_from,
+         grants:[{principal, principal_type, permission, granted_by, granted_at}]}
+     `effective` es READ|WRITE|ADMIN o null, e `inherited_from` la ruta del
+     ancestro de donde sale: la herencia va HACIA ARRIBA
+GET  /acl/shared-with-me
+     -> {entries:[{owner, name, permission, via_group, path}]}
+     `via_group` dice por que grupo llega la concesion, o null si es directa
 POST /acl/groups                {name}              -> 201
-GET  /acl/groups                                    -> {groups:[...]}
+GET  /acl/groups                                    -> {groups:[{name, members}]}
 POST /acl/groups/members        {name, username}    -> 204
 POST /acl/groups/members/remove {name, username}    -> 204
 ```
+
+**Codigos que importan en este bloque y en el RF3** (el mapeo completo esta en
+`api/errors.py`): **409** para un lock ajeno (`file_locked`, con `holder`, `mode` y
+`retry_after_seconds` en los `details`) y para una epoca vencida (`stale_lock`); **404**
+tambien cuando el archivo existe pero no es tuyo, porque decir «existe y no es tuyo»
+convertiria el arbol de otro usuario en algo enumerable; **410** si la reserva de
+escritura vencio; **503** si no hay DataNode disponible para colocar.
 
 Y el liderazgo, que es lo que hace util `dfsha cluster` durante una demostracion:
 
