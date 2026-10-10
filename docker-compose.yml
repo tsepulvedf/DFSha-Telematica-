@@ -16,7 +16,11 @@
 #   DFSHA_DATANODE_ADVERTISE_URL -> localhost:800N   (lo consume el CLIENTE, desde fuera)
 #   DFSHA_DATANODE_PEER_URL      -> data-node-N:8001 (lo consumen OTROS DATANODES, dentro)
 #   DFSHA_CONTROL_GRPC_URL       -> lb:9000          (ControlNode<->DataNode, por dentro)
-#   DFSHA_CONTROL_URL            -> lb:8000          (idem, confirmacion de bloque)
+#   DFSHA_CONTROL_INTERNAL_URL   -> https://lb:8443  (idem: confirmacion de bloque, mTLS)
+#
+# El DataNode NO lee DFSHA_CONTROL_URL: su plano interno tiene puerto, esquema y forma de
+# autenticarse propios (ver el comentario del campo en data_node/config.py). La que si la
+# lee es la CLI, y por eso sigue puesta en el servicio `client`.
 #
 # Los DataNodes laten contra el BALANCEADOR, no contra una instancia fija. Asi, matar al
 # ControlNode lider no deja a ningun DataNode sin camino: reconecta y su latido acaba en
@@ -113,7 +117,6 @@ x-datanode-base: &datanode-base
 
 x-datanode-env: &datanode-env
   DFSHA_DATA_DIR: "/var/lib/dfsha"
-  DFSHA_CONTROL_URL: "http://lb:8000"
   DFSHA_CONTROL_GRPC_URL: "lb:9000"
   # El plano interno va por el balanceador, igual que el gRPC: asi matar a una instancia
   # no deja a ningun DataNode sin camino. nginx lo pasa en nivel 4 y el handshake es de
