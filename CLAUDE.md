@@ -27,8 +27,11 @@ No se cuestionan, se implementan.
 4. **Routing híbrido.** El ControlNode es routing tier solo para metadatos. Los bytes
    viajan **directo** entre cliente y DataNode; nunca atraviesan el ControlNode.
 5. **CQRS en el ControlNode.** Comandos (mutan el namespace) y consultas (`ls`, `lookup`)
-   viven en paquetes distintos: `commands/` y `queries/`. Hoy ambos golpean la misma base
-   de datos; la separación existe para poder replicar el lado de lectura en la Etapa 3.
+   viven en paquetes distintos: `commands/` y `queries/`. **Desde la Etapa 3 esa separacion
+   se cobra**: las consultas van a la replica de lectura de PostgreSQL y los comandos al
+   primario, con read-your-writes por LSN. Ver «Enrutado CQRS». Con
+   `DFSHA_DB_REPLICA_URL` vacia las dos mitades vuelven al primario, que es un modo
+   soportado.
 6. **Bloque de tamaño fijo configurable.** Default 64 MB (`DFSHA_BLOCK_SIZE`).
 7. **Expiración por tiempo para estados transitorios.** Toda reserva de escritura tiene
    `expires_at`; un cliente caído no bloquea recursos indefinidamente. Este mecanismo es la
@@ -161,9 +164,13 @@ el GC, que sigue siendo manual a proposito, y el 2FA, que no esta en el enunciad
 10. **El evaluador de pertenencia no puede tumbar el ControlNode.** Captura `Exception`,
     registra y sigue; su intervalo es configurable.
 
-### Costuras dejadas listas para N nodos
+### Costuras dejadas listas para N nodos — **escrito en la Etapa 1; esta lista es historica**
 
-Aunque hoy haya un DataNode y una réplica, el diseño soporta N sin refactor:
+*Se conserva porque muestra que lo de la Etapa 3 no costo un refactor, y porque los
+«hoy» de abajo son los de entonces: hoy hay cuatro DataNodes, R=3 y tres ControlNodes.
+Cada costura se uso, y las dos de abajo dicen donde.*
+
+Cuando habia un DataNode y una réplica, el diseño ya soportaba N sin refactor:
 
 - `block_replicas` con cardinalidad N desde ya (un bloque, varias filas).
 - `data_nodes` con registro, capacidad y estado, aunque hoy tenga una fila.
@@ -2760,11 +2767,13 @@ Etapa 3 (Bloque C):
 
 ## 9. Cliente CLI
 
-Comandos: `login`, `register`, `ls`, `cd`, `pwd`, `mkdir`, `rmdir`, `rm`, `mv`, `stat`,
-`put <local> <remoto>`, `get <remoto> <local>`, `cluster`.
+Comandos: `login`, `logout`, `register`, `ls`, `cd`, `pwd`, `mkdir`, `rmdir`, `rm`, `mv`,
+`stat`, `put <local> <remoto>`, `get <remoto> <local>`, `cluster`.
 
-Etapa 3: `share`, `unshare`, `shared` y los de grupos, y `login --ask-password`, que no
-guarda la clave maestra en disco y la pide en cada `put` y `get`.
+Etapa 3: `share`, `unshare`, `shared`, `acl <ruta>` —que muestra el permiso efectivo y de
+donde se hereda—, el grupo de subcomandos `group {create,add,remove,ls}`, y
+`login --ask-password`, que no guarda la clave maestra en disco y la pide en cada `put` y
+`get`.
 
 RF3: `lock`, `unlock`, `locks`, `read --offset --length` (lectura por rango, a la salida
 estandar) y `append <remoto> <local>`. Ver "RF3" mas arriba.
@@ -2790,10 +2799,19 @@ abre la envoltura y descifra. Ver "Cifrado extremo a extremo".
 
 `scripts/gc.py`, a mano, sin demonio ni scheduler. Soporta `--dry-run`.
 
-1. `GET /internal/v1/gc/orphan-blocks` -> bloques de archivos `DELETED` y reservas vencidas.
-2. Por cada bloque, `DELETE /blocks/{block_id}` en cada réplica.
+1. `GET /internal/v1/gc/orphan-blocks` -> bloques de archivos `DELETED`, de reservas
+   vencidas y **desligados** (`file_id` NULL, el tercer caso, que anadio el append del
+   RF3), cada uno con su **token de borrado** firmado por el ControlNode.
+2. Por cada bloque, `DELETE /blocks/{block_id}` en cada réplica, con ese token: sin el, el
+   DataNode responde 403. El GC no puede fabricarlo, porque presenta un certificado de
+   cliente y la verificacion exige el rol `dfsha-control`.
 3. `POST /internal/v1/gc/confirm` para que el ControlNode borre las filas.
 4. Resumen: bloques borrados, bytes liberados, fallos.
+
+**Desde la Etapa 3 hay una segunda via**, `--via-control-plane`, que encola los borrados
+como `DeleteBlock` por el stream del heartbeat: no hace falta ruta hasta los DataNodes,
+solo hasta el ControlNode. A cambio es asincrona y **no confirma**. Ver «El GC tiene ahora
+dos vias».
 
 Por qué en la Etapa 1 y no después: sin GC, el `used_bytes` de cada DataNode queda inflado
 por bloques muertos, y ese número es la entrada de la política de colocación de la Etapa 2.
