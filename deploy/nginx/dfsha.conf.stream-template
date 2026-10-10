@@ -1,0 +1,44 @@
+# nginx en dfsha-db, delante de los DOS ControlNodes del despliegue en AWS. Parte STREAM.
+#
+# Plantilla, igual que default.conf.template: la IP de DFSHA_CONTROL_A_IP sale del .env.
+#
+# Nivel 4, igual que docker/nginx/dfsha-stream.conf del compose local: el gRPC (:9000) y el
+# plano interno (:8443) llevan TLS MUTUO, y un proxy que terminara TLS se quedaria el
+# certificado del DataNode, que ahi es su identidad. nginx pasa bytes sin mirarlos y no
+# tiene ni necesita certificado para estos dos puertos.
+#
+# Consecuencia para los certificados: el DataNode marca la IP de dfsha-db y le contesta
+# un ControlNode a traves de nginx, asi que esa IP tiene que estar en el SAN de
+# control.crt. Esta en la linea de gen_certs.py del paso 4.
+
+upstream dfsha_control_grpc {
+    least_conn;
+    server control-node:9000 max_fails=2 fail_timeout=5s;
+    server ${DFSHA_CONTROL_A_IP}:9000 max_fails=2 fail_timeout=5s;
+}
+
+server {
+    listen 9000;
+    proxy_pass dfsha_control_grpc;
+    # El stream de heartbeat dura horas. Si el ControlNode que lo atiende muere, el
+    # DataNode reconecta y el latido acaba en el otro: escribe en la base compartida.
+    proxy_timeout 1h;
+    proxy_connect_timeout 3s;
+    proxy_next_upstream on;
+    proxy_next_upstream_tries 2;
+}
+
+upstream dfsha_control_internal {
+    least_conn;
+    server control-node:8443 max_fails=2 fail_timeout=5s;
+    server ${DFSHA_CONTROL_A_IP}:8443 max_fails=2 fail_timeout=5s;
+}
+
+server {
+    listen 8443;
+    proxy_pass dfsha_control_internal;
+    proxy_timeout 60s;
+    proxy_connect_timeout 3s;
+    proxy_next_upstream on;
+    proxy_next_upstream_tries 2;
+}

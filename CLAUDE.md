@@ -814,7 +814,7 @@ aparece un `verify=<ruta>` junto a un `cert=` en algun sitio nuevo, es este fall
 
 #### El patron, que es lo que va al informe
 
-Los **trece** fallos serios de la Etapa 3 de esta tabla han sido el mismo tipo de cosa:
+Los **diecisiete** fallos serios de la Etapa 3 de esta tabla han sido el mismo tipo de cosa:
 **algo que aparenta estar puesto y no lo esta**, y ninguno se detecto leyendo el codigo.
 La tabla crecio a lo largo de la etapa; las tres primeras filas son las del codigo del
 Bloque B y C, que es donde se reconocio el patron.
@@ -834,6 +834,10 @@ Bloque B y C, que es donde se reconocio el patron.
 | El DataNode con TLS de cliente (C2) | El pipeline y la re-replicacion verificaban a sus pares | Verificaban contra el almacen del **sistema**, sin nuestra CA: con C2, cada reenvio fallaba y el commit daba 409 | Escribiendo los pasos para encender C2, antes de ejecutarlo |
 | Encender C2 (compose, sondas, sesion) | C2 estaba implementado, probado con nueve pruebas y documentado | **No se podia encender**: el compose no pasaba las variables, las sondas fijaban `http://` y el stack no levantaba, y la sesion ignoraba `DFSHA_CONTROL_URL` | Lo mismo: intentar escribir los pasos exactos |
 | La rama por defecto de GitHub (desde el hito 1) | Quien clonara el repositorio obtendria el proyecto | Obtenia **`etapa-1`**: `main` iba cuatro etapas por delante, y el `git clone` de nuestro propio README y del despliegue en AWS no indicaba rama | Al hacer el merge del hito 3, mirando `origin/HEAD` |
+| URL interna del DataNode en AWS | El compose de despliegue pasaba la URL del plano interno | La interpolacion leia el `.env` de `deploy/`: salia `https://:8443` y **pisaba la correcta** | Repasando `deploy/` antes de ejecutarlo, y confirmado con `docker compose config` |
+| `DFSHA_REPLICATION_FACTOR` en AWS | El ejemplo desplegaba la Etapa 3 | Traia `R=1`: la Etapa 3 **sin replicacion**, funcionando en apariencia bien | Repasando `deploy/` antes de ejecutarlo |
+| Python del despliegue en AWS | Ubuntu 22.04 servia para todo | Trae 3.10 y el cliente exige 3.11: su `pip install` **fallaba** | Repasando `deploy/`, contra `requires-python` |
+| Permisos de las claves en AWS | `chmod 600` dejaba las claves legibles por el servicio | Legibles **por coincidencia** entre el uid de `ubuntu` y el del contenedor | Repasando `deploy/`, contra el `USER` de los Dockerfiles |
 
 **El cuarto (`details`) es distinto de los tres primeros, y esa diferencia es lo que va
 al informe.** Los tres primeros se manifestaban como un **fallo**: un 409, una conexion cerrada, una descarga
@@ -869,15 +873,15 @@ codigo hasta las pruebas y la documentacion**.
 | **Codigo** | el direccionamiento, `cert=` de httpx, `blocks.size`, y los pares del DataNode sin la CA con C2 | 4 |
 | **Cliente** | los `details` descartados desde la Etapa 1 | 1 |
 | **Documentacion** | el arranque rapido con un secreto muerto y sin los certificados | 1 |
-| **Arranque** | el `__main__.py` que no compilaba, el `.env` vacio que tumbaba el DataNode en AWS, los guiones de demostracion que no arrancaban en Windows, `verificar_pruebas.py`, que solo arrancaba en la maquina donde se escribio, y C2, que no se podia encender | 5 |
+| **Arranque** | el `__main__.py` que no compilaba, el `.env` vacio que tumbaba el DataNode en AWS, los guiones de demostracion que no arrancaban en Windows, `verificar_pruebas.py`, que solo arrancaba en la maquina donde se escribio, C2, que no se podia encender, y los cuatro del despliegue en AWS: la URL interna vacia, `R=1`, el Python de Ubuntu 22.04 y los permisos por coincidencia | 9 |
 | **Migracion** | la 0006, que dejo sin sal a los usuarios existentes y con ellos el cifrado desactivado en silencio | 1 |
 | **Repositorio** | la rama por defecto de GitHub, que apuntaba a `etapa-1` desde el hito 1 | 1 |
 | **Pruebas** | tres que pasaban por un camino distinto del que su nombre anunciaba, y la del append «con cifrado» que no comprobaba el cifrado | 4 |
 
-**Diecisiete casos en siete capas.** Conviene contarlos bien, porque la cifra se cita: las
-**trece** filas de la tabla de fallos de arriba cubren las seis primeras capas, y la
+**Veintiun casos en siete capas.** Conviene contarlos bien, porque la cifra se cita: las
+**diecisiete** filas de la tabla de fallos de arriba cubren las seis primeras capas, y la
 septima —las **cuatro** pruebas que no probaban— no esta en esa tabla: tres en la seccion
-«Verificacion por mutacion» y la cuarta en «El agujero de la 0006». Decir «trece casos en
+«Verificacion por mutacion» y la cuarta en «El agujero de la 0006». Decir «diecisiete casos en
 siete capas» mezclaria las dos cuentas.
 
 Que se cuenta y que no, para poder defender la cifra: el agujero del cifrado es **un** caso,
@@ -946,7 +950,7 @@ por defecto a `main` en GitHub —un ajuste que no se puede fijar desde el repos
 **atar la documentacion al destino** con `git clone --branch main`, que sigue siendo
 correcto aunque el ajuste de GitHub vuelva a cambiar.
 
-Diecisiete casos en siete capas distintas no es un descuido puntual: es un **modo de fallo del
+Veintiun casos en siete capas distintas no es un descuido puntual: es un **modo de fallo del
 proyecto**. Y tiene una causa comun que conviene nombrar: en todos, **algo dejo de ser
 verdad y lo que lo afirmaba no se entero**, porque nada los ataba. El codigo no comprueba
 que el README sea cierto, una prueba no comprueba que su nombre describa lo que hace, y un
@@ -1499,10 +1503,13 @@ compose, el balanceador seguiria apuntando a la vieja.
 
 **Se decidio NO arreglarlo.** Las tres razones, en orden de peso:
 
-1. **El despliegue en AWS no tiene nginx.** Ahi hay un solo ControlNode y los DataNodes lo
-   alcanzan por su **IP privada**, que es estable entre reinicios de la instancia —es
-   justamente por eso que se anuncia la privada y no la publica—. Asi que esto no es un
-   fallo de produccion: su alcance es el `docker compose` local.
+1. **En AWS el alcance se reduce a un nombre.** Hasta el hito 3 el despliegue en AWS no
+   tenia nginx; desde entonces lo tiene, en `dfsha-db`, delante de dos ControlNodes (ver
+   «Despliegue en AWS» mas abajo). Pero de sus dos `upstream` solo uno es un nombre
+   —`control-node`, el ControlNode B, en la red de compose de esa misma instancia—; el
+   otro es la **IP privada** de `dfsha-control`, estable entre reinicios. El caso afecta
+   solo a reiniciar el ControlNode B, que es justo lo que hace la demostracion del relevo,
+   y por eso `deploy/README.md` lo menciona en ese paso.
 2. **El efecto ya esta acotado.** Los `upstream` llevan `max_fails=2 fail_timeout=5s` y
    `proxy_next_upstream`: una IP obsoleta a la que no responde nadie se detecta al
    conectar, nginx pasa a la siguiente y la saca de la rotacion. Se recupera solo. El unico
@@ -2037,6 +2044,67 @@ override—, y asi se ensena en el video: justo lo que el override hace posible.
 No debilita la seguridad del contenido: los bloques viajan cifrados extremo a extremo en
 los dos modos. Lo que C2 anade es proteger el JWT, el metadato y los tokens de bloque en
 la red, que es lo que un despliegue real encenderia.
+
+### Despliegue en AWS: dos ControlNodes y el balanceador en `dfsha-db`
+
+Decidido antes de montarlo, con el detalle en `deploy/README.md`:
+
+1. **Dos ControlNodes y nginx, sin septima instancia.** El ControlNode A en `dfsha-control`;
+   el B, nginx y PostgreSQL en `dfsha-db`. **Lo que faltaba no era un ControlNode, era el
+   balanceador**: sin el, DataNodes y cliente apuntan a una IP, y matar al que atiende el
+   trafico enseñaria el traspaso del lease pero no que el servicio continua. Medido en el
+   compose local: ControlNode 90-95 MiB, PostgreSQL 62, nginx 20; `dfsha-db` queda en
+   ~500-650 MB de ~950, con 1 GB de swap como red de seguridad.
+2. **«Una instancia, un servicio» nacio por los DataNodes** (un bloque en memoria por
+   subida concurrente; los dominios de falla), y no aplica a un ControlNode: no tiene
+   estado propio y los bytes no lo atraviesan. Es la objecion que alguien planteara al
+   ver tres servicios en una maquina.
+3. **El limite, escrito antes de la demostracion**: matar la instancia `dfsha-db` tumba el
+   cluster. PostgreSQL es el punto unico de fallo aceptado, con promocion manual.
+4. **C2 encendido en AWS.** El «apagado por defecto» del hito 3 es para quien clona; AWS es
+   el despliegue real y ahi el trafico cruza redes.
+5. **El cliente, dentro del cluster (opcion (a)), y nada de la aplicacion abierto a una IP
+   externa.** Abrir el 8000 no bastaria: los bytes van directos a los DataNodes por IP
+   privada, y la opcion de tuneles reintroduce la tension de una sola direccion anunciada.
+6. **Todo valor, escrito**: los compose de `deploy/` no interpolan, y
+   `DFSHA_DATANODE_PEER_URL` va explicita aunque coincida con la de cliente.
+
+**Revisandolo antes de ejecutarlo aparecieron fallos que lo habrian parado**, todos del
+patron de la etapa —lo que no se ha ejecutado nunca esta sin probar—:
+
+- `docker-compose.datanode.yml` componia la URL del plano interno con `${...}`, que compose
+  lee del `.env` de `deploy/` y no del de la raiz: salia `https://:8443` y, como
+  `environment:` gana a `env_file`, **pisaba la correcta**. Ningun `put` habria confirmado.
+  Comprobado con `docker compose config`: compose avisa con un *warning*, entre el ruido del
+  arranque.
+- `.env.control.example` traia `DFSHA_REPLICATION_FACTOR=1` («la replicacion llega en la
+  Etapa 3»): la Etapa 3 se habria desplegado **sin replicacion**.
+- Se proponia Ubuntu 22.04, con Python 3.10, y el cliente exige 3.11: su `pip install`
+  habria fallado. Ahora 24.04.
+- Las claves con `chmod 600` las leia el contenedor (uid 1000) **por coincidencia** con el
+  uid de `ubuntu`. Ahora `chown 1000:1000` explicito.
+
+**Entran los cuatro en la cuenta del informe, capa «Arranque»**, con el mismo criterio que
+el resto: el material llevaba semanas escrito, revisado y presentado como listo. Que se
+encontraran leyendo y no ejecutando no cambia lo que eran.
+
+**Y el matiz que refuerza el argumento**: los cuatro se encontraron **sin ejecutar nada**,
+repasando material que nadie habia ejercitado nunca. Dos de ellos habrian costado horas en
+las instancias, y por motivos distintos:
+
+- **La URL interna vacia** habria dado el `409 no alcanzan el quorum` de siempre: el sintoma
+  que ya despisto dos veces hacia la capacidad del cluster, ahora en seis maquinas y con el
+  reloj del laboratorio corriendo.
+- **`R=1`** no habria fallado en absoluto. La Etapa 3 se habria desplegado **sin
+  replicacion y funcionando en apariencia bien**: cada `put` confirmado, cada `get`
+  correcto, y el `FULLY_REPLICATED (1 de 1)` diciendo la verdad sobre una configuracion
+  equivocada. **Eso es peor que fallar**: un fallo se investiga; un sistema que funciona se
+  da por bueno, y se habria descubierto, si acaso, al matar un DataNode delante de quien
+  evalua.
+
+`scripts/demo/failover_del_lider.py` no sirve en AWS (usa `docker exec` local): la
+secuencia manual por SSH esta en `deploy/README.md`, paso 9, con `docker kill` y no `stop`,
+porque una parada ordenada **suelta** el lease y la demostracion de la caducidad se pierde.
 
 ### Intermitente conocido: `test_los_bloques_son_inmutables`
 

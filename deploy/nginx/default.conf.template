@@ -1,0 +1,69 @@
+# nginx en dfsha-db, delante de los DOS ControlNodes del despliegue en AWS. Parte HTTP.
+#
+# Es una PLANTILLA: la imagen oficial de nginx sustituye la variable DFSHA_CONTROL_A_IP al arrancar
+# con el valor del .env (lo recibe por env_file), y deja intactas las variables de nginx
+# como $host, porque solo sustituye las que existen en el entorno. Asi la IP de dfsha-control
+# queda ESCRITA en el .env, donde se puede verificar leyendolo, y no hay interpolacion de
+# compose, que en deploy/ ya fallo una vez en silencio.
+#
+# Mismo diseno que docker/nginx/dfsha-tls.conf del compose local, con C2 encendido: TLS se
+# termina aqui para el cliente (su identidad es el JWT, que llega intacto dentro de la
+# peticion) y se vuelve a cifrar hacia cada ControlNode VERIFICANDO contra la CA del
+# proyecto. `proxy_ssl_name lb` porque `lb` esta en el SAN de control.crt.
+
+upstream dfsha_control_rest {
+    least_conn;
+    # El de esta misma instancia, por la red de compose.
+    server control-node:8000 max_fails=2 fail_timeout=5s;
+    # El de dfsha-control, por su IP privada.
+    server ${DFSHA_CONTROL_A_IP}:8000 max_fails=2 fail_timeout=5s;
+}
+
+server {
+    listen 8000 ssl;
+    server_name _;
+
+    ssl_certificate     /etc/nginx/certs/control.crt;
+    ssl_certificate_key /etc/nginx/certs/control.key;
+    ssl_protocols       TLSv1.2 TLSv1.3;
+
+    client_max_body_size 1m;
+
+    location / {
+        proxy_pass https://dfsha_control_rest;
+        proxy_http_version 1.1;
+
+        proxy_ssl_trusted_certificate /etc/nginx/certs/ca.crt;
+        proxy_ssl_verify              on;
+        proxy_ssl_verify_depth        2;
+        proxy_ssl_name                lb;
+        proxy_ssl_protocols           TLSv1.2 TLSv1.3;
+
+        proxy_set_header Host              $host;
+        proxy_set_header X-Real-IP         $remote_addr;
+        proxy_set_header X-Forwarded-For   $proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto $scheme;
+
+        # Si la instancia que atiende cae a mitad, se reintenta en la otra. Es lo que hace
+        # que matar a un ControlNode no interrumpa al cliente.
+        proxy_next_upstream error timeout http_502 http_503 http_504;
+        proxy_next_upstream_tries 2;
+
+        proxy_connect_timeout 3s;
+        proxy_read_timeout 60s;
+    }
+}
+
+# Sonda de salud del contenedor: HTTP en loopback, y desde aqui HTTPS verificado hacia los
+# ControlNodes. El wget de busybox no sabe verificar contra una CA propia, y desactivar la
+# verificacion no es una opcion. Solo en 127.0.0.1: no se publica.
+server {
+    listen 127.0.0.1:8081;
+
+    location = /health {
+        proxy_pass https://dfsha_control_rest;
+        proxy_ssl_trusted_certificate /etc/nginx/certs/ca.crt;
+        proxy_ssl_verify              on;
+        proxy_ssl_name                lb;
+    }
+}
