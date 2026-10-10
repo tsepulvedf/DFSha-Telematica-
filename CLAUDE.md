@@ -27,8 +27,11 @@ No se cuestionan, se implementan.
 4. **Routing híbrido.** El ControlNode es routing tier solo para metadatos. Los bytes
    viajan **directo** entre cliente y DataNode; nunca atraviesan el ControlNode.
 5. **CQRS en el ControlNode.** Comandos (mutan el namespace) y consultas (`ls`, `lookup`)
-   viven en paquetes distintos: `commands/` y `queries/`. Hoy ambos golpean la misma base
-   de datos; la separación existe para poder replicar el lado de lectura en la Etapa 3.
+   viven en paquetes distintos: `commands/` y `queries/`. **Desde la Etapa 3 esa separacion
+   se cobra**: las consultas van a la replica de lectura de PostgreSQL y los comandos al
+   primario, con read-your-writes por LSN. Ver «Enrutado CQRS». Con
+   `DFSHA_DB_REPLICA_URL` vacia las dos mitades vuelven al primario, que es un modo
+   soportado.
 6. **Bloque de tamaño fijo configurable.** Default 64 MB (`DFSHA_BLOCK_SIZE`).
 7. **Expiración por tiempo para estados transitorios.** Toda reserva de escritura tiene
    `expires_at`; un cliente caído no bloquea recursos indefinidamente. Este mecanismo es la
@@ -52,17 +55,26 @@ Reglas transversales que se derivan de lo anterior:
 
 ## 2. Hoja de ruta
 
-- **Etapa 1 (hito-1)** — RF1 + RF2, un ControlNode y un DataNode, JWT, SHA-256 por
+- **Etapa 1 (hito-1, cerrada)** — RF1 + RF2, un ControlNode y un DataNode, JWT, SHA-256 por
   bloque, GC manual, logging estructurado.
-- **Etapa 2 (hito-2, actual)** — N DataNodes reales, gRPC ControlNode<->DataNode,
+- **Etapa 2 (hito-2, cerrada)** — N DataNodes reales, gRPC ControlNode<->DataNode,
   heartbeat cada 3 s con métricas de carga, block report incremental, maquina de estados
   ALIVE/SUSPECT/DEAD, politica de colocacion *power of d choices* con restriccion de
   dominios de falla, deteccion de divergencia sin borrado automatico, y despliegue en
   AWS.
-- **Etapa 3 (hito-3)** — replicación R=3 con pipeline y commit W=2, re-replicación ante
-  caída, ControlNode primary/standby con edit log, réplicas de lectura CQRS, RF3 con
-  leases, mTLS y cifrado en reposo.
-- **Etapa 4 (hito-4)** — benchmarks, informe, video.
+- **Etapa 3 (hito-3, cerrada)** — replicación R=3 con pipeline y commit W=2,
+  re-replicación ante caída, varios ControlNodes con lease y época, réplicas de lectura
+  CQRS, RF3 con leases, mTLS, TLS de cliente y cifrado extremo a extremo. Validada en
+  `docker compose` y en AWS (ver «Estado de la validacion en Docker»).
+- **Etapa 4 (hito-4, ACTUAL)** — benchmarks, informe, video.
+
+**Lo que se hizo distinto de como esta escrito arriba, y conviene no confundirlo**: la
+alta disponibilidad del ControlNode **no lleva edit log ni primary/standby**. Los
+ControlNodes son **sin estado** y todos sirven peticiones; lo que se reparte es el
+**lease de liderazgo** sobre PostgreSQL compartido, y lo que aisla al lider congelado es
+la **epoca**. No hacia falta un edit log porque no hay estado propio que replicar: el
+metadato ya vive en una base compartida, y la que tiene failover —manual— es la base.
+Ver «Liderazgo: la epoca es un token de aislamiento».
 
 Diseñar contra esta hoja de ruta, no adelantarla.
 
@@ -92,7 +104,11 @@ Diseñar contra esta hoja de ruta, no adelantarla.
 - `GET /api/v1/cluster/status` y `dfsha cluster`.
 - Compose con cuatro DataNodes y material de despliegue en AWS.
 
-### No entra hasta la Etapa 3 — no lo implementes ni lo simules
+### No entra hasta la Etapa 3 — **ya entro todo; esta lista es historica**
+
+*Se conserva porque cada punto lleva escrito donde se hizo, y eso es lo que permite
+comprobar que no quedo nada a medias. Al cerrar el hito 3, los cinco estan cumplidos salvo
+el GC, que sigue siendo manual a proposito, y el 2FA, que no esta en el enunciado.*
 
 - Replicación efectiva. `DFSHA_REPLICATION_FACTOR` sigue en **1**: la política soporta
   R>1 y está probada para ello, pero el default no cambia hasta la Etapa 3.
@@ -100,6 +116,10 @@ Diseñar contra esta hoja de ruta, no adelantarla.
 - Pipeline de escritura entre DataNodes, quórum W, re-replicación automática.
   **Hecho en la Etapa 3, Bloque B.**
 - Alta disponibilidad del ControlNode, edit log, failover, réplicas de lectura.
+  **Hecho en la Etapa 3, Bloque A**, con una diferencia que importa: tres ControlNodes
+  **sin estado** con lease y epoca, y replica de lectura de PostgreSQL para el lado de
+  consulta de CQRS. **Sin edit log y sin primary/standby**: no hay estado propio que
+  replicar. El failover de la base es manual (`deploy/RUNBOOK-postgres.md`).
 - mTLS, cifrado en reposo, 2FA, ACLs por grupo.
   **Hecho en la Etapa 3, Bloque C**: mTLS en el plano interno, TLS en el de cliente,
   cifrado extremo a extremo y ACLs con grupos. 2FA no entra: no esta en el enunciado.
@@ -144,9 +164,13 @@ Diseñar contra esta hoja de ruta, no adelantarla.
 10. **El evaluador de pertenencia no puede tumbar el ControlNode.** Captura `Exception`,
     registra y sigue; su intervalo es configurable.
 
-### Costuras dejadas listas para N nodos
+### Costuras dejadas listas para N nodos — **escrito en la Etapa 1; esta lista es historica**
 
-Aunque hoy haya un DataNode y una réplica, el diseño soporta N sin refactor:
+*Se conserva porque muestra que lo de la Etapa 3 no costo un refactor, y porque los
+«hoy» de abajo son los de entonces: hoy hay cuatro DataNodes, R=3 y tres ControlNodes.
+Cada costura se uso, y las dos de abajo dicen donde.*
+
+Cuando habia un DataNode y una réplica, el diseño ya soportaba N sin refactor:
 
 - `block_replicas` con cardinalidad N desde ya (un bloque, varias filas).
 - `data_nodes` con registro, capacidad y estado, aunque hoy tenga una fila.
@@ -617,7 +641,7 @@ hacerlo en el hilo del stream dejaria de mandar latidos mientras dura, el Contro
 daria por muerto justo al nodo que esta haciendo el trabajo, y la respuesta a eso seria
 programar todavia mas copias.
 
-**La tercera y ultima tarea en background.** La Etapa 2 fijo que solo hubiera dos y que
+**La cuarta y ultima tarea en background.** La Etapa 2 fijo que solo hubiera dos y que
 anadir una se justificara. Esta se justifica porque un hueco de replicacion no lo provoca
 ninguna peticion: lo provoca que algo **deje** de pasar, y nadie va a preguntar por el. Va
 aparte del evaluador de pertenencia porque sus cadencias son muy distintas (1 s frente a
@@ -1559,6 +1583,17 @@ Cambiar un fallo raro y auto-recuperable por perder el balanceo en el camino pri
 mal negocio. Queda documentado en `scripts/demo/README.md` con la salida —`docker compose
 restart lb`— y con el aviso de que **el balanceador no es el primer sospechoso**.
 
+**Visto en ejecucion el 10/10/2026, y conviene saber el disparador exacto**: un
+`docker compose up -d --build` que **recrea los tres ControlNodes pero no el `lb`** —porque
+la configuracion del balanceador no cambio— les da IP nuevas y deja a nginx con las
+viejas. El sintoma no fue en el `:8000` sino en el gRPC: los cuatro DataNodes en bucle de
+reinicio con `datanode.register_retry` y `code: UNAVAILABLE` contra `lb:9000`, y ninguno
+registrado. `docker compose restart lb` lo arreglo y los diez servicios quedaron
+`healthy`. Asi que el caso «raro» tiene un disparador de lo mas comun —reconstruir las
+imagenes— y el remedio sigue siendo una orden. Lo que **no** se sostiene es llamarlo
+auto-recuperable aqui: con la IP vieja no respondiendo nadie, nginx la descarta, pero si
+las tres estan obsoletas no queda ninguna a la que pasar.
+
 #### Los certificados en compose
 
 `./certs` se monta **solo lectura** en los ControlNodes, los DataNodes y el cliente. Cada
@@ -2374,7 +2409,11 @@ Reglas de dominio, a hacer cumplir en `domain/`:
 
 ```
 POST /auth/register   {username, password}          -> 201
-POST /auth/login      {username, password}          -> {access_token, expires_in}
+POST /auth/login      {username, password}
+     -> {access_token, expires_in, token_type, kdf_salt}
+     `kdf_salt` viaja AQUI, y no es un descuido: el cliente la necesita para
+     derivar su clave maestra en una sesion nueva, y una sal no es secreta. Su
+     trabajo es que dos usuarios con la misma contrasena no compartan clave
 ```
 
 Todo lo demás exige `Authorization: Bearer <token>`.
@@ -2383,7 +2422,12 @@ Namespace (RF1):
 
 ```
 GET    /fs/ls?path=/a/b        -> {entries:[{name, type, size, created_at}]}
-GET    /fs/stat?path=/a/b/c    -> {path, type, size, block_size, block_count, created_at}
+GET    /fs/stat?path=/a/b/c
+       -> {path, type, size, block_size, block_count, created_at,
+           replication_state, min_replicas, max_replicas, replication_factor}
+       los cuatro ultimos son de la Etapa 3 y NULL en un directorio.
+       `replication_state` se DERIVA del bloque peor replicado en el momento de
+       la consulta: FULLY_REPLICATED | UNDER_REPLICATED | UNAVAILABLE
 POST   /fs/mkdir               {path, parents: bool}
 DELETE /fs/rmdir?path=&recursive=
 DELETE /fs/rm?path=
@@ -2418,6 +2462,84 @@ GET  /files/open?path=/a/b/c
      suponerlo: es lo que mantiene legibles los archivos de la Etapa 2
 ```
 
+RF3 (Bloque C). **Los de lock y el handle van bajo `/fs`, no bajo `/files`**, que es donde
+los pone el codigo; `read` y `append` si van en `/files`:
+
+```
+POST /fs/open     {path, mode, lock?, holder?}
+     -> {file_id, path, size, block_size, mode, wrapped_key, key_algo, lock}
+     abrir y bloquear ocurren en la MISMA transaccion; `read` toma lock
+     compartido y `write` exclusivo. Un lock compartido NO autoriza a escribir
+
+POST /fs/lock     {path, mode, holder}   -> {file_id, path, holder, epoch, mode,
+                                             expires_at, lease_seconds}
+     pedirlo dos veces con el mismo holder es RENOVAR, no un lock nuevo
+POST /fs/unlock   {path, mode, holder}   -> 204   (el mismo LockRequest)
+GET  /fs/locks?path=/a/b
+     -> {path, holders:[{holder, mode, epoch, expires_at}]}
+     se lee SIN cerrojo y los VENCIDOS se filtran al responder: el vencimiento
+     se evalua al consultar, nunca con un barrido
+
+GET  /files/read?path=&offset=0&length=   (length ausente = hasta el final)
+     -> {file_id, offset, length, size,
+         blocks:[{block_id, index, size, checksum_sha256, replicas, token,
+                  skip, take}]}
+     solo los bloques que intersectan el tramo; `skip` y `take` dicen cuanto
+     recortar de cada uno YA DESCIFRADO. El bloque se baja ENTERO: con cifrado
+     no se puede descifrar ni verificar un tramo suelto
+
+POST /files/{file_id}/append         {size, cipher_overhead?, lock_holder, lock_epoch}
+     -> 201 {file_id, block_size, expires_at, tail, tail_plain_size,
+             blocks:[{block_id, index, size, replicas, pipeline, token}]}
+     `tail` es el bloque de cola a REESCRIBIR si estaba a medias (un
+     BlockReadPlan, con su token de lectura), y `tail_plain_size` lo que ya
+     ocupaba en claro
+POST /files/{file_id}/append/commit  {block_ids, new_size, replaces,
+                                      lock_holder, lock_epoch}
+     -> 200 {path, size, block_count}
+     el lock se exige DOS veces, aqui y al planificar: entre las dos el cliente
+     sube bytes y su lease pudo vencer
+```
+
+ACLs y grupos (Bloque C). `/compartido-conmigo` es un directorio **virtual**: no existe en
+`directories`, se compone al vuelo con las concesiones que apuntan a este usuario.
+
+```
+POST /acl/share     {path, principal, permission}   -> 204
+POST /acl/unshare   {path, principal}               -> 204
+GET  /acl/show?path=/a/b
+     -> {path, effective, source, inherited_from,
+         grants:[{principal, principal_type, permission, granted_by, granted_at}]}
+     `effective` es READ|WRITE|ADMIN o null, e `inherited_from` la ruta del
+     ancestro de donde sale: la herencia va HACIA ARRIBA
+GET  /acl/shared-with-me
+     -> {entries:[{owner, name, permission, via_group, path}]}
+     `via_group` dice por que grupo llega la concesion, o null si es directa
+POST /acl/groups                {name}              -> 201
+GET  /acl/groups                                    -> {groups:[{name, members}]}
+POST /acl/groups/members        {name, username}    -> 204
+POST /acl/groups/members/remove {name, username}    -> 204
+```
+
+**Codigos que importan en este bloque y en el RF3** (el mapeo completo esta en
+`api/errors.py`): **409** para un lock ajeno (`file_locked`, con `holder`, `mode` y
+`retry_after_seconds` en los `details`) y para una epoca vencida (`stale_lock`); **404**
+tambien cuando el archivo existe pero no es tuyo, porque decir «existe y no es tuyo»
+convertiria el arbol de otro usuario en algo enumerable; **410** si la reserva de
+escritura vencio; **503** si no hay DataNode disponible para colocar.
+
+Y el liderazgo, que es lo que hace util `dfsha cluster` durante una demostracion:
+
+```
+GET /cluster/status      -> {nodes:[...], replication_factor, write_quorum,
+                             suspect_after_ms, dead_after_ms,
+                             under_replicated_blocks, critical_blocks}
+GET /cluster/leadership  -> {leader_id, epoch, is_self, instance_id,
+                             expires_in_seconds, acquired_at, renewed_at}
+     `is_self` dice si contesto el lider: con tres instancias tras un
+     balanceador, es la unica forma de saber a quien te atendio
+```
+
 ### Alcance de gRPC (Etapa 2) — material del informe
 
 **gRPC solo entre ControlNode y DataNode.** Cliente<->ControlNode y cliente<->DataNode
@@ -2442,18 +2564,32 @@ porque los usa el script, no el DataNode.
 ### ControlNode `/internal/v1` — lo consumen el DataNode y el GC
 
 ```
-POST /datanodes/register        {base_url, capacity_bytes} -> {data_node_id}
 POST /blocks/{block_id}/stored  {data_node_id, size, checksum_sha256} -> 204
-GET  /gc/orphan-blocks          -> {blocks:[{block_id, size, replicas:[{data_node_id, base_url}]}]}
+GET  /gc/orphan-blocks          -> {blocks:[{block_id, size, token, replicas:[{data_node_id, base_url}]}]}
 POST /gc/confirm                {block_ids:[...]} -> 204
 ```
 
-`GET /gc/orphan-blocks` devuelve bloques de archivos `DELETED` y de reservas vencidas.
-`POST /gc/confirm` borra esas filas del metadato una vez el script confirmó que los bloques
-ya no están en disco.
+**`POST /datanodes/register` ya NO es REST**: es el RPC `Register` de
+`common/proto/control.proto`, como `Heartbeat` y `BlockReport`. De este bloque solo quedan
+en REST estas tres rutas, y cada una por su motivo:
 
-Autenticación interna: secreto compartido por header `X-DFSha-Internal-Secret`,
-comparado en tiempo constante. En la Etapa 3 esto pasa a gRPC con mTLS.
+- **`/blocks/{id}/stored`**, porque el DataNode la llama de forma **sincrona antes de
+  responder 201** al cliente: asi, cuando el cliente puede pedir el commit, el ControlNode
+  ya sabe de esa copia. Si viajara en el block report del heartbeat, un commit inmediato
+  podria llegar hasta 3 s antes que la noticia y fallar con un 409 por una carrera. **La
+  latencia del commit no puede quedar atada al periodo del heartbeat.**
+- **Los dos del recolector**, porque los usa el script `scripts/gc.py`, que corre donde el
+  cliente y no es un DataNode.
+
+`GET /gc/orphan-blocks` devuelve bloques de archivos `DELETED`, de reservas vencidas y
+**desligados** (`file_id` NULL, el tercer caso que anadio el append del RF3), cada uno con
+su **token de borrado** firmado. `POST /gc/confirm` borra esas filas del metadato una vez
+el script confirmo que los bloques ya no estan en disco.
+
+Autenticacion interna: **TLS mutuo** en su propio puerto (`:8443`), con la CA del
+proyecto. `X-DFSha-Internal-Secret` **ya no existe** —desaparecio en el Bloque C—: un
+secreto compartido protege contra quien no lo conoce, pero no dice **quien** esta al otro
+lado, y cualquiera que lo tenga es todos a la vez.
 
 ### DataNode `/api/v1` — lo consume el cliente
 
@@ -2506,7 +2642,7 @@ Todo por variables de entorno vía Pydantic Settings, documentadas en `.env.exam
 
 ```
 DFSHA_BLOCK_SIZE=67108864        # 64 MB default
-DFSHA_CONTROL_URL=http://localhost:8000
+DFSHA_CONTROL_URL=http://localhost:8000   # la lee el CLIENTE (no es un campo de settings)
 DFSHA_DB_URL=sqlite:///./dfsha.db
 DFSHA_JWT_SECRET=
 DFSHA_JWT_TTL_SECONDS=3600
@@ -2518,14 +2654,14 @@ DFSHA_LOG_LEVEL=INFO
 # --- Etapa 2 ---
 DFSHA_DATANODE_ADVERTISE_URL=http://localhost:8001   # alcanzable por el CLIENTE
 DFSHA_DATANODE_FAULT_DOMAIN=local-1                  # cadena opaca
-DFSHA_CONTROL_GRPC_URL=control-node:9000
+DFSHA_CONTROL_GRPC_URL=lb:9000   # en compose, el BALANCEADOR; default localhost:9000
 DFSHA_GRPC_PORT=9000
 DFSHA_HEARTBEAT_INTERVAL_MS=3000
 DFSHA_FULL_REPORT_EVERY_N=20
 DFSHA_SUSPECT_AFTER_MS=10000     # menor que DEAD, o el servicio no arranca
 DFSHA_DEAD_AFTER_MS=30000
 DFSHA_MEMBERSHIP_INTERVAL_MS=1000
-DFSHA_REPLICATION_FACTOR=1       # la Etapa 3 sube este default
+DFSHA_REPLICATION_FACTOR=3       # la Etapa 3 subio este default de 1 a 3
 DFSHA_PLACEMENT_D=3
 DFSHA_MIN_FREE_BYTES=134217728
 
@@ -2533,9 +2669,18 @@ DFSHA_MIN_FREE_BYTES=134217728
 DFSHA_DB_REPLICA_URL=            # vacia = todo al primario, y es un modo SOPORTADO
 DFSHA_LEASE_TTL_MS=6000
 DFSHA_LEASE_RENEW_MS=2000        # menor que el TTL, o el servicio no arranca
-DFSHA_WRITE_QUORUM=2
-DFSHA_REREPLICATION_GRACE_MS=300000
+DFSHA_WRITE_QUORUM=2             # no puede ser mayor que R, o el servicio no arranca
+DFSHA_REREPLICATION_GRACE_MS=300000   # 5 min; 30 s para el video
+DFSHA_REREPLICATION_INTERVAL_MS=5000
+DFSHA_REREPLICATION_MAX_PER_NODE=2    # tope por destino: sin el se satura el nodo mas vacio
+DFSHA_REREPLICATION_MAX_PER_PASS=8
 DFSHA_FILE_LOCK_TTL_MS=120000    # RF3: vida de un bloqueo de archivo
+DFSHA_DATANODE_PEER_URL=         # alcanzable por OTROS DATANODES; vacia = la de cliente
+DFSHA_CONTROL_INTERNAL_URL=https://localhost:8443   # lo lee el DataNode: plano interno
+DFSHA_ORDER_WORKERS=2            # hilos del DataNode para ordenes del plano de control
+DFSHA_GRPC_MAX_WORKERS=16
+DFSHA_REGISTER_MAX_ATTEMPTS=30
+DFSHA_REGISTER_RETRY_SECONDS=2
 # mTLS: los tres SIN DEFAULT. Generalos con python scripts/gen_certs.py
 DFSHA_TLS_CA_CERT=certs/ca.crt
 DFSHA_TLS_CERT=certs/control.crt
@@ -2663,11 +2808,13 @@ Etapa 3 (Bloque C):
 
 ## 9. Cliente CLI
 
-Comandos: `login`, `register`, `ls`, `cd`, `pwd`, `mkdir`, `rmdir`, `rm`, `mv`, `stat`,
-`put <local> <remoto>`, `get <remoto> <local>`, `cluster`.
+Comandos: `login`, `logout`, `register`, `ls`, `cd`, `pwd`, `mkdir`, `rmdir`, `rm`, `mv`,
+`stat`, `put <local> <remoto>`, `get <remoto> <local>`, `cluster`.
 
-Etapa 3: `share`, `unshare`, `shared` y los de grupos, y `login --ask-password`, que no
-guarda la clave maestra en disco y la pide en cada `put` y `get`.
+Etapa 3: `share`, `unshare`, `shared`, `acl <ruta>` —que muestra el permiso efectivo y de
+donde se hereda—, el grupo de subcomandos `group {create,add,remove,ls}`, y
+`login --ask-password`, que no guarda la clave maestra en disco y la pide en cada `put` y
+`get`.
 
 RF3: `lock`, `unlock`, `locks`, `read --offset --length` (lectura por rango, a la salida
 estandar) y `append <remoto> <local>`. Ver "RF3" mas arriba.
@@ -2693,10 +2840,19 @@ abre la envoltura y descifra. Ver "Cifrado extremo a extremo".
 
 `scripts/gc.py`, a mano, sin demonio ni scheduler. Soporta `--dry-run`.
 
-1. `GET /internal/v1/gc/orphan-blocks` -> bloques de archivos `DELETED` y reservas vencidas.
-2. Por cada bloque, `DELETE /blocks/{block_id}` en cada réplica.
+1. `GET /internal/v1/gc/orphan-blocks` -> bloques de archivos `DELETED`, de reservas
+   vencidas y **desligados** (`file_id` NULL, el tercer caso, que anadio el append del
+   RF3), cada uno con su **token de borrado** firmado por el ControlNode.
+2. Por cada bloque, `DELETE /blocks/{block_id}` en cada réplica, con ese token: sin el, el
+   DataNode responde 403. El GC no puede fabricarlo, porque presenta un certificado de
+   cliente y la verificacion exige el rol `dfsha-control`.
 3. `POST /internal/v1/gc/confirm` para que el ControlNode borre las filas.
 4. Resumen: bloques borrados, bytes liberados, fallos.
+
+**Desde la Etapa 3 hay una segunda via**, `--via-control-plane`, que encola los borrados
+como `DeleteBlock` por el stream del heartbeat: no hace falta ruta hasta los DataNodes,
+solo hasta el ControlNode. A cambio es asincrona y **no confirma**. Ver «El GC tiene ahora
+dos vias».
 
 Por qué en la Etapa 1 y no después: sin GC, el `used_bytes` de cada DataNode queda inflado
 por bloques muertos, y ese número es la entrada de la política de colocación de la Etapa 2.
@@ -2736,6 +2892,7 @@ src/dfsha/
 │   ├── crypto.py        # las tres capas de clave (Bloque C)
 │   ├── blocktoken.py    # autorizacion por bloque que el DataNode verifica solo
 │   ├── serve.py         # arranque con TLS de cliente opcional (C2)
+│   ├── healthcheck.py   # sonda: elige el esquema con la MISMA variable que el servidor
 │   └── tls.py           # UNICO sitio donde se construye un contexto TLS de cliente
 ├── control_node/
 │   ├── main.py, config.py
@@ -2756,9 +2913,14 @@ alembic/{env.py,versions/}      # migraciones del metadato (Etapa 3)
 tests/{unit,integration}/
 scripts/{gen_testfile.py,gc.py,gen_certs.py,gen_proto.py,verificar_pruebas.py}
 scripts/demo/                   # guiones de la demostracion del video
+docker-compose.yml              # el stack local: 10 servicios, C2 APAGADO
+docker-compose.tls.yml          # override que ENCIENDE C2; se quita para apagarlo
 docker/{control_node,data_node,client}.Dockerfile
-docker/nginx/{nginx.conf,dfsha.conf,dfsha-stream.conf}
+docker/nginx/{nginx.conf,dfsha.conf,dfsha-stream.conf,dfsha-tls.conf}
 docker/postgres/*.sh
 certs/                          # CA y certificados; NO se versiona
-deploy/RUNBOOK-postgres.md      # promocion manual de la replica
+deploy/{README.md,RUNBOOK-postgres.md}        # AWS, y la promocion manual de la replica
+deploy/docker-compose.{db,control,datanode}.yml   # db = PostgreSQL + ControlNode B + nginx
+deploy/nginx/                   # plantillas: la IP de dfsha-control sale del .env
+deploy/.env.{control,datanode}.example
 ```

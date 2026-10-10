@@ -39,7 +39,13 @@ rango, `append` y bloqueo de archivos con lease.
 > **Estado.** El hito está **completo**: Bloques A (PostgreSQL, CQRS con réplica de
 > lectura, elección de líder), B (replicación R=3 con pipeline, quórum W=2 y
 > re-replicación) y C (mTLS, cifrado extremo a extremo, ACLs, token de bloque, RF3 y TLS
-> de cliente). 529 pruebas en verde.
+> de cliente). **640 pruebas en verde**, más **4 que se saltan** sin `DFSHA_TEST_PG_URL`:
+> son las de la exclusión mutua del lease, que necesita el `SELECT … FOR UPDATE` de
+> PostgreSQL de verdad y corren en el CI. Y validado de punta a punta en `docker compose`
+> y en AWS.
+
+> **Informe técnico:** [`docs/DFSha-Informe-Tecnico.pdf`](docs/DFSha-Informe-Tecnico.pdf)
+> · [versión Word](docs/DFSha-Informe-Tecnico.docx)
 
 ---
 
@@ -244,38 +250,51 @@ fabricarlos él, así que quien decide qué es un huérfano sigue siendo el Cont
 
 ```mermaid
 flowchart LR
-    CLI["Cliente (CLI)<br/>token + cwd en ~/.dfsha"]
+    CLI["Cliente (CLI)<br/>cifra los bloques · token, cwd y<br/>clave maestra en ~/.dfsha"]
 
-    subgraph control["ControlNode"]
-        REST["REST :8000<br/>api/ · routers"]
-        GRPC["gRPC :9000<br/>ControlPlane"]
-        CMD["commands/ · queries/<br/>CQRS"]
-        PLACE["placement<br/>power of d choices"]
-        DB[("SQLite<br/>metadato")]
-        REST --> CMD
-        GRPC --> CMD
-        CMD --> PLACE
-        CMD --> DB
-        PLACE --> DB
+    subgraph lb["nginx (lb)"]
+        LB7[":8000 REST del cliente<br/>nivel 7 · least_conn"]
+        LB4[":8443 + :9000 mTLS<br/>nivel 4 · passthrough"]
     end
 
-    subgraph datos["DataNodes"]
-        DN1["data-node-1 :8001<br/>local-1"]
-        DN2["data-node-2 :8002<br/>local-2"]
-        DN3["data-node-3 :8003<br/>local-3"]
-        DN4["data-node-4 :8004<br/>local-4"]
+    subgraph control["ControlNodes x3 · sin estado · lease con epoca"]
+        CN1["control-node-1<br/>api/ · commands/ queries/<br/>placement · leadership"]
+        CN2["control-node-2"]
+        CN3["control-node-3"]
     end
 
-    CLI -- "1· plan: que bloque,<br/>en que nodo" --> REST
-    CLI == "2· bytes, directo<br/>PUT/GET /blocks/:id" ==> DN1
-    CLI == " " ==> DN2
-    CLI == " " ==> DN3
-    CLI == " " ==> DN4
+    subgraph meta["PostgreSQL"]
+        PGP[("primario<br/>comandos y read-your-writes")]
+        PGR[("replica de lectura<br/>ls · stat · open")]
+    end
 
-    DN1 -. "heartbeat 3s + block report<br/>(gRPC, stream bidireccional)" .-> GRPC
-    DN2 -. " " .-> GRPC
-    DN3 -. " " .-> GRPC
-    DN4 -. " " .-> GRPC
+    subgraph datos["DataNodes x4 · dos dominios de falla"]
+        DN1["data-node-1 :8001"]
+        DN2["data-node-2 :8001"]
+        DN3["data-node-3 :8001"]
+        DN4["data-node-4 :8001"]
+    end
+
+    CLI -- "1· plan: que bloque, en que nodos,<br/>y un token de bloque firmado" --> LB7
+    LB7 --> CN1
+    LB7 --> CN2
+    LB7 --> CN3
+
+    CLI == "2· bytes YA CIFRADOS, a UNA replica<br/>advertise_url" ==> DN1
+    DN1 == "3· pipeline R=3: verifica y reenvia<br/>peer_url" ==> DN2
+    DN2 ==> DN3
+
+    DN1 -. "heartbeat 3s + block report · ordenes de<br/>re-replicacion (gRPC, stream bidireccional)" .-> LB4
+    DN2 -. " " .-> LB4
+    DN3 -. " " .-> LB4
+    DN4 -. " " .-> LB4
+    LB4 -.-> CN1
+    LB4 -.-> CN2
+    LB4 -.-> CN3
+
+    CN1 -- "comandos (W)" --> PGP
+    CN1 -. "consultas (R)" .-> PGR
+    PGP -- "replicacion en streaming" --> PGR
 
     classDef bytes stroke-width:3px
     class CLI,DN1,DN2,DN3,DN4 bytes
@@ -283,7 +302,21 @@ flowchart LR
 
 La línea gruesa es el camino de los datos; la punteada, el plano de control. El
 ControlNode no es un cuello de botella de ancho de banda: cada DataNode que se añade suma
-capacidad de transferencia en lugar de saturar un nodo central.
+capacidad de transferencia en lugar de saturar un nodo central. Y el cliente sube los bytes
+**una sola vez**: las otras dos copias las hace la cadena entre DataNodes.
+
+Cuatro cosas que el diagrama dice y conviene leer despacio:
+
+- **Los tres ControlNodes no se reparten el trabajo, se relevan.** Todos sirven lecturas,
+  planes y autenticación; solo el que sostiene el lease evalúa la pertenencia y programa
+  re-replicaciones. Ver «Elección de líder».
+- **El `:8000` se proxea en nivel 7 y el `:8443`/`:9000` en nivel 4.** Un proxy de nivel 7
+  termina TLS, y en el plano interno el certificado **es** la identidad: no puede morir en
+  el balanceador. Ver «El balanceador» en `CLAUDE.md`.
+- **El metadato está en PostgreSQL**, con una réplica de lectura que sirve el lado de
+  consulta de CQRS. SQLite queda solo para las pruebas rápidas.
+- **Dos direcciones por DataNode**: el cliente usa `advertise_url` y la cadena del pipeline
+  usa `peer_url`. Es la sección siguiente.
 
 ### Dos direcciones por DataNode
 
@@ -662,14 +695,21 @@ Solo lo consume el DataNode. Definición en
 | `Heartbeat` | **stream bidireccional** | Latido cada 3 s con métricas y report incremental. El ControlNode responde `Ack` y, si su visión no cuadra, `FullReportReq` |
 | `BlockReport` | unario | Report completo, fuera de banda porque puede ser grande |
 
-El stream es bidireccional desde ya aunque hoy el ControlNode solo empuje esos dos
-mensajes: es por donde la Etapa 3 mandará las órdenes de re-replicación, y añadirlas será
-un caso más en el `oneof`, no rehacer el transporte.
+El stream es bidireccional desde la Etapa 2, y en la Etapa 3 se cobró: las órdenes de
+re-replicación y de borrado (`ReplicateBlock`, `DeleteBlock`) viajan por él como dos casos
+más del `oneof` de `ControlMessage`, sin transporte nuevo. Era la costura que esa decisión
+dejó hecha.
 
 ### ControlNode `/internal/v1` — DataNode y GC
 
-Exige la cabecera `X-DFSha-Internal-Secret`, comparada en tiempo constante. En la Etapa 3
-pasa a mTLS.
+Va por su **propio puerto** (`:8443`) y con **TLS mutuo**: quien no presente un certificado
+firmado por la CA del proyecto no llega ni a mandar la petición. No hay ninguna cabecera de
+secreto compartido —`X-DFSha-Internal-Secret` desapareció en el Bloque C—, y la diferencia
+es la que justifica el cambio: un secreto protege contra quien no lo conoce, pero no dice
+**quién** está al otro lado, y cualquiera que lo tenga es todos a la vez.
+
+Puerto propio y no `:8000` porque el certificado de cliente no se puede exigir en unas
+rutas y no en otras dentro del mismo puerto.
 
 | Método | Ruta | Cuerpo | Respuesta |
 |---|---|---|---|
@@ -1010,7 +1050,7 @@ src/dfsha/
 │   └── services/    auth, placement, resolver, pertenencia, access, shared
 ├── data_node/       storage.py (layout en disco), heartbeat.py (cliente gRPC) + api/
 └── client/          cli.py, session.py, chunker.py, transfer.py
-alembic/versions/    migraciones del metadato (0001–0007)
+alembic/versions/    migraciones del metadato (0001–0008)
 scripts/             gc.py, gen_testfile.py, gen_proto.py, gen_certs.py,
                      verificar_pruebas.py, demo/
 certs/               la CA y los certificados (NO se versiona)
