@@ -634,7 +634,7 @@ hacerlo en el hilo del stream dejaria de mandar latidos mientras dura, el Contro
 daria por muerto justo al nodo que esta haciendo el trabajo, y la respuesta a eso seria
 programar todavia mas copias.
 
-**La tercera y ultima tarea en background.** La Etapa 2 fijo que solo hubiera dos y que
+**La cuarta y ultima tarea en background.** La Etapa 2 fijo que solo hubiera dos y que
 anadir una se justificara. Esta se justifica porque un hueco de replicacion no lo provoca
 ninguna peticion: lo provoca que algo **deje** de pasar, y nadie va a preguntar por el. Va
 aparte del evaluador de pertenencia porque sus cadencias son muy distintas (1 s frente a
@@ -2435,6 +2435,63 @@ GET  /files/open?path=/a/b/c
      suponerlo: es lo que mantiene legibles los archivos de la Etapa 2
 ```
 
+RF3 (Bloque C). **Los de lock y el handle van bajo `/fs`, no bajo `/files`**, que es donde
+los pone el codigo; `read` y `append` si van en `/files`:
+
+```
+POST /fs/open     {path, mode, lock?, holder?}
+     -> {file_id, path, size, block_size, mode, wrapped_key, key_algo, lock}
+     abrir y bloquear ocurren en la MISMA transaccion; `read` toma lock
+     compartido y `write` exclusivo. Un lock compartido NO autoriza a escribir
+
+POST /fs/lock     {path, mode, holder}   -> {file_id, path, holder, epoch, mode,
+                                             expires_at, lease_seconds}
+     pedirlo dos veces con el mismo holder es RENOVAR, no un lock nuevo
+POST /fs/unlock   {path, mode, holder}   -> 204   (el mismo LockRequest)
+GET  /fs/locks?path=/a/b                 -> {path, holders:[...]}
+     los VENCIDOS no se barren: el vencimiento se evalua al consultar
+
+GET  /files/read?path=&offset=&length=
+     -> {file_id, offset, length, size, blocks:[...]}
+     solo los bloques que intersectan el tramo, con cuanto recortar de cada uno.
+     El bloque se baja ENTERO: con cifrado no se puede descifrar por partes
+
+POST /files/{file_id}/append         {size, cipher_overhead?, lock_holder, lock_epoch}
+     -> {file_id, block_size, expires_at, tail, tail_plain_size, blocks:[...]}
+     `tail` es el bloque de cola a REESCRIBIR, si estaba a medias
+POST /files/{file_id}/append/commit  {block_ids, new_size, replaces,
+                                      lock_holder, lock_epoch} -> 200
+     el lock se exige DOS veces, aqui y al planificar: entre las dos el cliente
+     sube bytes y su lease pudo vencer
+```
+
+ACLs y grupos (Bloque C). `/compartido-conmigo` es un directorio **virtual**: no existe en
+`directories`, se compone al vuelo con las concesiones que apuntan a este usuario.
+
+```
+POST /acl/share     {path, principal, permission}   -> 204
+POST /acl/unshare   {path, principal}               -> 204
+GET  /acl/show?path=/a/b
+     -> {path, effective, source, inherited_from, grants:[...]}
+GET  /acl/shared-with-me                            -> {entries:[...]}
+POST /acl/groups                {name}              -> 201
+GET  /acl/groups                                    -> {groups:[...]}
+POST /acl/groups/members        {name, username}    -> 204
+POST /acl/groups/members/remove {name, username}    -> 204
+```
+
+Y el liderazgo, que es lo que hace util `dfsha cluster` durante una demostracion:
+
+```
+GET /cluster/status      -> {nodes:[...], replication_factor, write_quorum,
+                             suspect_after_ms, dead_after_ms,
+                             under_replicated_blocks, critical_blocks}
+GET /cluster/leadership  -> {leader_id, epoch, is_self, instance_id,
+                             expires_in_seconds, acquired_at, renewed_at}
+     `is_self` dice si contesto el lider: con tres instancias tras un
+     balanceador, es la unica forma de saber a quien te atendio
+```
+
 ### Alcance de gRPC (Etapa 2) — material del informe
 
 **gRPC solo entre ControlNode y DataNode.** Cliente<->ControlNode y cliente<->DataNode
@@ -2776,6 +2833,7 @@ src/dfsha/
 │   ├── crypto.py        # las tres capas de clave (Bloque C)
 │   ├── blocktoken.py    # autorizacion por bloque que el DataNode verifica solo
 │   ├── serve.py         # arranque con TLS de cliente opcional (C2)
+│   ├── healthcheck.py   # sonda: elige el esquema con la MISMA variable que el servidor
 │   └── tls.py           # UNICO sitio donde se construye un contexto TLS de cliente
 ├── control_node/
 │   ├── main.py, config.py
@@ -2796,9 +2854,14 @@ alembic/{env.py,versions/}      # migraciones del metadato (Etapa 3)
 tests/{unit,integration}/
 scripts/{gen_testfile.py,gc.py,gen_certs.py,gen_proto.py,verificar_pruebas.py}
 scripts/demo/                   # guiones de la demostracion del video
+docker-compose.yml              # el stack local: 10 servicios, C2 APAGADO
+docker-compose.tls.yml          # override que ENCIENDE C2; se quita para apagarlo
 docker/{control_node,data_node,client}.Dockerfile
-docker/nginx/{nginx.conf,dfsha.conf,dfsha-stream.conf}
+docker/nginx/{nginx.conf,dfsha.conf,dfsha-stream.conf,dfsha-tls.conf}
 docker/postgres/*.sh
 certs/                          # CA y certificados; NO se versiona
-deploy/RUNBOOK-postgres.md      # promocion manual de la replica
+deploy/{README.md,RUNBOOK-postgres.md}        # AWS, y la promocion manual de la replica
+deploy/docker-compose.{db,control,datanode}.yml   # db = PostgreSQL + ControlNode B + nginx
+deploy/nginx/                   # plantillas: la IP de dfsha-control sale del .env
+deploy/.env.{control,datanode}.example
 ```

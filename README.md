@@ -39,7 +39,10 @@ rango, `append` y bloqueo de archivos con lease.
 > **Estado.** El hito está **completo**: Bloques A (PostgreSQL, CQRS con réplica de
 > lectura, elección de líder), B (replicación R=3 con pipeline, quórum W=2 y
 > re-replicación) y C (mTLS, cifrado extremo a extremo, ACLs, token de bloque, RF3 y TLS
-> de cliente). 529 pruebas en verde.
+> de cliente). **640 pruebas en verde**, más **4 que se saltan** sin `DFSHA_TEST_PG_URL`:
+> son las de la exclusión mutua del lease, que necesita el `SELECT … FOR UPDATE` de
+> PostgreSQL de verdad y corren en el CI. Y validado de punta a punta en `docker compose`
+> y en AWS.
 
 ---
 
