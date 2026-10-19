@@ -46,6 +46,10 @@ rango, `append` y bloqueo de archivos con lease.
 
 > **Informe técnico:** [`docs/DFSha-Informe-Tecnico.pdf`](docs/DFSha-Informe-Tecnico.pdf)
 > · [versión Word](docs/DFSha-Informe-Tecnico.docx)
+>
+> **Video de sustentación:** [youtu.be/MeJQ8At93hA](https://youtu.be/MeJQ8At93hA)
+
+
 
 ---
 
