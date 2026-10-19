@@ -1,5 +1,21 @@
 # Despliegue de DFSha en AWS — Etapa 3
 
+### Usar el cliente desde `dfsha-control`
+
+Los certificados del despliegue viven en `/etc/dfsha/certs/`, no en `certs/` del
+repositorio: cada instancia recibe solo sus tres ficheros y la CA del proyecto se
+queda fuera. El cliente busca la CA en `certs/ca.crt` y en `~/.dfsha/ca.crt`, así
+que antes de usarlo en una instancia hay que copiarla:
+
+    mkdir -p ~/.dfsha
+    sudo cp /etc/dfsha/certs/ca.crt ~/.dfsha/ca.crt
+    sudo chown ubuntu:ubuntu ~/.dfsha/ca.crt
+
+Sin esto, el `login` falla con `no se encuentra la CA con la que verificarlo`.
+Un certificado de CA es público; lo secreto es `ca.key`, que no está en estas
+máquinas y no debe estarlo.
+
+
 > **Ejecutado y validado el 9 de octubre de 2026**, de punta a punta: las seis instancias,
 > las ocho migraciones, los cuatro DataNodes con mTLS y HTTPS, un `put` de 50 MB
 > `FULLY_REPLICATED (3 de 3)` con 150 réplicas repartidas 36/38/39/37, la caída de un
