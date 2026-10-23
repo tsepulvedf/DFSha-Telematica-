@@ -44,7 +44,7 @@ rango, `append` y bloqueo de archivos con lease.
 > PostgreSQL de verdad y corren en el CI. Y validado de punta a punta en `docker compose`
 > y en AWS.
 
-> **Informe técnico:** [`docs/DFSha-Informe-Tecnico.pdf`](docs/DFSha-Informe-Tecnico.pdf)
+> **Informe técnico:** 
 > · [versión Word](docs/DFSha-Informe-Tecnico.docx)
 >
 > **Video de sustentación:** [youtu.be/MeJQ8At93hA](https://youtu.be/MeJQ8At93hA)
